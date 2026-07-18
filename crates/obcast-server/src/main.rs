@@ -8,6 +8,7 @@ mod ingest;
 mod origin;
 mod playout;
 mod store;
+mod waveform;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -148,6 +149,7 @@ async fn main() {
         .route("/api/:stream/status", get(api::status))
         .route("/api/:stream/playout", post(api::set_playout))
         .route("/api/:stream/ws", get(api::ws_handler))
+        .route("/api/:stream/waveform", get(api::waveform_handler))
         .with_state(app_state)
         .nest_service("/remote", ServeDir::new(web_remote_dir()));
 

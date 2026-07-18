@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
+use serde::Deserialize;
 
 use obcast_proto::control::{
     ControlEvent, ControlStatus, LinkHealth, PlayoutCommand, PlayoutPosition,
@@ -18,6 +19,7 @@ use obcast_proto::state::Seq;
 
 use crate::ingest::ApiError;
 use crate::playout::EngineCommand;
+use crate::waveform::{self, WaveformJson};
 use crate::{AppState, StreamHandle};
 
 /// A stream is considered "link down" once this long has passed since the
@@ -213,4 +215,43 @@ fn linear_to_db(linear: f32) -> f32 {
     } else {
         20.0 * linear.log10()
     }
+}
+
+#[derive(Deserialize)]
+pub struct WaveformQuery {
+    /// Bound the decode work per request; defaults to the whole DVR window,
+    /// which for a multi-minute buffer means dozens of `ffmpeg` spawns.
+    start_seq: Option<Seq>,
+    end_seq: Option<Seq>,
+}
+
+/// `GET /api/{stream}/waveform` — BBC waveform-data.js JSON (+ obcast's
+/// `rungs`/`seqs` extension) covering `[start_seq, end_seq]`, defaulting to
+/// the full DVR window. Decodes every segment in range via `ffmpeg`, so this
+/// runs on a blocking task rather than the async executor.
+pub async fn waveform_handler(
+    State(app): State<Arc<AppState>>,
+    Path(stream): Path<String>,
+    Query(q): Query<WaveformQuery>,
+) -> Result<Json<WaveformJson>, ApiError> {
+    let handle = app.stream(&stream).await;
+
+    let store = handle.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let store = store.blocking_lock();
+        let start = q
+            .start_seq
+            .unwrap_or_else(|| store.dvr_start_seq().unwrap_or(0));
+        let end = q.end_seq.unwrap_or_else(|| store.live_seq().unwrap_or(0));
+        if end < start {
+            return Err("end_seq must be >= start_seq");
+        }
+        Ok(waveform::build(&store, store.profile(), start, end))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    result
+        .map(Json)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
 }

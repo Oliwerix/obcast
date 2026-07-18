@@ -66,7 +66,9 @@ reshapes what the encoder uploads next (see `protocol.md` §5). Two ways to
 drive it:
 
 **Web remote** — open `http://127.0.0.1:8080/remote/?stream=myshow` for
-start/stop/seek buttons, live health, and VU meters.
+start/stop/seek buttons, live health, VU meters, and a waveform (BBC
+peaks.js) you can click or drag to seek — colored by ABR rung, so you can
+see where quality is low at a glance.
 
 **REST**, for scripting:
 

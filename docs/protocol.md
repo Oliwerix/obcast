@@ -143,15 +143,36 @@ future use but not yet sent — commands go through the plain HTTP response of
 `POST /api/{stream}/playout` instead. The socket does not accept inbound
 commands; it is read-only from the client's perspective.
 
+### Waveform
+```
+GET /api/{stream}/waveform?start_seq={seq}&end_seq={seq}
+```
+BBC waveform-data.js JSON (`version`/`channels`/`sample_rate`/`samples_per_pixel`/
+`bits`/`length`/`data`), consumed directly by BBC's [peaks.js](https://github.com/bbc/peaks.js)
+on the web remote. `start_seq`/`end_seq` default to the current DVR window.
+Extended with two obcast-specific parallel arrays peaks.js itself ignores:
+`rungs` (best rung covering each point, `null` for a gap) and `seqs` (the DVR
+seq each point belongs to) — together these let the client color-code the
+waveform by quality without a second round trip. Computed by decoding every
+segment in range via `ffmpeg` (mono, 8kHz, min/max per 40ms), so a request
+over a multi-minute DVR window is not free — the web remote refreshes it on a
+timer (every 5s), not per frame.
+
 ### Web remote (reference UI)
 ```
 GET /remote/  ->  static single-page app (see web/remote/)
 ```
-Talks to the REST + WS endpoints above. It exposes two independent audio
-paths and does not conflate them:
+Talks to the REST + WS endpoints above, plus the waveform endpoint. It
+exposes two independent audio paths and does not conflate them:
 - **Server hardware output** — the real playout engine (§5), controlled by
-  the buttons on the page. This is the position that feeds back into
-  `ServerState` and reshapes the encoder's upload plan.
+  the buttons on the page and by clicking/dragging the peaks.js waveform.
+  This is the position that feeds back into `ServerState` and reshapes the
+  encoder's upload plan. Since there's no local audio to attach to,
+  peaks.js runs against a custom `player` adapter (see
+  [customizing.md](https://github.com/bbc/peaks.js/blob/master/doc/customizing.md))
+  whose `seek()` posts to `POST /api/{stream}/playout` and whose notion of
+  current time/playing state is a mirror of the WS `ControlEvent` stream —
+  there is no real decode or playback happening in the browser for this path.
 - **Listen-along preview** — a plain `hls.js` pull of `/hls/{stream}/master.m3u8`
   into a browser `<audio>` element, for checking levels/timing by ear. It has
   its own independent buffering and is not the playhead described above.

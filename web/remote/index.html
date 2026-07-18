@@ -5,6 +5,7 @@
 <title>OBCast Remote</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script src="https://unpkg.com/peaks.js/dist/peaks.js"></script>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -47,6 +48,10 @@
   .meter-bar { height: 100%; background: linear-gradient(90deg, #4ade80, #facc15 80%, #f87171 95%); width: 0%; transition: width 60ms linear; }
   .note { font-size: 12px; color: #8a8f98; margin-top: 6px; }
   audio, video { width: 100%; border-radius: 6px; margin-top: 8px; background: #000; }
+  #zoomview-container { width: 100%; height: 100px; background: #0e0f12; border-radius: 6px; margin-top: 4px; cursor: pointer; overflow: hidden; }
+  .legend { display: flex; gap: 16px; margin-top: 8px; font-size: 11px; color: #8a8f98; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 </style>
 </head>
 <body>
@@ -88,6 +93,15 @@
       <div class="meter-wrap"><div id="meter-rms" class="meter-bar"></div></div>
     </div>
   </div>
+
+  <div id="zoomview-container" style="margin-top:16px;"></div>
+  <div class="legend">
+    <span><i style="background:#f87171;"></i>lo</span>
+    <span><i style="background:#facc15;"></i>mid</span>
+    <span><i style="background:#4ade80;"></i>hd</span>
+    <span><i style="background:#3a3f47;"></i>gap</span>
+  </div>
+  <div class="note">Click or drag the waveform to seek the server's hardware output. Color shows the ABR rung actually covering that audio.</div>
 </div>
 
 <div class="card">
@@ -172,6 +186,144 @@ function applyMeters(peakDb, rmsDb) {
   document.getElementById('meter-rms').style.width = toPct(rmsDb) + '%';
 }
 
+// --- Waveform: BBC peaks.js, driven by the server's real playhead ---
+//
+// peaks.js is built to sit on an HTML5 <audio>/<video> element. There isn't
+// one here -- "playback" is the server's hardware output, not anything in
+// this browser -- so a custom `player` adapter is used instead. Its seek()
+// posts to the control API; its notion of "current time" and "playing" is
+// just a mirror of the ControlEvent stream, fed in via emitter.emit(...) as
+// documented at https://github.com/bbc/peaks.js/blob/master/doc/customizing.md.
+let peaksInstance = null;
+let waveformPointMs = null; // ms per waveform point, known once the first payload loads
+
+const RUNG_COLORS = { 0: '#f87171', 1: '#facc15', 2: '#4ade80' }; // lo/mid/hd
+const GAP_COLOR = '#3a3f47';
+function colorForRung(rung) {
+  return (rung === null || rung === undefined) ? GAP_COLOR : (RUNG_COLORS[rung] ?? '#8a8f98');
+}
+
+function makeServerPlayer() {
+  let currentTime = 0;
+  let playing = false;
+  let durationSecs = 0;
+  let dvrStartSeq = null;
+  let segMs = 2000;
+  let emitter = null;
+  return {
+    // -- required peaks.js adapter methods (doc/customizing.md "Player" interface) --
+    init(eventEmitter) { emitter = eventEmitter; return Promise.resolve(); },
+    destroy() {},
+    play() { post(`/api/${stream}/playout`, { cmd: 'resume' }); return Promise.resolve(); },
+    pause() { post(`/api/${stream}/playout`, { cmd: 'pause' }); },
+    seek(time) {
+      const secsBehindLive = Math.max(0, durationSecs - time);
+      post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: secsBehindLive } });
+    },
+    isPlaying() { return playing; },
+    isSeeking() { return false; },
+    getCurrentTime() { return currentTime; },
+    getDuration() { return durationSecs; },
+    setSource() { return Promise.resolve(); }, // no real media source to swap
+    // -- internal: fed by connectWs()'s status handler, not part of the adapter contract --
+    updateFromStatus(s) {
+      if (s.live_seq != null && s.dvr_start_seq != null) {
+        dvrStartSeq = s.dvr_start_seq;
+        durationSecs = ((s.live_seq - s.dvr_start_seq + 1) * segMs) / 1000;
+      }
+      if (s.playout.position_seq != null && dvrStartSeq != null) {
+        const newTime = ((s.playout.position_seq - dvrStartSeq) * segMs) / 1000;
+        if (Math.abs(newTime - currentTime) > 0.001) {
+          currentTime = newTime;
+          emitter?.emit('player.timeupdate', currentTime);
+        }
+      }
+      const wasPlaying = playing;
+      playing = s.playout.state === 'playing';
+      if (playing && !wasPlaying) emitter?.emit('player.playing', currentTime);
+      if (!playing && wasPlaying) emitter?.emit('player.pause', currentTime);
+    },
+    setSegmentMs(ms) { segMs = ms; },
+  };
+}
+const serverPlayer = makeServerPlayer();
+
+function initWaveform(json) {
+  peaks.init({
+    zoomview: {
+      container: document.getElementById('zoomview-container'),
+      waveformColor: GAP_COLOR,
+      playheadColor: '#e6e6e6',
+      autoScroll: false,
+    },
+    player: serverPlayer,
+    waveformData: { json },
+  }, (err, instance) => {
+    if (err) { console.error('peaks.js init failed', err); return; }
+    peaksInstance = instance;
+    applySegmentColors(json);
+  });
+}
+
+// waveform-data.js's JSON format has no segment_ms field; derive it from how
+// many consecutive points share the same seq in our `seqs` extension array.
+function pointsPerSegment(json) {
+  if (!json.seqs || json.seqs.length < 2) return 1;
+  let count = 1;
+  const first = json.seqs[0];
+  while (count < json.seqs.length && json.seqs[count] === first) count++;
+  return count;
+}
+
+function pointMs(json) {
+  return (json.samples_per_pixel / json.sample_rate) * 1000;
+}
+
+/// One non-overlay segment per DVR seq, colored by that seq's rung.
+/// overlay:false makes the segment draw its own waveform peaks in `color` in
+/// place of the base waveform, so adjacent no-gap segments read as one
+/// continuously color-coded waveform rather than boxes drawn on top of it.
+function applySegmentColors(json) {
+  peaksInstance.segments.removeAll();
+  const pMs = pointMs(json);
+
+  let i = 0;
+  while (i < json.seqs.length) {
+    const seq = json.seqs[i];
+    const rung = json.rungs[i];
+    let j = i;
+    while (j < json.seqs.length && json.seqs[j] === seq) j++;
+    peaksInstance.segments.add({
+      startTime: (i * pMs) / 1000,
+      endTime: (j * pMs) / 1000,
+      color: colorForRung(rung),
+      editable: false,
+      overlay: false,
+      id: `seq-${seq}`,
+    });
+    i = j;
+  }
+}
+
+async function applyWaveform() {
+  const resp = await fetch(`/api/${stream}/waveform`);
+  if (!resp.ok) return;
+  const json = await resp.json();
+  if (json.length === 0) return;
+
+  waveformPointMs = pointMs(json);
+  serverPlayer.setSegmentMs(waveformPointMs * pointsPerSegment(json));
+
+  if (!peaksInstance) {
+    initWaveform(json);
+  } else {
+    peaksInstance.setSource({ waveformData: { json } }, (err) => {
+      if (err) { console.error('waveform refresh failed', err); return; }
+      applySegmentColors(json);
+    });
+  }
+}
+
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/api/${stream}/ws`);
@@ -179,13 +331,19 @@ function connectWs() {
     const msg = JSON.parse(ev.data);
     // ControlEvent is internally tagged ("type"); Status's fields (stream,
     // server, encoder, link) are flattened alongside it, not nested.
-    if (msg.type === 'status') applyStatus(msg);
-    else if (msg.type === 'meters') applyMeters(msg.peak_db, msg.rms_db);
+    if (msg.type === 'status') {
+      applyStatus(msg);
+      serverPlayer.updateFromStatus(msg.server);
+    } else if (msg.type === 'meters') {
+      applyMeters(msg.peak_db, msg.rms_db);
+    }
   };
   ws.onclose = () => setTimeout(connectWs, 1000);
   ws.onerror = () => ws.close();
 }
 connectWs();
+applyWaveform();
+setInterval(applyWaveform, 5000);
 
 // Listen-along player: independent HLS pull, not tied to server playout state.
 const audio = document.getElementById('player');
