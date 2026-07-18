@@ -83,8 +83,10 @@ pub enum ControlEvent {
     Status(Box<ControlStatus>),
     /// Playout head advanced (frequent, lightweight).
     Position { seq: Seq },
-    /// Peak/RMS meters for the playout bus, dBFS.
-    Meters { peak_db: f32, rms_db: f32 },
+    /// VU/PPM meters for the playout bus, dBFS — see `obcast_proto::meter`
+    /// for the IEC 60268-17 (VU) / IEC 60268-10 Type I (PPM) ballistics
+    /// these are computed with.
+    Meters { vu_db: f32, ppm_db: f32 },
     /// A command was accepted/rejected.
     Ack {
         command: String,

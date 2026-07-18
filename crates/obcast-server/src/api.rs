@@ -187,8 +187,8 @@ async fn ws_session(stream: String, handle: Arc<StreamHandle>, mut socket: WebSo
                         }
                     }
                 }
-                let (peak, rms) = handle.playout.meters();
-                let event = ControlEvent::Meters { peak_db: linear_to_db(peak), rms_db: linear_to_db(rms) };
+                let (vu_db, ppm_db) = handle.playout.meters();
+                let event = ControlEvent::Meters { vu_db, ppm_db };
                 if send_event(&mut socket, &event).await.is_err() {
                     return;
                 }
@@ -207,14 +207,6 @@ async fn ws_session(stream: String, handle: Arc<StreamHandle>, mut socket: WebSo
 async fn send_event(socket: &mut WebSocket, event: &ControlEvent) -> Result<(), axum::Error> {
     let text = serde_json::to_string(event).expect("ControlEvent is always serializable");
     socket.send(Message::Text(text)).await
-}
-
-fn linear_to_db(linear: f32) -> f32 {
-    if linear <= 0.0 {
-        -100.0
-    } else {
-        20.0 * linear.log10()
-    }
 }
 
 #[derive(Deserialize)]

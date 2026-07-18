@@ -19,7 +19,7 @@ use obcast_proto::state::{PlayoutState, Rung, StreamProfile};
 
 use crate::audio::{self, AudioHandle};
 use crate::config::AppConfig;
-use crate::gui::meter::{self, k14_meter, mini_meter, MeterReading, PeakHold};
+use crate::gui::meter::{self, k14_meter, mini_meter, MeterReading};
 use crate::shared::SharedState;
 use crate::{encode, sse, uploader};
 use std::sync::Arc;
@@ -69,9 +69,6 @@ struct ObcastApp {
     selected_device: String,
     cfg: AppConfig,
     live: bool,
-
-    hold_l: PeakHold,
-    hold_r: PeakHold,
 }
 
 impl ObcastApp {
@@ -101,8 +98,6 @@ impl ObcastApp {
             selected_device: cfg.device_name.clone(),
             cfg,
             live: false,
-            hold_l: PeakHold::default(),
-            hold_r: PeakHold::default(),
         }
     }
 
@@ -401,42 +396,30 @@ impl ObcastApp {
 
     fn meter_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Levels — K-14");
-        let ((peak_l, rms_l), (peak_r, rms_r)) = self.audio.meters();
+        let ((vu_l, ppm_l), (vu_r, ppm_r)) = self.audio.meters();
         let clipped_l = self.audio.take_clip_l();
         let clipped_r = self.audio.take_clip_r();
         let mono = self.audio.mono();
 
         ui.horizontal(|ui| {
             let reading_l = MeterReading {
-                rms_db: meter::linear_to_dbfs(rms_l),
-                peak_db: meter::linear_to_dbfs(peak_l),
+                vu_db: vu_l,
+                ppm_db: ppm_l,
                 clipped: clipped_l,
             };
             let label_l = if mono { "MONO" } else { "L" };
-            let resp_l = k14_meter(
-                ui,
-                label_l,
-                &reading_l,
-                &mut self.hold_l,
-                egui::vec2(90.0, 280.0),
-            );
+            let resp_l = k14_meter(ui, label_l, &reading_l, egui::vec2(90.0, 280.0));
             if resp_l.clicked() {
                 self.audio.reset_clips();
             }
 
             if !mono {
                 let reading_r = MeterReading {
-                    rms_db: meter::linear_to_dbfs(rms_r),
-                    peak_db: meter::linear_to_dbfs(peak_r),
+                    vu_db: vu_r,
+                    ppm_db: ppm_r,
                     clipped: clipped_r,
                 };
-                let resp_r = k14_meter(
-                    ui,
-                    "R",
-                    &reading_r,
-                    &mut self.hold_r,
-                    egui::vec2(90.0, 280.0),
-                );
+                let resp_r = k14_meter(ui, "R", &reading_r, egui::vec2(90.0, 280.0));
                 if resp_r.clicked() {
                     self.audio.reset_clips();
                 }
@@ -447,17 +430,9 @@ impl ObcastApp {
                 ui.label(
                     egui::RichText::new("K-14: 0 = -14 dBFS, 14 dB headroom to clip.").small(),
                 );
-                ui.label(format!(
-                    "L  rms {:>5.1} dB   peak {:>5.1} dB",
-                    meter::linear_to_dbfs(rms_l),
-                    meter::linear_to_dbfs(peak_l)
-                ));
+                ui.label(format!("L  vu {vu_l:>5.1} dB   ppm {ppm_l:>5.1} dB"));
                 if !mono {
-                    ui.label(format!(
-                        "R  rms {:>5.1} dB   peak {:>5.1} dB",
-                        meter::linear_to_dbfs(rms_r),
-                        meter::linear_to_dbfs(peak_r)
-                    ));
+                    ui.label(format!("R  vu {vu_r:>5.1} dB   ppm {ppm_r:>5.1} dB"));
                 }
                 if clipped_l || clipped_r {
                     ui.colored_label(

@@ -4,11 +4,10 @@
 //! full scale, leaving headroom for transients instead of riding the
 //! ceiling — K-14 leaves 14 dB, the broadcast convention. This widget
 //! draws that scale directly (ticks labelled in K-relative dB), fills a
-//! bar to the RMS level colour-zoned green/yellow/red around the K-0
-//! point, and overlays an instantaneous peak tick plus a slower-decaying
-//! peak-hold marker so a transient is still readable after it's gone.
-
-use std::time::Instant;
+//! bar to the IEC 60268-17 VU (loudness) level colour-zoned
+//! green/yellow/red around the K-0 point, and overlays the IEC 60268-10
+//! PPM (fast peak) reading as a "flying" marker so a transient is still
+//! readable after it's gone — both ballistics computed on the audio thread.
 
 use eframe::egui::{self, Color32, Rect, Stroke, Vec2};
 
@@ -45,51 +44,11 @@ fn zone_color(dbfs: f32) -> Color32 {
     }
 }
 
-/// Peak-hold ballistics: pins to the loudest recent peak, holds briefly,
-/// then decays — independent of the audio thread's own instantaneous
-/// meters, since this is purely a display-side convention (hold time,
-/// decay rate) that can change without touching capture code.
-pub struct PeakHold {
-    peak_db: f32,
-    hold_secs: f32,
-    last_update: Instant,
-}
-
-impl Default for PeakHold {
-    fn default() -> Self {
-        Self {
-            peak_db: MIN_DBFS,
-            hold_secs: 0.0,
-            last_update: Instant::now(),
-        }
-    }
-}
-
-impl PeakHold {
-    const HOLD_SECS: f32 = 1.5;
-    const DECAY_DB_PER_SEC: f32 = 20.0;
-
-    pub fn update(&mut self, instantaneous_db: f32) -> f32 {
-        let now = Instant::now();
-        let dt = (now - self.last_update).as_secs_f32().min(0.5);
-        self.last_update = now;
-
-        if instantaneous_db >= self.peak_db {
-            self.peak_db = instantaneous_db;
-            self.hold_secs = 0.0;
-        } else {
-            self.hold_secs += dt;
-            if self.hold_secs > Self::HOLD_SECS {
-                self.peak_db = (self.peak_db - Self::DECAY_DB_PER_SEC * dt).max(instantaneous_db);
-            }
-        }
-        self.peak_db
-    }
-}
-
 pub struct MeterReading {
-    pub rms_db: f32,
-    pub peak_db: f32,
+    /// IEC 60268-17 VU — the slow "loudness" bar.
+    pub vu_db: f32,
+    /// IEC 60268-10 PPM — the fast "flying" peak marker.
+    pub ppm_db: f32,
     pub clipped: bool,
 }
 
@@ -100,11 +59,8 @@ pub fn k14_meter(
     ui: &mut egui::Ui,
     label: &str,
     reading: &MeterReading,
-    hold: &mut PeakHold,
     size: Vec2,
 ) -> egui::Response {
-    let held_db = hold.update(reading.peak_db);
-
     ui.vertical(|ui| {
         ui.label(
             egui::RichText::new(label)
@@ -141,31 +97,24 @@ pub fn k14_meter(
             );
         }
 
-        // RMS fill — the "loudness" reading, the main thing K-metering is for.
-        let rms_frac = frac(reading.rms_db);
-        let fill_top = bar_rect.bottom() - rms_frac * bar_rect.height();
+        // VU fill — the IEC 60268-17 loudness reading, the main thing
+        // K-metering is for.
+        let vu_frac = frac(reading.vu_db);
+        let fill_top = bar_rect.bottom() - vu_frac * bar_rect.height();
         painter.rect_filled(
             Rect::from_min_max(egui::pos2(bar_rect.left(), fill_top), bar_rect.max),
             0.0,
-            zone_color(reading.rms_db),
+            zone_color(reading.vu_db),
         );
 
-        // Instantaneous peak tick.
-        let peak_y = bar_rect.bottom() - frac(reading.peak_db) * bar_rect.height();
+        // PPM marker — the IEC 60268-10 fast-attack/slow-decay peak needle,
+        // "flying" above the slower VU bar. Its ballistics come from the audio
+        // thread, so no display-side hold/decay is needed here.
+        let ppm_y = bar_rect.bottom() - frac(reading.ppm_db) * bar_rect.height();
         painter.line_segment(
             [
-                egui::pos2(bar_rect.left(), peak_y),
-                egui::pos2(bar_rect.right(), peak_y),
-            ],
-            Stroke::new(1.5, Color32::WHITE),
-        );
-
-        // Decaying peak-hold marker.
-        let hold_y = bar_rect.bottom() - frac(held_db) * bar_rect.height();
-        painter.line_segment(
-            [
-                egui::pos2(bar_rect.left(), hold_y),
-                egui::pos2(bar_rect.right(), hold_y),
+                egui::pos2(bar_rect.left(), ppm_y),
+                egui::pos2(bar_rect.right(), ppm_y),
             ],
             Stroke::new(2.0, Color32::from_rgb(0xf5, 0xf5, 0xf5)),
         );

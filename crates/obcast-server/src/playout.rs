@@ -44,10 +44,10 @@ pub struct PlayoutHandle {
     paused: AtomicBool,
     position_seq: AtomicI64,  // -1 = none
     volume_millis: AtomicU32, // gain * 1000, fixed-point for atomic access
-    // Linear peak/RMS of the most recent audio callback's output (post-gain),
-    // stored as raw f32 bits since there's no stable AtomicF32.
-    peak_bits: AtomicU32,
-    rms_bits: AtomicU32,
+    // dBFS VU/PPM ballistics of the playout output (post-gain), stored as raw
+    // f32 bits since there's no stable AtomicF32.
+    vu_bits: AtomicU32,
+    ppm_bits: AtomicU32,
     cmd_tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
@@ -71,12 +71,12 @@ impl PlayoutHandle {
         self.volume_millis.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
-    /// Linear (peak, rms) of the most recently played audio, 0.0..=1.0ish.
-    /// Convert to dBFS at the call site for display.
+    /// `(vu_db, ppm_db)` of the playout output — IEC ballistics in dBFS,
+    /// ready to display without further conversion.
     pub fn meters(&self) -> (f32, f32) {
         (
-            f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
-            f32::from_bits(self.rms_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.vu_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.ppm_bits.load(Ordering::Relaxed)),
         )
     }
 
@@ -94,8 +94,8 @@ pub fn spawn(store: Arc<Mutex<DvrStore>>, rungs: Vec<RungId>) -> Arc<PlayoutHand
         paused: AtomicBool::new(false),
         position_seq: AtomicI64::new(-1),
         volume_millis: AtomicU32::new(1000),
-        peak_bits: AtomicU32::new(0),
-        rms_bits: AtomicU32::new(0),
+        vu_bits: AtomicU32::new(0),
+        ppm_bits: AtomicU32::new(0),
         cmd_tx,
     });
 
@@ -138,6 +138,10 @@ fn run_engine(
     let (mut producer, mut consumer) = ring.split();
 
     let volume_handle = handle.clone();
+    // Persistent across callbacks: the 300 ms VU and 650 ms PPM time
+    // constants span many callbacks, so these must not reset each call.
+    let mut vu = obcast_proto::meter::Vu::new();
+    let mut ppm = obcast_proto::meter::Ppm::new();
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
@@ -150,18 +154,16 @@ fn run_engine(
                 *s = 0.0;
             }
 
-            let peak = data.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-            let mean_sq = if data.is_empty() {
-                0.0
-            } else {
-                data.iter().map(|s| s * s).sum::<f32>() / data.len() as f32
-            };
+            // Feed the whole post-gain buffer, including any zero-padded
+            // underrun tail — that silence is genuinely being output.
+            vu.process(data, sample_rate);
+            ppm.process(data, sample_rate);
             volume_handle
-                .peak_bits
-                .store(peak.to_bits(), Ordering::Relaxed);
+                .vu_bits
+                .store(vu.value_db().to_bits(), Ordering::Relaxed);
             volume_handle
-                .rms_bits
-                .store(mean_sq.sqrt().to_bits(), Ordering::Relaxed);
+                .ppm_bits
+                .store(ppm.value_db().to_bits(), Ordering::Relaxed);
         },
         |err| tracing::error!(error = %err, "playout stream error"),
         None,
