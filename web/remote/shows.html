@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>OBCast — Shows</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #14161a; color: #e6e6e6; margin: 0; padding: 24px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: #8a8f98; font-size: 13px; margin-bottom: 20px; }
+  .card {
+    background: #1c1f24; border: 1px solid #2a2e35; border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  button {
+    background: #2a2e35; color: #e6e6e6; border: 1px solid #383d46; border-radius: 6px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #383d46; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.danger { background: #3a1e1e; border-color: #5a2a2a; color: #f87171; }
+  button.danger:hover { background: #4a2525; }
+  .pill {
+    display: inline-block; padding: 3px 9px; border-radius: 100px; font-size: 11px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em;
+  }
+  .pill.live { background: #1e4530; color: #4ade80; }
+  .pill.past { background: #2a2e35; color: #8a8f98; }
+  table.shows { width: 100%; border-collapse: collapse; }
+  table.shows th {
+    text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: #8a8f98; font-weight: 600; padding: 8px 12px 8px 0; border-bottom: 1px solid #2a2e35;
+  }
+  table.shows td { padding: 12px 12px 12px 0; font-size: 13px; color: #b8bcc4; border-bottom: 1px solid #23262c; vertical-align: middle; }
+  table.shows tr:last-child td { border-bottom: none; }
+  table.shows td.v { color: #e6e6e6; font-variant-numeric: tabular-nums; }
+  a.show-name { color: #e6e6e6; font-weight: 600; text-decoration: none; font-size: 14px; }
+  a.show-name:hover { color: #4a7de0; text-decoration: underline; }
+  .muted { color: #8a8f98; font-size: 13px; }
+  .empty { color: #8a8f98; font-size: 14px; padding: 24px 4px; text-align: center; }
+  #banner { font-size: 13px; margin-bottom: 12px; display: none; }
+  #banner.err { display: block; background: #3a1e1e; color: #f87171; border: 1px solid #5a2a2a; border-radius: 6px; padding: 8px 12px; }
+  #banner.ok  { display: block; background: #1e4530; color: #4ade80; border: 1px solid #2a5a3f; border-radius: 6px; padding: 8px 12px; }
+</style>
+</head>
+<body>
+
+<h1>OBCast — Shows</h1>
+<div class="sub">Every stream the server has received audio for. Open one to control it, or delete a past show to reclaim disk.</div>
+
+<div id="banner"></div>
+
+<div class="card">
+  <div id="content">
+    <div class="empty">Loading shows…</div>
+  </div>
+</div>
+
+<script>
+const apiBase = '';
+
+// --- formatting helpers ---
+function humanBytes(bytes) {
+  if (bytes == null) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = bytes, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+}
+
+function humanDuration(ms) {
+  if (ms == null) return '—';
+  const totalSecs = Math.round(ms / 1000);
+  const h = Math.floor(totalSecs / 3600);
+  const m = Math.floor((totalSecs % 3600) / 60);
+  const s = totalSecs % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+function relativeTime(unixMs) {
+  if (unixMs == null) return '—';
+  const diff = Date.now() - unixMs;
+  if (diff < 0) return 'just now';
+  const secs = Math.round(diff / 1000);
+  if (secs < 10) return 'just now';
+  if (secs < 60) return `${secs} seconds ago`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  // older than a day: show an absolute local timestamp
+  return new Date(unixMs).toLocaleString();
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+// --- state ---
+let latestShows = [];
+let deleting = new Set(); // names with an in-flight delete
+const banner = document.getElementById('banner');
+const content = document.getElementById('content');
+
+function showBanner(kind, text) {
+  banner.className = kind;
+  banner.textContent = text;
+  if (kind === 'ok') {
+    setTimeout(() => {
+      if (banner.textContent === text) { banner.className = ''; banner.textContent = ''; }
+    }, 4000);
+  }
+}
+
+function render() {
+  if (latestShows.length === 0) {
+    content.innerHTML = '<div class="empty">No shows yet.</div>';
+    return;
+  }
+
+  const rows = latestShows.map(show => {
+    const name = show.name;
+    const enc = escapeHtml(name);
+    const href = 'index.html?stream=' + encodeURIComponent(name);
+    const pill = show.live
+      ? '<span class="pill live">live</span>'
+      : '<span class="pill past">past</span>';
+    const isDeleting = deleting.has(name);
+    const delLabel = isDeleting ? 'Deleting…' : 'Delete';
+    const delAttr = isDeleting ? 'disabled' : '';
+    return `
+      <tr data-name="${enc}">
+        <td><a class="show-name" href="${escapeHtml(href)}">${enc}</a></td>
+        <td>${pill}</td>
+        <td class="v">${humanBytes(show.size_bytes)}</td>
+        <td class="v">${humanDuration(show.duration_ms)}</td>
+        <td class="v">${show.segment_count ?? 0}</td>
+        <td class="muted">${escapeHtml(relativeTime(show.modified_unix_ms))}</td>
+        <td><button class="danger" data-del="${enc}" ${delAttr}>${delLabel}</button></td>
+      </tr>`;
+  }).join('');
+
+  content.innerHTML = `
+    <table class="shows">
+      <thead>
+        <tr>
+          <th>Show</th><th>Status</th><th>Size</th><th>Duration</th>
+          <th>Segments</th><th>Last active</th><th></th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+  content.querySelectorAll('button[data-del]').forEach(btn => {
+    btn.onclick = () => onDelete(btn.getAttribute('data-del'));
+  });
+}
+
+async function onDelete(name) {
+  if (deleting.has(name)) return;
+  if (!confirm(`Delete show "${name}"?\n\nThis permanently removes all audio files the server received for it. This cannot be undone.`)) {
+    return;
+  }
+  deleting.add(name);
+  render();
+  try {
+    const resp = await fetch(apiBase + '/api/shows/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (resp.status === 204) {
+      latestShows = latestShows.filter(s => s.name !== name);
+      showBanner('ok', `Deleted "${name}".`);
+    } else if (resp.status === 404) {
+      latestShows = latestShows.filter(s => s.name !== name);
+      showBanner('err', `"${name}" no longer exists — it may have already been deleted.`);
+    } else {
+      showBanner('err', `Failed to delete "${name}" (server returned ${resp.status}).`);
+    }
+  } catch (e) {
+    showBanner('err', `Failed to delete "${name}": ${e.message || 'network error'}.`);
+  } finally {
+    deleting.delete(name);
+    render();
+  }
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch(apiBase + '/api/shows');
+    if (!resp.ok) {
+      if (banner.className !== 'err') showBanner('err', `Could not load shows (server returned ${resp.status}).`);
+      return;
+    }
+    const data = await resp.json();
+    if (!Array.isArray(data)) {
+      showBanner('err', 'Could not load shows: unexpected response from server.');
+      return;
+    }
+    latestShows = data;
+    if (banner.className === 'err') { banner.className = ''; banner.textContent = ''; }
+    render();
+  } catch (e) {
+    // Keep whatever is on screen; surface the problem without wiping the list.
+    if (latestShows.length === 0) {
+      content.innerHTML = '<div class="empty">Could not reach the server. Retrying…</div>';
+    }
+    showBanner('err', `Could not load shows: ${e.message || 'network error'}.`);
+  }
+}
+
+refresh();
+setInterval(refresh, 7000);
+</script>
+
+</body>
+</html>

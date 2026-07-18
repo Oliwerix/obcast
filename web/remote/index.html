@@ -52,12 +52,19 @@
   .legend { display: flex; gap: 16px; margin-top: 8px; font-size: 11px; color: #8a8f98; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .la-quality { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #b8bcc4; font-variant-numeric: tabular-nums; }
+  .la-quality i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; background: #3a3f47; }
+  .la-spacer { flex: 1 1 auto; }
+  .pill.buffering { background: #4a3a12; color: #facc15; }
+  .pill.stalled   { background: #3a1e1e; color: #f87171; }
+  .pill.error     { background: #3a1e1e; color: #f87171; }
+  .pill.live      { background: #1e4530; color: #4ade80; }
 </style>
 </head>
 <body>
 
 <h1>OBCast Remote</h1>
-<div class="sub">Stream: <span id="stream-name"></span></div>
+<div class="sub">Stream: <span id="stream-name"></span> &middot; <a href="shows.html" style="color:#8a8f98;">&larr; all shows</a></div>
 
 <div class="card">
   <h2>Server hardware output — the real playhead</h2>
@@ -123,7 +130,17 @@
     Independent HLS playback for checking levels/timing by ear. Has its own buffering and is
     <strong>not</strong> connected to the server's hardware output above.
   </div>
-  <audio id="player" controls></audio>
+  <audio id="player" style="display:none;"></audio>
+  <div class="row" style="margin-top:12px;">
+    <button id="la-playpause" class="primary" disabled>Play</button>
+    <span id="la-state" class="pill stopped">idle</span>
+    <span id="la-quality" class="la-quality"><i></i><span id="la-quality-label">—</span></span>
+    <span class="la-spacer"></span>
+    <button id="la-mute">Mute</button>
+    <input id="la-volume" type="range" min="0" max="100" value="100" />
+    <span id="la-volume-val" style="font-size:12px; color:#8a8f98;">100%</span>
+  </div>
+  <div class="note" id="la-time">—</div>
 </div>
 
 <script>
@@ -346,14 +363,126 @@ applyWaveform();
 setInterval(applyWaveform, 5000);
 
 // Listen-along player: independent HLS pull, not tied to server playout state.
+// Its own hls.js instance, media events drive a small custom transport UI, and
+// fatal hls.js errors self-recover (network -> startLoad, media -> recoverMediaError)
+// so a transient hiccup on this preview doesn't need a page reload.
 const audio = document.getElementById('player');
 const hlsUrl = `/hls/${stream}/master.m3u8`;
-if (Hls.isSupported()) {
+
+const laPlayPause = document.getElementById('la-playpause');
+const laStatePill = document.getElementById('la-state');
+const laQualityDot = document.querySelector('#la-quality i');
+const laQualityLabel = document.getElementById('la-quality-label');
+const laMute = document.getElementById('la-mute');
+const laVolume = document.getElementById('la-volume');
+const laVolumeVal = document.getElementById('la-volume-val');
+const laTime = document.getElementById('la-time');
+
+let laHls = null;
+let laLevels = [];
+let laRecoverTimer = null;
+
+function setLaState(state, label) {
+  laStatePill.textContent = label ?? state;
+  laStatePill.className = 'pill ' + state;
+}
+
+// Map an hls.js level index to lo/mid/hd naming + the waveform's RUNG_COLORS,
+// ranking levels by bitrate so the label stays meaningful for any rung count.
+const LA_RUNG_NAMES = ['lo', 'mid', 'hd'];
+function setLaQuality(idx) {
+  if (idx == null || idx < 0 || !laLevels.length || !laLevels[idx]) {
+    laQualityDot.style.background = GAP_COLOR;
+    laQualityLabel.textContent = '—';
+    return;
+  }
+  const ranked = laLevels
+    .map((l, i) => ({ i, bitrate: l.bitrate || 0 }))
+    .sort((a, b) => a.bitrate - b.bitrate);
+  const rank = ranked.findIndex(x => x.i === idx);
+  const rung = ranked.length <= 1
+    ? 0
+    : Math.round((rank / (ranked.length - 1)) * (LA_RUNG_NAMES.length - 1));
+  const kbps = Math.round((laLevels[idx].bitrate || 0) / 1000);
+  laQualityDot.style.background = RUNG_COLORS[rung] ?? '#8a8f98';
+  laQualityLabel.textContent = kbps ? `${LA_RUNG_NAMES[rung]} · ${kbps}k` : LA_RUNG_NAMES[rung];
+}
+
+function updateMuteBtn() {
+  laMute.textContent = (audio.muted || audio.volume === 0) ? 'Unmute' : 'Mute';
+}
+
+laPlayPause.onclick = () => {
+  if (audio.paused) audio.play().catch(() => {});
+  else audio.pause();
+};
+
+laVolume.oninput = () => {
+  const v = laVolume.value / 100;
+  audio.volume = v;
+  if (v > 0) audio.muted = false;
+  laVolumeVal.textContent = laVolume.value + '%';
+  updateMuteBtn();
+};
+
+laMute.onclick = () => {
+  audio.muted = !audio.muted;
+  updateMuteBtn();
+};
+
+audio.addEventListener('playing', () => { setLaState('live', 'live'); laPlayPause.textContent = 'Pause'; });
+audio.addEventListener('pause',   () => { setLaState('paused', 'paused'); laPlayPause.textContent = 'Play'; });
+audio.addEventListener('waiting', () => setLaState('buffering', 'buffering'));
+audio.addEventListener('stalled', () => setLaState('stalled', 'stalled'));
+audio.addEventListener('ended',   () => { setLaState('stopped', 'ended'); laPlayPause.textContent = 'Play'; });
+audio.addEventListener('timeupdate', () => {
+  let behind = 0;
+  if (audio.buffered.length) {
+    behind = Math.max(0, audio.buffered.end(audio.buffered.length - 1) - audio.currentTime);
+  }
+  laTime.textContent = behind < 1 ? 'At live edge' : `~${behind.toFixed(1)}s behind live edge`;
+});
+
+function buildLaHls() {
   const hls = new Hls();
+  laHls = hls;
+  hls.on(Hls.Events.MANIFEST_PARSED, () => {
+    laLevels = hls.levels || [];
+    laPlayPause.disabled = false;
+    setLaQuality(hls.currentLevel);
+  });
+  hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
+    laLevels = hls.levels || laLevels;
+    setLaQuality(data.level);
+  });
+  hls.on(Hls.Events.ERROR, (_e, data) => {
+    if (!data.fatal) return;
+    setLaState('error', 'error — recovering');
+    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      clearTimeout(laRecoverTimer);
+      laRecoverTimer = setTimeout(() => hls.startLoad(), 1000);
+    } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+      hls.recoverMediaError();
+    } else {
+      hls.destroy();
+      clearTimeout(laRecoverTimer);
+      laRecoverTimer = setTimeout(buildLaHls, 2000);
+    }
+  });
   hls.loadSource(hlsUrl);
   hls.attachMedia(audio);
+}
+
+setLaState('stopped', 'idle');
+setLaQuality(null);
+updateMuteBtn();
+
+if (Hls.isSupported()) {
+  buildLaHls();
 } else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
+  // Safari native HLS: no hls.js level info, so quality stays '—'.
   audio.src = hlsUrl;
+  laPlayPause.disabled = false;
 }
 </script>
 

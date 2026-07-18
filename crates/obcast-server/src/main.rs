@@ -7,16 +7,17 @@ mod api;
 mod ingest;
 mod origin;
 mod playout;
+mod shows;
 mod store;
 mod waveform;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use obcast_proto::state::{PlayoutStatus, Rung, ServerState, StreamProfile, WaterLevels};
 use tokio::sync::{broadcast, Mutex};
@@ -84,6 +85,30 @@ impl AppState {
         streams.insert(name.to_string(), handle.clone());
         handle
     }
+
+    /// A snapshot of currently in-memory streams, without creating any new
+    /// ones. Used to compute the `live` flag on the shows listing.
+    pub async fn stream_snapshot(&self) -> Vec<(String, Arc<StreamHandle>)> {
+        self.streams
+            .lock()
+            .await
+            .iter()
+            .map(|(name, handle)| (name.clone(), handle.clone()))
+            .collect()
+    }
+
+    /// Removes and returns a stream's handle without creating one if absent.
+    pub async fn remove_stream(&self, name: &str) -> Option<Arc<StreamHandle>> {
+        self.streams.lock().await.remove(name)
+    }
+
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub(crate) fn segment_ms(&self) -> u32 {
+        self.profile.segment_ms
+    }
 }
 
 /// Static web remote assets. Overridable so the server can be run from
@@ -150,6 +175,8 @@ async fn main() {
         .route("/api/:stream/playout", post(api::set_playout))
         .route("/api/:stream/ws", get(api::ws_handler))
         .route("/api/:stream/waveform", get(api::waveform_handler))
+        .route("/api/shows", get(shows::list_shows))
+        .route("/api/shows/:name", delete(shows::delete_show))
         .with_state(app_state)
         .nest_service("/remote", ServeDir::new(web_remote_dir()));
 
