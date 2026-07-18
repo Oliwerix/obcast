@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use obcast_proto::meter::{Ppm, Vu};
 use tokio::sync::mpsc as tokio_mpsc;
 
 /// The encoder always receives L/R PCM regardless of the source device's
@@ -84,10 +85,10 @@ pub struct AudioHandle {
     right_ch: AtomicU16,
     gain_db_bits: AtomicU32,
 
-    peak_l_bits: AtomicU32,
-    rms_l_bits: AtomicU32,
-    peak_r_bits: AtomicU32,
-    rms_r_bits: AtomicU32,
+    vu_l_bits: AtomicU32,
+    ppm_l_bits: AtomicU32,
+    vu_r_bits: AtomicU32,
+    ppm_r_bits: AtomicU32,
     clip_l: AtomicBool,
     clip_r: AtomicBool,
 
@@ -170,17 +171,19 @@ impl AudioHandle {
         self.live.store(live, Ordering::Relaxed);
     }
 
-    /// Linear (peak, rms) for the selected L and R channels, post-gain,
-    /// 0.0..=~1.4ish (gain can push a sample past digital 1.0 before the
-    /// clip is caught). Convert to dBFS at the call site.
+    /// Standards-based (VU, PPM) ballistics in dBFS for the selected L and R
+    /// channels, post-gain: `((vu_l_db, ppm_l_db), (vu_r_db, ppm_r_db))`. The
+    /// IEC 60268-17 VU is the slow loudness reading, the IEC 60268-10 PPM the
+    /// fast peak reading; both are computed sample-accurately on the audio
+    /// thread, so these are already dB — no conversion needed at the call site.
     pub fn meters(&self) -> ((f32, f32), (f32, f32)) {
         let l = (
-            f32::from_bits(self.peak_l_bits.load(Ordering::Relaxed)),
-            f32::from_bits(self.rms_l_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.vu_l_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.ppm_l_bits.load(Ordering::Relaxed)),
         );
         let r = (
-            f32::from_bits(self.peak_r_bits.load(Ordering::Relaxed)),
-            f32::from_bits(self.rms_r_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.vu_r_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.ppm_r_bits.load(Ordering::Relaxed)),
         );
         (l, r)
     }
@@ -216,10 +219,10 @@ pub fn spawn(pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>) -> Arc<AudioHandle> 
         left_ch: AtomicU16::new(0),
         right_ch: AtomicU16::new(1),
         gain_db_bits: AtomicU32::new(0.0f32.to_bits()),
-        peak_l_bits: AtomicU32::new(0),
-        rms_l_bits: AtomicU32::new(0),
-        peak_r_bits: AtomicU32::new(0),
-        rms_r_bits: AtomicU32::new(0),
+        vu_l_bits: AtomicU32::new((-100.0f32).to_bits()),
+        ppm_l_bits: AtomicU32::new((-100.0f32).to_bits()),
+        vu_r_bits: AtomicU32::new((-100.0f32).to_bits()),
+        ppm_r_bits: AtomicU32::new((-100.0f32).to_bits()),
         clip_l: AtomicBool::new(false),
         clip_r: AtomicBool::new(false),
         channel_peaks: RwLock::new(Vec::new()),
@@ -301,13 +304,20 @@ fn open_stream(
 
     let err_fn = |err| tracing::error!(error = %err, "capture stream error");
 
+    // Ballistic filter state lives here and is moved into the callback so it
+    // persists across callbacks — the whole point of the 300 ms VU / 650 ms
+    // PPM time constants is that they span many blocks. Only the audio thread
+    // ever touches it, so no locking is involved.
+    let mut meters = MeterState::new();
+    let ch = channels as usize;
+
     let stream = match sample_format {
         cpal::SampleFormat::F32 => {
             let h = handle.clone();
             let tx = pcm_tx.clone();
             device.build_input_stream(
                 config,
-                move |data: &[f32], _| process_block(data, channels as usize, &h, &tx),
+                move |data: &[f32], _| process_block(data, ch, sample_rate, &h, &tx, &mut meters),
                 err_fn,
                 None,
             )?
@@ -319,7 +329,7 @@ fn open_stream(
                 config,
                 move |data: &[i16], _| {
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
-                    process_block(&f, channels as usize, &h, &tx)
+                    process_block(&f, ch, sample_rate, &h, &tx, &mut meters)
                 },
                 err_fn,
                 None,
@@ -335,7 +345,7 @@ fn open_stream(
                         .iter()
                         .map(|&s| (s as f32 - 32768.0) / 32768.0)
                         .collect();
-                    process_block(&f, channels as usize, &h, &tx)
+                    process_block(&f, ch, sample_rate, &h, &tx, &mut meters)
                 },
                 err_fn,
                 None,
@@ -348,14 +358,42 @@ fn open_stream(
     Ok((stream, channels, sample_rate, opened_name))
 }
 
+/// Persistent per-channel meter ballistics, owned by the audio callback so
+/// its envelope state survives across callbacks. `scratch_l`/`scratch_r` are
+/// reused each block to hand the ballistics a contiguous per-channel slice
+/// without allocating.
+struct MeterState {
+    vu_l: Vu,
+    ppm_l: Ppm,
+    vu_r: Vu,
+    ppm_r: Ppm,
+    scratch_l: Vec<f32>,
+    scratch_r: Vec<f32>,
+}
+
+impl MeterState {
+    fn new() -> Self {
+        Self {
+            vu_l: Vu::new(),
+            ppm_l: Ppm::new(),
+            vu_r: Vu::new(),
+            ppm_r: Ppm::new(),
+            scratch_l: Vec::new(),
+            scratch_r: Vec::new(),
+        }
+    }
+}
+
 /// Runs on the audio callback: pick L/R out of the device's native
 /// channels, apply gain, meter, and (if live) forward to the encoder.
-/// Never blocks and never allocates more than one `Vec` per callback.
+/// Never blocks and never allocates more than the output `Vec` per callback.
 fn process_block(
     raw: &[f32],
     channels: usize,
+    sample_rate: u32,
     handle: &AudioHandle,
     pcm_tx: &tokio_mpsc::UnboundedSender<Vec<f32>>,
+    meters: &mut MeterState,
 ) {
     if channels == 0 {
         return;
@@ -383,7 +421,8 @@ fn process_block(
     let gain = 10f32.powf(handle.gain_db() / 20.0);
 
     let mut out = Vec::with_capacity(frames * OUT_CHANNELS);
-    let (mut peak_l, mut peak_r, mut sum_l, mut sum_r) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    meters.scratch_l.clear();
+    meters.scratch_r.clear();
 
     for f in 0..frames {
         let base = f * channels;
@@ -403,27 +442,31 @@ fn process_block(
         l = l.clamp(-1.0, 1.0);
         r = r.clamp(-1.0, 1.0);
 
-        peak_l = peak_l.max(l.abs());
-        peak_r = peak_r.max(r.abs());
-        sum_l += l * l;
-        sum_r += r * r;
+        meters.scratch_l.push(l);
+        meters.scratch_r.push(r);
         out.push(l);
         out.push(r);
     }
 
-    let n = frames.max(1) as f32;
+    // Feed the post-gain, post-clamp block through the IEC ballistics
+    // sample-accurately (they step internally), then publish dBFS readings.
+    meters.vu_l.process(&meters.scratch_l, sample_rate);
+    meters.ppm_l.process(&meters.scratch_l, sample_rate);
+    meters.vu_r.process(&meters.scratch_r, sample_rate);
+    meters.ppm_r.process(&meters.scratch_r, sample_rate);
+
     handle
-        .peak_l_bits
-        .store(peak_l.to_bits(), Ordering::Relaxed);
+        .vu_l_bits
+        .store(meters.vu_l.value_db().to_bits(), Ordering::Relaxed);
     handle
-        .peak_r_bits
-        .store(peak_r.to_bits(), Ordering::Relaxed);
+        .ppm_l_bits
+        .store(meters.ppm_l.value_db().to_bits(), Ordering::Relaxed);
     handle
-        .rms_l_bits
-        .store((sum_l / n).sqrt().to_bits(), Ordering::Relaxed);
+        .vu_r_bits
+        .store(meters.vu_r.value_db().to_bits(), Ordering::Relaxed);
     handle
-        .rms_r_bits
-        .store((sum_r / n).sqrt().to_bits(), Ordering::Relaxed);
+        .ppm_r_bits
+        .store(meters.ppm_r.value_db().to_bits(), Ordering::Relaxed);
 
     if handle.live.load(Ordering::Relaxed) {
         let _ = pcm_tx.send(out);
