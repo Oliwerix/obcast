@@ -14,3 +14,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-stream = "0.3"
 futures = "0.3"
+cpal = "0.18"
+ringbuf = "0.5"

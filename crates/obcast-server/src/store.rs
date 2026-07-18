@@ -89,11 +89,11 @@ impl DvrStore {
         }
     }
 
-    fn live_seq(&self) -> Option<Seq> {
+    pub fn live_seq(&self) -> Option<Seq> {
         self.index.keys().next_back().copied()
     }
 
-    fn dvr_start_seq(&self) -> Option<Seq> {
+    pub fn dvr_start_seq(&self) -> Option<Seq> {
         self.index.keys().next().copied()
     }
 

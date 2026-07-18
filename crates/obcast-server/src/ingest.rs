@@ -16,7 +16,7 @@ use obcast_proto::state::{RungId, Seq, ServerState};
 
 use crate::{AppState, StreamHandle};
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -65,8 +65,7 @@ fn check_auth(handle: &StreamHandle, headers: &HeaderMap) -> Result<(), ApiError
 
 async fn current_state(handle: &StreamHandle) -> ServerState {
     let store = handle.store.lock().await;
-    let playout = handle.playout.lock().await.clone();
-    store.build_server_state(playout)
+    store.build_server_state(handle.playout_status())
 }
 
 pub async fn upload_segment(
@@ -97,9 +96,9 @@ pub async fn upload_segment(
     let state = {
         let mut store = handle.store.lock().await;
         store.record(rung, seq);
-        let playout = handle.playout.lock().await.clone();
-        store.build_server_state(playout)
+        store.build_server_state(handle.playout_status())
     };
+    *handle.last_ingest.lock().await = Some(std::time::Instant::now());
     let _ = handle.tx.send(state.clone());
     tracing::info!(stream, rung, seq, bytes = body.len(), "segment ingested");
     Ok(Json(state))

@@ -1,33 +1,49 @@
 //! obcast-server: ingest + DVR store + `ServerState` computation + SSE state
-//! feed (M1), plus an HLS origin (M4). Hardware playout and the control API
-//! land in later milestones — see CLAUDE.md. `debug::set_playout` is a
-//! stand-in for M5 so the scheduler's upgrade tier can be exercised.
+//! feed (M1), an HLS origin (M4), and hardware playout via cpal (M5), with a
+//! minimal REST control surface (`api.rs`) to drive it. The full control API
+//! (WS events, encoder telemetry, auth) and the web remote are M6/M7 — see
+//! CLAUDE.md.
 
-mod debug;
+mod api;
 mod ingest;
 mod origin;
+mod playout;
 mod store;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::routing::{get, post};
 use axum::Router;
-use obcast_proto::state::{
-    PlayoutState, PlayoutStatus, Rung, ServerState, StreamProfile, WaterLevels,
-};
+use obcast_proto::state::{PlayoutStatus, Rung, ServerState, StreamProfile, WaterLevels};
 use tokio::sync::{broadcast, Mutex};
 
+use playout::PlayoutHandle;
 use store::DvrStore;
 
-/// Per-stream state: the DVR index, the playout stub, and the SSE broadcaster.
+/// Per-stream state: the DVR index, the playout engine handle, and the SSE
+/// broadcaster. `store` is behind an `Arc` (not just a `Mutex`) because the
+/// playout engine thread holds its own clone alongside every HTTP handler.
 pub struct StreamHandle {
-    pub store: Mutex<DvrStore>,
-    pub playout: Mutex<PlayoutStatus>,
+    pub store: Arc<Mutex<DvrStore>>,
+    pub playout: Arc<PlayoutHandle>,
     pub tx: broadcast::Sender<ServerState>,
     pub ingest_token: Option<String>,
+    pub last_ingest: Mutex<Option<Instant>>,
+}
+
+impl StreamHandle {
+    pub fn playout_status(&self) -> PlayoutStatus {
+        PlayoutStatus {
+            state: self.playout.playout_state(),
+            position_seq: self.playout.position(),
+            device: None,
+            volume: self.playout.volume(),
+        }
+    }
 }
 
 pub struct AppState {
@@ -40,29 +56,29 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Look up a stream's handle, lazily creating it on first contact.
+    /// Look up a stream's handle, lazily creating it (and its playout
+    /// engine thread) on first contact.
     pub async fn stream(&self, name: &str) -> Arc<StreamHandle> {
         let mut streams = self.streams.lock().await;
         if let Some(handle) = streams.get(name) {
             return handle.clone();
         }
-        let store = DvrStore::new(
+        let store = Arc::new(Mutex::new(DvrStore::new(
             self.profile.clone(),
             self.water,
             self.dvr_window_ms,
             self.data_dir.join(name),
-        );
+        )));
+        let rungs = self.profile.rungs.iter().map(|r| r.id).collect();
+        let playout = playout::spawn(store.clone(), rungs);
+
         let (tx, _rx) = broadcast::channel(64);
         let handle = Arc::new(StreamHandle {
-            store: Mutex::new(store),
-            playout: Mutex::new(PlayoutStatus {
-                state: PlayoutState::Stopped,
-                position_seq: None,
-                device: None,
-                volume: 1.0,
-            }),
+            store,
+            playout,
             tx,
             ingest_token: self.ingest_token.clone(),
+            last_ingest: Mutex::new(None),
         });
         streams.insert(name.to_string(), handle.clone());
         handle
@@ -120,7 +136,8 @@ async fn main() {
         .route("/ingest/:stream/state", get(ingest::state_feed))
         .route("/hls/:stream/master.m3u8", get(origin::master_playlist))
         .route("/hls/:stream/:rendition/:tail", get(origin::rendition_tail))
-        .route("/debug/:stream/playout", post(debug::set_playout))
+        .route("/api/:stream/status", get(api::status))
+        .route("/api/:stream/playout", post(api::set_playout))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
