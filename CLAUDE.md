@@ -108,6 +108,8 @@ obcast/
         playout.rs                 # cpal hardware output: start/stop/seek, ffmpeg decode, meters
         api.rs                     # control REST + WS (status / playout / events)
         waveform.rs                # quality-colored waveform JSON for the web remote
+        shows.rs                   # global shows listing (list/delete) for the web UI
+        config.rs                  # obcast-server.toml: playout audio subsystem/device
     obcast-client/
       src/
         main.rs

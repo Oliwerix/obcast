@@ -65,6 +65,8 @@ struct ObcastApp {
     shared: Arc<SharedState>,
     cmd_tx: tokio_mpsc::UnboundedSender<ControllerCmd>,
 
+    hosts: Vec<String>,
+    selected_host: String,
     devices: Vec<audio::DeviceInfo>,
     selected_device: String,
     cfg: AppConfig,
@@ -84,9 +86,10 @@ impl ObcastApp {
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         rt.spawn(controller(cmd_rx, pcm_rx, audio.clone(), shared.clone()));
 
-        let devices = audio::list_input_devices();
+        let hosts = audio::list_hosts();
+        let devices = audio::list_input_devices(&cfg.audio_host);
         if !cfg.device_name.is_empty() {
-            audio.open(&cfg.device_name);
+            audio.open(&cfg.audio_host, &cfg.device_name);
         }
 
         Self {
@@ -94,6 +97,8 @@ impl ObcastApp {
             audio,
             shared,
             cmd_tx,
+            hosts,
+            selected_host: cfg.audio_host.clone(),
             devices,
             selected_device: cfg.device_name.clone(),
             cfg,
@@ -202,6 +207,44 @@ impl ObcastApp {
     }
 
     fn device_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Audio Subsystem");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("host_combo")
+                .width(260.0)
+                .selected_text(if self.selected_host.is_empty() {
+                    "(platform default)".to_string()
+                } else {
+                    self.selected_host.clone()
+                })
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_value(
+                            &mut self.selected_host,
+                            String::new(),
+                            "(platform default)",
+                        )
+                        .changed()
+                    {
+                        self.devices = audio::list_input_devices(&self.selected_host);
+                        self.selected_device.clear();
+                    }
+                    for h in self.hosts.clone() {
+                        if ui
+                            .selectable_value(&mut self.selected_host, h.clone(), h)
+                            .changed()
+                        {
+                            self.devices = audio::list_input_devices(&self.selected_host);
+                            self.selected_device.clear();
+                        }
+                    }
+                });
+            if self.selected_host != self.cfg.audio_host {
+                self.cfg.audio_host = self.selected_host.clone();
+                self.persist_config();
+            }
+        });
+
+        ui.separator();
         ui.heading("Input Device");
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("device_combo")
@@ -223,12 +266,12 @@ impl ObcastApp {
                 .on_hover_text("Refresh device list")
                 .clicked()
             {
-                self.devices = audio::list_input_devices();
+                self.devices = audio::list_input_devices(&self.selected_host);
             }
         });
         ui.horizontal(|ui| {
             if ui.button("Open").clicked() && !self.selected_device.is_empty() {
-                self.audio.open(&self.selected_device);
+                self.audio.open(&self.selected_host, &self.selected_device);
                 self.cfg.device_name = self.selected_device.clone();
                 self.persist_config();
             }

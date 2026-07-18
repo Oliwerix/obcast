@@ -30,6 +30,36 @@ Config is via environment variables, all optional:
 Each `{stream}` name is created lazily on first contact (first ingest, first
 status request, etc.) — there's no separate "create a stream" step.
 
+### Picking the playout audio subsystem/device
+
+The rest of the server's config is environment variables, but the hardware
+playout device is a TOML file (`OBCAST_CONFIG_FILE`, default
+`obcast-server.toml` in the working directory) since it's a per-machine
+setting rather than a per-run one:
+
+```toml
+# obcast-server.toml
+[audio]
+host = "PulseAudio"   # cpal host / "audio subsystem": e.g. ALSA, JACK,
+                       # PulseAudio, WASAPI, CoreAudio. Empty = platform default.
+device = ""            # output device name within that host. Empty = its default.
+```
+
+The file (and each field) is optional — a missing file, or one that only sets
+`host`, just leaves the rest at the platform default. `ALSA`/`WASAPI`/
+`CoreAudio` are always available; `JACK` and `PulseAudio` are opt-in cargo
+features (off by default so a plain `cargo build` never needs `libjack`/
+`libpulse` dev headers):
+
+```
+cargo build -p obcast-server --features jack,pulseaudio
+```
+
+If `host`/`device` don't match anything available at startup, playout logs an
+error and disables itself — same as the old "no default output device"
+behavior, just resolved against the configured subsystem/device instead of
+always the platform default.
+
 ## Run the encoder client
 
 ```
@@ -48,6 +78,13 @@ Useful flags:
 Find a real capture device with `pactl list sources short`. Without `--device`,
 the client synthesizes a 440Hz test tone (paced in real time), which is enough
 to exercise the whole pipeline without any audio hardware.
+
+The GUI (the default, non-`--headless` path) has an **Audio Subsystem**
+picker above the device list — pick a cpal host (ALSA/JACK/PulseAudio/
+WASAPI/CoreAudio, whatever's available) before picking a device from it. Like
+the device and channel map, the choice is persisted to the client's TOML
+config across restarts. `JACK`/`PulseAudio` need the same opt-in cargo
+features as the server: `cargo build -p obcast-client --features jack,pulseaudio`.
 
 ## Listen
 
@@ -98,8 +135,11 @@ explains why.
 
 ## Troubleshooting
 
-- **No sound from playout, no errors**: check the server logs for "no default
-  audio output device" — playout silently no-ops without one.
+- **No sound from playout, no errors**: check the server logs for "no matching
+  audio output device" — playout silently no-ops without one. If you set
+  `[audio]` in `obcast-server.toml`, double check `host`/`device` actually
+  match something `cargo run -p obcast-server --features jack,pulseaudio`
+  (if used) has compiled in on this machine.
 - **`ffmpeg: command not found`**: both crates shell out to it; it must be on
   the server's and the client's `PATH`.
 - **Web remote shows "link: down"**: the server marks a stream's link down

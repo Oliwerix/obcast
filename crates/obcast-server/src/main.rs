@@ -4,6 +4,7 @@
 //! Auth hardening and packaging are M7 — see CLAUDE.md.
 
 mod api;
+mod config;
 mod ingest;
 mod origin;
 mod playout;
@@ -23,6 +24,7 @@ use obcast_proto::state::{PlayoutStatus, Rung, ServerState, StreamProfile, Water
 use tokio::sync::{broadcast, Mutex};
 use tower_http::services::ServeDir;
 
+use config::AudioConfig;
 use playout::PlayoutHandle;
 use store::DvrStore;
 
@@ -42,7 +44,7 @@ impl StreamHandle {
         PlayoutStatus {
             state: self.playout.playout_state(),
             position_seq: self.playout.position(),
-            device: None,
+            device: self.playout.device_name(),
             volume: self.playout.volume(),
         }
     }
@@ -55,6 +57,7 @@ pub struct AppState {
     water: WaterLevels,
     dvr_window_ms: u32,
     ingest_token: Option<String>,
+    audio: AudioConfig,
 }
 
 impl AppState {
@@ -72,7 +75,7 @@ impl AppState {
             self.data_dir.join(name),
         )));
         let rungs = self.profile.rungs.iter().map(|r| r.id).collect();
-        let playout = playout::spawn(store.clone(), rungs);
+        let playout = playout::spawn(store.clone(), rungs, self.audio.clone());
 
         let (tx, _rx) = broadcast::channel(64);
         let handle = Arc::new(StreamHandle {
@@ -155,6 +158,7 @@ async fn main() {
         .parse()
         .expect("invalid OBCAST_LISTEN_ADDR");
     let ingest_token = std::env::var("OBCAST_INGEST_TOKEN").ok();
+    let server_cfg = config::ServerConfig::load();
 
     let app_state = Arc::new(AppState {
         streams: Mutex::new(HashMap::new()),
@@ -163,6 +167,7 @@ async fn main() {
         water: WaterLevels::default(),
         dvr_window_ms: 5 * 60 * 1000,
         ingest_token,
+        audio: server_cfg.audio,
     });
 
     let app = Router::new()

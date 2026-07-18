@@ -18,3 +18,11 @@ cpal = "0.18"
 directories = "6.0.0"
 toml = "1.1.3"
 anyhow = "1.0.103"
+
+# Off by default so a plain `cargo build` never needs libjack/libpulse dev
+# headers. Enable per-machine to expose more audio subsystems in the
+# "Audio Subsystem" picker on Linux/BSD, e.g.
+# `cargo build -p obcast-client --features jack,pulseaudio`.
+[features]
+jack = ["cpal/jack"]
+pulseaudio = ["cpal/pulseaudio"]

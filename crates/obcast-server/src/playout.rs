@@ -13,7 +13,7 @@
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -23,7 +23,38 @@ use tokio::sync::{mpsc, Mutex};
 
 use obcast_proto::state::{PlayoutState, RungId, Seq};
 
+use crate::config::AudioConfig;
 use crate::store::DvrStore;
+
+/// `Device` only exposes its name via `description()` (or the `Display`
+/// impl, which panics through `to_string()` if the backend call fails) —
+/// this never panics. Mirrors `obcast-client`'s `audio::device_name`.
+fn device_name(d: &cpal::Device) -> String {
+    d.description()
+        .map(|desc| desc.name().to_string())
+        .unwrap_or_else(|_| "<unknown device>".to_string())
+}
+
+/// Resolves a host name (from the config file) to a cpal `Host`, falling
+/// back to the platform default for an empty name or one unavailable on
+/// this machine.
+fn resolve_host(name: &str) -> cpal::Host {
+    if name.is_empty() {
+        return cpal::default_host();
+    }
+    cpal::available_hosts()
+        .into_iter()
+        .find(|id| id.name().eq_ignore_ascii_case(name))
+        .and_then(|id| cpal::host_from_id(id).ok())
+        .unwrap_or_else(cpal::default_host)
+}
+
+fn resolve_output_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    if name.is_empty() {
+        return host.default_output_device();
+    }
+    host.output_devices().ok()?.find(|d| device_name(d) == name)
+}
 
 const CHANNELS: usize = 2;
 const RING_CAPACITY_FRAMES: usize = 48_000 * CHANNELS; // ~1s at 48kHz stereo
@@ -48,10 +79,18 @@ pub struct PlayoutHandle {
     // f32 bits since there's no stable AtomicF32.
     vu_bits: AtomicU32,
     ppm_bits: AtomicU32,
+    /// Name of the output device actually opened, set once by the engine
+    /// thread at startup; empty until then or if no device was found.
+    device_name: RwLock<String>,
     cmd_tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
 impl PlayoutHandle {
+    pub fn device_name(&self) -> Option<String> {
+        let name = self.device_name.read().unwrap();
+        (!name.is_empty()).then(|| name.clone())
+    }
+
     pub fn position(&self) -> Option<Seq> {
         let v = self.position_seq.load(Ordering::Relaxed);
         (v >= 0).then_some(v as Seq)
@@ -86,8 +125,13 @@ impl PlayoutHandle {
 }
 
 /// Spawns the playout engine on its own OS thread and returns a handle for
-/// issuing commands and reading live status.
-pub fn spawn(store: Arc<Mutex<DvrStore>>, rungs: Vec<RungId>) -> Arc<PlayoutHandle> {
+/// issuing commands and reading live status. `audio_cfg` picks the audio
+/// subsystem (cpal host) and output device from `obcast-server.toml`.
+pub fn spawn(
+    store: Arc<Mutex<DvrStore>>,
+    rungs: Vec<RungId>,
+    audio_cfg: AudioConfig,
+) -> Arc<PlayoutHandle> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let handle = Arc::new(PlayoutHandle {
         running: AtomicBool::new(false),
@@ -96,6 +140,7 @@ pub fn spawn(store: Arc<Mutex<DvrStore>>, rungs: Vec<RungId>) -> Arc<PlayoutHand
         volume_millis: AtomicU32::new(1000),
         vu_bits: AtomicU32::new(0),
         ppm_bits: AtomicU32::new(0),
+        device_name: RwLock::new(String::new()),
         cmd_tx,
     });
 
@@ -104,7 +149,7 @@ pub fn spawn(store: Arc<Mutex<DvrStore>>, rungs: Vec<RungId>) -> Arc<PlayoutHand
     // `Handle::current()` on.
     let rt = tokio::runtime::Handle::current();
     let worker_handle = handle.clone();
-    std::thread::spawn(move || run_engine(rt, store, rungs, worker_handle, cmd_rx));
+    std::thread::spawn(move || run_engine(rt, store, rungs, audio_cfg, worker_handle, cmd_rx));
 
     handle
 }
@@ -113,15 +158,21 @@ fn run_engine(
     rt: tokio::runtime::Handle,
     store: Arc<Mutex<DvrStore>>,
     rungs: Vec<RungId>,
+    audio_cfg: AudioConfig,
     handle: Arc<PlayoutHandle>,
     mut cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
 ) {
-    let host = cpal::default_host();
-    let Some(device) = host.default_output_device() else {
-        tracing::error!("no default audio output device; playout disabled");
+    let host = resolve_host(&audio_cfg.host);
+    let Some(device) = resolve_output_device(&host, &audio_cfg.device) else {
+        tracing::error!(
+            host = %audio_cfg.host,
+            device = %audio_cfg.device,
+            "no matching audio output device; playout disabled"
+        );
         drain_forever(&mut cmd_rx);
         return;
     };
+    *handle.device_name.write().unwrap() = device_name(&device);
     let Ok(supported) = device.default_output_config() else {
         tracing::error!("output device has no default config; playout disabled");
         drain_forever(&mut cmd_rx);

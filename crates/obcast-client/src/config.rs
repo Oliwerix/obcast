@@ -18,6 +18,9 @@ pub struct AppConfig {
     pub segment_ms: u32,
     pub out_dir: String,
 
+    /// Audio subsystem (cpal host) to open `device_name` from, e.g. "ALSA",
+    /// "JACK", "PulseAudio", "WASAPI", "CoreAudio". Empty = platform default.
+    pub audio_host: String,
     pub device_name: String,
     pub mono: bool,
     pub left_channel: u16,
@@ -33,6 +36,7 @@ impl Default for AppConfig {
             ingest_token: String::new(),
             segment_ms: 2000,
             out_dir: "./client-buffer".into(),
+            audio_host: String::new(),
             device_name: String::new(),
             mono: false,
             left_channel: 0,

@@ -46,11 +46,37 @@ fn device_name(d: &cpal::Device) -> String {
         .unwrap_or_else(|_| "<unknown device>".to_string())
 }
 
-/// Enumerate input devices on the default host. Works the same way on
-/// Windows (WASAPI), macOS (CoreAudio) and Linux (ALSA/JACK/PulseAudio,
-/// whichever cpal picks as the default host) — no platform branching here.
-pub fn list_input_devices() -> Vec<DeviceInfo> {
-    let host = cpal::default_host();
+/// Names of the audio subsystems (cpal hosts) available on this platform —
+/// e.g. `["ALSA", "JACK", "PulseAudio"]` on Linux, `["WASAPI"]` (or
+/// `["WASAPI", "ASIO"]`) on Windows, `["CoreAudio"]` on macOS. Always
+/// non-empty: cpal guarantees at least one host per platform.
+pub fn list_hosts() -> Vec<String> {
+    cpal::available_hosts()
+        .into_iter()
+        .map(|id| id.name().to_string())
+        .collect()
+}
+
+/// Resolves a host name from [`list_hosts`] to a cpal `Host`, falling back
+/// to the platform default for an empty name or one that isn't currently
+/// available (e.g. a subsystem picked on a different machine).
+fn resolve_host(name: &str) -> cpal::Host {
+    if name.is_empty() {
+        return cpal::default_host();
+    }
+    cpal::available_hosts()
+        .into_iter()
+        .find(|id| id.name().eq_ignore_ascii_case(name))
+        .and_then(|id| cpal::host_from_id(id).ok())
+        .unwrap_or_else(cpal::default_host)
+}
+
+/// Enumerate input devices on the given audio subsystem (cpal host); an
+/// empty `host_name` means the platform default. Works the same way on
+/// Windows (WASAPI), macOS (CoreAudio) and Linux (ALSA/JACK/PulseAudio) — no
+/// platform branching here, just which host the operator picked.
+pub fn list_input_devices(host_name: &str) -> Vec<DeviceInfo> {
+    let host = resolve_host(host_name);
     let Ok(devices) = host.input_devices() else {
         return Vec::new();
     };
@@ -67,7 +93,7 @@ pub fn list_input_devices() -> Vec<DeviceInfo> {
 }
 
 enum AudioCommand {
-    Open(String),
+    Open { host: String, device: String },
     Close,
 }
 
@@ -130,10 +156,11 @@ impl AudioHandle {
         self.last_error.read().unwrap().clone()
     }
 
-    pub fn open(&self, device_name: &str) {
-        let _ = self
-            .cmd_tx
-            .send(AudioCommand::Open(device_name.to_string()));
+    pub fn open(&self, host_name: &str, device_name: &str) {
+        let _ = self.cmd_tx.send(AudioCommand::Open {
+            host: host_name.to_string(),
+            device: device_name.to_string(),
+        });
     }
 
     pub fn close(&self) {
@@ -250,9 +277,9 @@ fn run_engine(
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            AudioCommand::Open(name) => {
+            AudioCommand::Open { host, device } => {
                 stream = None; // close any previous device before opening the next
-                match open_stream(&name, handle.clone(), pcm_tx.clone()) {
+                match open_stream(&host, &device, handle.clone(), pcm_tx.clone()) {
                     Ok((s, channels, rate, opened_name)) => {
                         handle.device_channels.store(channels, Ordering::Relaxed);
                         handle.sample_rate.store(rate, Ordering::Relaxed);
@@ -261,12 +288,12 @@ fn run_engine(
                         handle.running.store(true, Ordering::Relaxed);
                         *handle.last_error.write().unwrap() = None;
                         stream = Some(s);
-                        tracing::info!(device = %name, channels, rate, "capture device opened");
+                        tracing::info!(host = %host, device = %device, channels, rate, "capture device opened");
                     }
                     Err(err) => {
                         handle.running.store(false, Ordering::Relaxed);
                         *handle.last_error.write().unwrap() = Some(err.to_string());
-                        tracing::warn!(device = %name, error = %err, "failed to open capture device");
+                        tracing::warn!(host = %host, device = %device, error = %err, "failed to open capture device");
                     }
                 }
             }
@@ -279,11 +306,12 @@ fn run_engine(
 }
 
 fn open_stream(
+    host_name: &str,
     name: &str,
     handle: Arc<AudioHandle>,
     pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>,
 ) -> Result<(cpal::Stream, u16, u32, String)> {
-    let host = cpal::default_host();
+    let host = resolve_host(host_name);
     let device = if name.is_empty() || name == "default" {
         host.default_input_device()
     } else {

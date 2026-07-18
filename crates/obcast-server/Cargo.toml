@@ -16,3 +16,11 @@ async-stream = "0.3"
 futures = "0.3"
 cpal = "0.18"
 ringbuf = "0.5"
+toml = "1.1.3"
+
+# Off by default so a plain `cargo build` never needs libjack/libpulse dev
+# headers. Enable per-machine to pick more audio subsystems for playout in
+# `obcast-server.toml`, e.g. `cargo build -p obcast-server --features jack,pulseaudio`.
+[features]
+jack = ["cpal/jack"]
+pulseaudio = ["cpal/pulseaudio"]
