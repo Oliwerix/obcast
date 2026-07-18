@@ -69,10 +69,10 @@ Chosen for single-binary robustness in the field and one shared type crate acros
 | Server framework   | `axum` (ingest, HLS origin, control REST, WS) + `tower-http`      |
 | Server → encoder feed | SSE over `axum`; also piggybacked on upload responses          |
 | Client audio I/O   | `cpal` (capture + playout device access)                          |
-| Encode / decode    | `ffmpeg` via subprocess (AAC-LC; HE-AAC low rung). `symphonia` for decode-only paths |
-| Client GUI         | `egui`/`eframe` (simplest cross-platform), or Tauri if a web UI is preferred |
+| Encode / decode    | `ffmpeg` via subprocess, one process → N rungs (currently AAC-LC on every rung; native `aac` can't emit HE-AAC, so the low rung needs `libfdk_aac` to get its intended win). `symphonia` for decode-only paths |
+| Client GUI         | `egui`/`eframe` (chosen, done); also a `--headless` CLI path with no GUI |
 | DVR store          | Filesystem segments + in-memory index (optionally `rusqlite`)     |
-| Web listen / UI    | `hls.js` (native HLS on Safari); small Vite app                   |
+| Web listen / UI    | `hls.js` + `peaks.js`, loaded from CDN by a single static `web/remote/index.html` — no bundler/build step |
 | Packaging          | `cargo dist` / static binaries (client), Docker (server)          |
 
 Keep the ingest / control / HLS contracts in `obcast-proto` and `docs/protocol.md` — they are the
@@ -89,21 +89,43 @@ obcast/
   README.md
   docs/
     protocol.md                    # control plane + feedback loop (authoritative)
+    getting-started.md             # quick-start / run guide
+  web/
+    remote/index.html              # static web remote (control + listen + waveform), no build step
   crates/
-    obcast-proto/                  # DONE (built + unit-tested)
+    obcast-proto/                  # state/control types + scheduler + tests
       src/
         lib.rs
         state.rs                   # ServerState, EncoderState, StreamProfile, water levels
         control.rs                 # PlayoutCommand, ControlStatus, ControlEvent, ...
         scheduler.rs               # plan_uploads(): the closed-loop core + tests
-    obcast-server/                 # SKELETON — build out ingest/DVR/origin/playout/control
-      src/main.rs
-    obcast-client/                 # SKELETON — build out capture/encode/buffer/uploader/gui
-      src/main.rs
+    obcast-server/
+      src/
+        main.rs
+        ingest.rs                  # segment upload, abandon, SSE state feed
+        store.rs                   # DvrStore: in-mem index, disk bytes, eviction, build_server_state
+        origin.rs                  # HLS master + per-rung sliding-window playlists
+        playout.rs                 # cpal hardware output: start/stop/seek, ffmpeg decode, meters
+        api.rs                     # control REST + WS (status / playout / events)
+        waveform.rs                # quality-colored waveform JSON for the web remote
+    obcast-client/
+      src/
+        main.rs
+        audio.rs                   # cpal capture, channel-map, gain, level meters
+        encode.rs                  # ffmpeg ABR encode (one proc → N rungs)
+        inventory.rs               # scans {rung}/{seq}.ts disk ring buffer
+        uploader.rs                # tick loop driving plan_uploads; folds ServerState from replies
+        sse.rs                     # reconnecting ServerState feed
+        shared.rs                  # shared client state/handles
+        config.rs                  # persisted operator config (TOML)
+        gui/{mod,app,meter}.rs     # egui shell, panels, K-14 meters
 ```
 
-When the server/client crates grow, use modules like `ingest/`, `store/`, `origin/`, `playout/`,
-`control/` (server) and `audio/`, `encode/`, `buffer/`, `upload/`, `gui/` (client).
+The layout is flat files per crate (not nested module dirs). On the server, `api.rs` is the control
+module and `waveform.rs` backs the web remote's colored waveform. On the client, the on-disk ring
+buffer is just the `{rung}/{seq}.ts` file convention read by `inventory.rs` — there is no separate
+`buffer` module. The web remote is a single dependency-free `web/remote/index.html` pulling `hls.js`
+and `peaks.js` from CDNs.
 
 ---
 
@@ -116,6 +138,9 @@ When the server/client crates grow, use modules like `ingest/`, `store/`, `origi
   therefore trivial — never add stateful upload handshakes that break this.
 - **Never block the live edge / playout head.** Keep the segments about to be played flowing. If a
   segment can't be sent within its retry budget, abandon it (tell the server) rather than stall.
+  **Not yet enforced end-to-end** (verified by design review): the client never calls `/abandon`,
+  and `playout.rs` has no timeout/skip on a missing segment — a permanent gap freezes the playout
+  head indefinitely instead of skipping past it. See §8 M7.
 - **No audio lost to a short outage.** Segments persist on disk until acked and within the DVR
   window; on reconnect, resume from the oldest un-acked segment.
 - **Rungs are ordered low→high; rung 0 is the survival rung.** The scheduler always has a cheap
@@ -123,6 +148,9 @@ When the server/client crates grow, use modules like `ingest/`, `store/`, `origi
 - **The server owns the published playlist** and rebuilds it from what it actually received.
 - **The feedback loop degrades safely.** If `ServerState` goes stale, the encoder assumes
   `ServerState::unknown()` (stopped, empty buffer) and plays it safe: low rung, protect the live edge.
+  **Not yet implemented** (verified by design review): there is no staleness timeout on the client's
+  held `ServerState` today, and a server restart resets `rev` to 0, which makes the client's rev-gate
+  reject the fresh post-restart state and pin the stale one. See §8 M7.
 
 ---
 
@@ -156,9 +184,9 @@ state), **Control** (web↔server).
 - Ingest: `POST /ingest/{stream}/segment` with `X-Rendition`, `X-Seq`, `X-Auth`; **response body is
   a `ServerState`**. `POST /ingest/{stream}/abandon` for permanent gaps.
 - Link feed: `GET /ingest/{stream}/state` (SSE `ServerState`) so feedback survives upload stalls.
-- Control: `GET /api/status` → `ControlStatus`; `POST /api/playout` ← `PlayoutCommand`
-  (`start`/`stop`/`pause`/`resume`/`seek`/`go_live`/`set_device`/`set_volume`); `WS /api/ws` streams
-  `ControlEvent` (status, position, meters, ack).
+- Control: `GET /api/{stream}/status` → `ControlStatus`; `POST /api/{stream}/playout` ← `PlayoutCommand`
+  (`start`/`stop`/`pause`/`resume`/`seek`/`go_live`/`set_device`/`set_volume`); `WS /api/{stream}/ws`
+  streams `ControlEvent` (status, position, meters, ack).
 - Listen: `GET /hls/{stream}/master.m3u8`, `/{rendition}/index.m3u8`, `/{rendition}/{seq}.ts`.
 
 The `obcast-proto` Rust types are the source of truth for all these schemas.
@@ -169,20 +197,53 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
 
 - **M0 — DONE.** Workspace, `obcast-proto` (state/control types + `plan_uploads` with tests),
   `docs/protocol.md`, server/client skeletons.
-- **M1** Server: ingest endpoint + DVR store + `ServerState` computation + SSE state feed. Stand up
-  a running loop that emits real feedback.
-- **M2** Client: `cpal` capture + device selection + level meters + `egui` shell.
-- **M3** Client: `ffmpeg` ABR encode → disk ring buffer; uploader loop driving `plan_uploads`
-  against the real server (or a mock).
-- **M4** Server: HLS origin (master + per-rung playlists over the DVR window). Web listen with
-  hls.js + scrub bar.
-- **M5** Server: playout to hardware out via `cpal`, with start/stop + seek; wire the head into
-  `ServerState`.
-- **M6** Control API (REST + WS) + web remote UI (start/stop/seek server output, health panel).
-- **M7** Auth (separate ingest/control/listen tokens), reconnect-resume/abandon hardening,
-  packaging (static client binaries, server Docker), telemetry.
+- **M1 — DONE.** Server ingest endpoint + `DvrStore` (in-mem index, disk bytes, DVR eviction) +
+  `ServerState` computation + SSE state feed with heartbeat. Idempotent `record()`; emits real feedback.
+- **M2 — DONE.** Client `cpal` capture + device selection + live channel-map + gain + K-14 level
+  meters + `egui` shell + persisted TOML config.
+- **M3 — DONE.** Client `ffmpeg` ABR encode (one proc → N rungs) → `{rung}/{seq}.ts` disk ring
+  buffer; `inventory.rs` scan; uploader tick loop driving `plan_uploads` against the real server and
+  folding `ServerState` from responses.
+- **M4 — DONE (server) / PARTIAL (web listen).** HLS origin (master + per-rung sliding-window
+  playlists, best-rung fallback) done. Web has hls.js listen-along, but the scrub bar drives *server*
+  playout via the waveform — browser-side DVR scrub of the listen-along player itself is **OPEN**.
+- **M5 — DONE.** Playout to hardware out via `cpal` (dedicated thread, ffmpeg decode, ring buffer,
+  atomics for pos/state/vol/meters), start/stop + seek; head flows into `ServerState` (holds rather
+  than skips on a not-yet-on-disk segment).
+- **M6 — DONE.** Control API (REST `status`/`playout` + WS status/position/meters) + web remote UI
+  (start/stop/seek, health panel, VU meters, waveform seek).
+- **M7 — PARTIAL / mostly OPEN.** Done: optional single-token ingest auth (`X-Auth`); SSE + uploader
+  reconnect on drop. Open: auth split (separate ingest/control/listen tokens); client-side
+  abandon + retry budget (**correctness risk, not just a missing feature** — a permanent segment gap
+  currently stalls the playout head indefinitely, see §5); stale-`ServerState` fallback (no staleness
+  timeout, plus a server-restart `rev`-reset bug that pins the client on stale state, see §5); server-side
+  DVR file reaping (`evict_old()` drops index entries but the underlying `.ts` files are never deleted —
+  unbounded disk growth on a long OB, verified by Rust review); reverse telemetry path (client sends
+  `EncoderState`; server populates `ControlStatus.encoder` + real `throughput_kbps`, incl. the
+  `POST /ingest/{stream}/heartbeat` route `docs/protocol.md` already documents — confirmed purely
+  cosmetic/dashboard-visibility, not load-bearing for scheduling); packaging (server Docker, static
+  client binaries).
 
-Prefer a thin end-to-end slice (M1 → M3 minimal → M4 listen) before deepening playout and control.
+**Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
+(`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
+live channel-mapping capture (pick 2 of N device channels as L/R); K-14 + per-channel metering;
+persisted TOML operator config; a `--headless` client path (ffmpeg captures a device or sine tone
+directly, no GUI); `README.md` + `docs/getting-started.md`.
+
+**What's next (priority order, re-ranked after Rust/design review — correctness risks before
+features):** (1) Client-side abandon + a timeout/skip in `playout.rs` for a missing segment, so a
+permanent gap can no longer stall the playout head indefinitely — this is the highest-priority item,
+it violates the §5 "never block the playout head" invariant today. (2) Stale-`ServerState` fallback:
+add a staleness timeout on the client's held state, and fix the server-restart `rev`-reset bug that
+pins the client on stale state — implements the §5 "degrades safely" invariant, which currently isn't
+enforced. (3) Server-side DVR file reaping so `.ts` files are actually deleted when evicted from the
+index (currently unbounded disk growth on a long OB). (4) Close the reverse telemetry path — client
+sends `EncoderState` periodically, server fills `ControlStatus.encoder` + real `throughput_kbps`,
+wiring the documented `/ingest/{stream}/heartbeat` route (confirmed cosmetic/dashboard-only; the core
+server→encoder loop of §1 is intact and must stay that way). (5) Auth split. (6) Packaging (Docker +
+cargo-dist). (7) De-duplicate `StreamProfile` (currently copied in `server/main.rs`, `client/main.rs`,
+`client/gui/app.rs`) into one shared/config-driven source. (8) Lower priority: browser-side DVR scrub
+for listen-along; a true HE-AAC survival rung via `libfdk_aac` (native `aac` emits LC for all rungs).
 
 ---
 
