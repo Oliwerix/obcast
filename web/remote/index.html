@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>OBCast Remote</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #14161a; color: #e6e6e6; margin: 0; padding: 24px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: #8a8f98; font-size: 13px; margin-bottom: 20px; }
+  .card {
+    background: #1c1f24; border: 1px solid #2a2e35; border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: #8a8f98; margin: 0 0 12px; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  button {
+    background: #2a2e35; color: #e6e6e6; border: 1px solid #383d46; border-radius: 6px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #383d46; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.primary { background: #3b6fd4; border-color: #3b6fd4; }
+  button.primary:hover { background: #4a7de0; }
+  input[type=text], input[type=number] {
+    background: #14161a; border: 1px solid #2a2e35; color: #e6e6e6; border-radius: 6px;
+    padding: 7px 10px; font-size: 13px;
+  }
+  input[type=range] { width: 140px; }
+  .pill {
+    display: inline-block; padding: 3px 9px; border-radius: 100px; font-size: 11px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em;
+  }
+  .pill.playing { background: #1e4530; color: #4ade80; }
+  .pill.paused  { background: #4a3a12; color: #facc15; }
+  .pill.stopped { background: #3a1e1e; color: #f87171; }
+  .pill.up   { background: #1e4530; color: #4ade80; }
+  .pill.down { background: #3a1e1e; color: #f87171; }
+  table.status td { padding: 3px 10px 3px 0; font-size: 13px; color: #b8bcc4; }
+  table.status td.v { color: #e6e6e6; font-variant-numeric: tabular-nums; }
+  .meter-wrap { background: #14161a; border-radius: 4px; height: 10px; width: 220px; overflow: hidden; }
+  .meter-bar { height: 100%; background: linear-gradient(90deg, #4ade80, #facc15 80%, #f87171 95%); width: 0%; transition: width 60ms linear; }
+  .note { font-size: 12px; color: #8a8f98; margin-top: 6px; }
+  audio, video { width: 100%; border-radius: 6px; margin-top: 8px; background: #000; }
+</style>
+</head>
+<body>
+
+<h1>OBCast Remote</h1>
+<div class="sub">Stream: <span id="stream-name"></span></div>
+
+<div class="card">
+  <h2>Server hardware output — the real playhead</h2>
+  <div class="note" style="margin-top:0; margin-bottom:12px;">
+    This is the actual position that drives the encoder's upload scheduler. Start/stop/seek here
+    move the real broadcast output, not just your browser.
+  </div>
+  <div class="row">
+    <span id="playout-pill" class="pill stopped">stopped</span>
+    <button id="btn-start" class="primary">Start live</button>
+    <button id="btn-stop">Stop</button>
+    <button id="btn-pause">Pause</button>
+    <button id="btn-resume">Resume</button>
+    <button id="btn-golive">Go live</button>
+  </div>
+  <div class="row" style="margin-top:12px;">
+    <label for="seek-secs" style="font-size:13px; color:#b8bcc4;">Seek to seconds behind live:</label>
+    <input id="seek-secs" type="number" min="0" value="30" style="width:70px;" />
+    <button id="btn-seek">Seek</button>
+  </div>
+  <div class="row" style="margin-top:12px;">
+    <label style="font-size:13px; color:#b8bcc4;">Volume</label>
+    <input id="volume" type="range" min="0" max="150" value="100" />
+    <span id="volume-val" style="font-size:12px; color:#8a8f98;">100%</span>
+  </div>
+  <div class="row" style="margin-top:14px;">
+    <div>
+      <div style="font-size:11px; color:#8a8f98; margin-bottom:3px;">PEAK</div>
+      <div class="meter-wrap"><div id="meter-peak" class="meter-bar"></div></div>
+    </div>
+    <div>
+      <div style="font-size:11px; color:#8a8f98; margin-bottom:3px;">RMS</div>
+      <div class="meter-wrap"><div id="meter-rms" class="meter-bar"></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Stream health</h2>
+  <table class="status">
+    <tr><td>Link</td><td class="v"><span id="link-pill" class="pill down">down</span></td></tr>
+    <tr><td>Last segment age</td><td class="v" id="seg-age">—</td></tr>
+    <tr><td>Current rung</td><td class="v" id="cur-rung">—</td></tr>
+    <tr><td>Gaps in window</td><td class="v" id="gaps">—</td></tr>
+    <tr><td>Playout position</td><td class="v" id="pos-seq">—</td></tr>
+    <tr><td>Live seq</td><td class="v" id="live-seq">—</td></tr>
+    <tr><td>Lead (buffer ahead of head)</td><td class="v" id="lead-ms">—</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Listen along (browser preview — not the real playhead)</h2>
+  <div class="note" style="margin-top:0;">
+    Independent HLS playback for checking levels/timing by ear. Has its own buffering and is
+    <strong>not</strong> connected to the server's hardware output above.
+  </div>
+  <audio id="player" controls></audio>
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const stream = params.get('stream') || 'obshow';
+document.getElementById('stream-name').textContent = stream;
+
+const apiBase = '';
+const post = (path, body) => fetch(apiBase + path, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+});
+
+document.getElementById('btn-start').onclick = () => post(`/api/${stream}/playout`, { cmd: 'start', position: { kind: 'live' } });
+document.getElementById('btn-stop').onclick = () => post(`/api/${stream}/playout`, { cmd: 'stop' });
+document.getElementById('btn-pause').onclick = () => post(`/api/${stream}/playout`, { cmd: 'pause' });
+document.getElementById('btn-resume').onclick = () => post(`/api/${stream}/playout`, { cmd: 'resume' });
+document.getElementById('btn-golive').onclick = () => post(`/api/${stream}/playout`, { cmd: 'go_live' });
+document.getElementById('btn-seek').onclick = () => {
+  const secs = parseInt(document.getElementById('seek-secs').value, 10) || 0;
+  post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: secs } });
+};
+
+const volumeInput = document.getElementById('volume');
+const volumeVal = document.getElementById('volume-val');
+let volumeDebounce = null;
+volumeInput.oninput = () => {
+  volumeVal.textContent = volumeInput.value + '%';
+  clearTimeout(volumeDebounce);
+  volumeDebounce = setTimeout(() => {
+    post(`/api/${stream}/playout`, { cmd: 'set_volume', gain: volumeInput.value / 100 });
+  }, 150);
+};
+
+function applyStatus(status) {
+  const s = status.server;
+  const playoutPill = document.getElementById('playout-pill');
+  playoutPill.textContent = s.playout.state;
+  playoutPill.className = 'pill ' + s.playout.state;
+
+  document.getElementById('pos-seq').textContent = s.playout.position_seq ?? '—';
+  document.getElementById('live-seq').textContent = s.live_seq ?? '—';
+  document.getElementById('lead-ms').textContent = s.lead_ms + ' ms';
+
+  const linkPill = document.getElementById('link-pill');
+  linkPill.textContent = status.link.connected ? 'up' : 'down';
+  linkPill.className = 'pill ' + (status.link.connected ? 'up' : 'down');
+  document.getElementById('seg-age').textContent = status.link.last_segment_age_ms + ' ms';
+  document.getElementById('cur-rung').textContent = status.link.current_rung ?? '—';
+  document.getElementById('gaps').textContent = status.link.gaps;
+
+  if (!volumeInput.matches(':active')) {
+    volumeInput.value = Math.round(s.playout.volume * 100);
+    volumeVal.textContent = volumeInput.value + '%';
+  }
+}
+
+function applyMeters(peakDb, rmsDb) {
+  const toPct = db => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
+  document.getElementById('meter-peak').style.width = toPct(peakDb) + '%';
+  document.getElementById('meter-rms').style.width = toPct(rmsDb) + '%';
+}
+
+function connectWs() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/api/${stream}/ws`);
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    // ControlEvent is internally tagged ("type"); Status's fields (stream,
+    // server, encoder, link) are flattened alongside it, not nested.
+    if (msg.type === 'status') applyStatus(msg);
+    else if (msg.type === 'meters') applyMeters(msg.peak_db, msg.rms_db);
+  };
+  ws.onclose = () => setTimeout(connectWs, 1000);
+  ws.onerror = () => ws.close();
+}
+connectWs();
+
+// Listen-along player: independent HLS pull, not tied to server playout state.
+const audio = document.getElementById('player');
+const hlsUrl = `/hls/${stream}/master.m3u8`;
+if (Hls.isSupported()) {
+  const hls = new Hls();
+  hls.loadSource(hlsUrl);
+  hls.attachMedia(audio);
+} else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
+  audio.src = hlsUrl;
+}
+</script>
+
+</body>
+</html>

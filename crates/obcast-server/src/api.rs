@@ -1,17 +1,19 @@
-//! Minimal control-plane REST surface so playout can be driven without a
-//! GUI: `GET /api/{stream}/status` and `POST /api/{stream}/playout`. The
-//! `ControlEvent` WebSocket in `docs/protocol.md` §4 is M6 — full control
-//! API + web remote; this is just enough to exercise M5's hardware playout
-//! engine end to end.
+//! Control-plane REST + WebSocket surface (M6): `GET /api/{stream}/status`,
+//! `POST /api/{stream}/playout`, and `WS /api/{stream}/ws` streaming
+//! `ControlEvent`s. See `docs/protocol.md` §4.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::Json;
 
-use obcast_proto::control::{ControlStatus, LinkHealth, PlayoutCommand, PlayoutPosition};
+use obcast_proto::control::{
+    ControlEvent, ControlStatus, LinkHealth, PlayoutCommand, PlayoutPosition,
+};
 use obcast_proto::state::Seq;
 
 use crate::ingest::ApiError;
@@ -21,6 +23,9 @@ use crate::{AppState, StreamHandle};
 /// A stream is considered "link down" once this long has passed since the
 /// last successful ingest.
 const STALE_AFTER: Duration = Duration::from_secs(5);
+
+/// How often the WS pushes `Meters`, independent of state-change events.
+const METERS_INTERVAL: Duration = Duration::from_millis(200);
 
 async fn resolve_position(handle: &StreamHandle, pos: PlayoutPosition) -> Result<Seq, ApiError> {
     let store = handle.store.lock().await;
@@ -82,11 +87,7 @@ pub async fn set_playout(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn status(
-    State(app): State<Arc<AppState>>,
-    Path(stream): Path<String>,
-) -> Json<ControlStatus> {
-    let handle = app.stream(&stream).await;
+async fn build_status(stream: &str, handle: &StreamHandle) -> ControlStatus {
     let server = {
         let store = handle.store.lock().await;
         store.build_server_state(handle.playout_status())
@@ -112,8 +113,8 @@ pub async fn status(
         .filter(|c| c.best_rung.is_none())
         .count() as u32;
 
-    Json(ControlStatus {
-        stream,
+    ControlStatus {
+        stream: stream.to_string(),
         server,
         encoder: None,
         link: LinkHealth {
@@ -123,5 +124,93 @@ pub async fn status(
             throughput_kbps: 0,
             gaps,
         },
-    })
+    }
+}
+
+pub async fn status(
+    State(app): State<Arc<AppState>>,
+    Path(stream): Path<String>,
+) -> Json<ControlStatus> {
+    let handle = app.stream(&stream).await;
+    Json(build_status(&stream, &handle).await)
+}
+
+/// `WS /api/{stream}/ws`: pushes a full `Status` snapshot on connect and on
+/// every `ServerState` change (piggybacking the same broadcast channel the
+/// SSE link-plane feed uses), `Position` between snapshots as playout
+/// advances, and `Meters` on a fixed tick for VU display.
+pub async fn ws_handler(
+    State(app): State<Arc<AppState>>,
+    Path(stream): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let handle = app.stream(&stream).await;
+    ws.on_upgrade(move |socket| ws_session(stream, handle, socket))
+}
+
+async fn ws_session(stream: String, handle: Arc<StreamHandle>, mut socket: WebSocket) {
+    let mut state_rx = handle.tx.subscribe();
+    let mut meters_tick = tokio::time::interval(METERS_INTERVAL);
+    let mut last_position = handle.playout.position();
+
+    let initial = build_status(&stream, &handle).await;
+    if send_event(&mut socket, &ControlEvent::Status(Box::new(initial)))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            msg = state_rx.recv() => {
+                match msg {
+                    Ok(_) => {
+                        let status = build_status(&stream, &handle).await;
+                        if send_event(&mut socket, &ControlEvent::Status(Box::new(status))).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            _ = meters_tick.tick() => {
+                let pos = handle.playout.position();
+                if pos != last_position {
+                    last_position = pos;
+                    if let Some(seq) = pos {
+                        if send_event(&mut socket, &ControlEvent::Position { seq }).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let (peak, rms) = handle.playout.meters();
+                let event = ControlEvent::Meters { peak_db: linear_to_db(peak), rms_db: linear_to_db(rms) };
+                if send_event(&mut socket, &event).await.is_err() {
+                    return;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Err(_)) => return,
+                    _ => {} // ignore inbound text/ping/pong; commands go through POST /api/{stream}/playout
+                }
+            }
+        }
+    }
+}
+
+async fn send_event(socket: &mut WebSocket, event: &ControlEvent) -> Result<(), axum::Error> {
+    let text = serde_json::to_string(event).expect("ControlEvent is always serializable");
+    socket.send(Message::Text(text)).await
+}
+
+fn linear_to_db(linear: f32) -> f32 {
+    if linear <= 0.0 {
+        -100.0
+    } else {
+        20.0 * linear.log10()
+    }
 }

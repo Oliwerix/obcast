@@ -1,8 +1,7 @@
 //! obcast-server: ingest + DVR store + `ServerState` computation + SSE state
-//! feed (M1), an HLS origin (M4), and hardware playout via cpal (M5), with a
-//! minimal REST control surface (`api.rs`) to drive it. The full control API
-//! (WS events, encoder telemetry, auth) and the web remote are M6/M7 — see
-//! CLAUDE.md.
+//! feed (M1), an HLS origin (M4), hardware playout via cpal (M5), and the
+//! control API (REST + WS `ControlEvent`s) plus a static web remote (M6).
+//! Auth hardening and packaging are M7 — see CLAUDE.md.
 
 mod api;
 mod ingest;
@@ -20,6 +19,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use obcast_proto::state::{PlayoutStatus, Rung, ServerState, StreamProfile, WaterLevels};
 use tokio::sync::{broadcast, Mutex};
+use tower_http::services::ServeDir;
 
 use playout::PlayoutHandle;
 use store::DvrStore;
@@ -85,6 +85,15 @@ impl AppState {
     }
 }
 
+/// Static web remote assets. Overridable so the server can be run from
+/// outside the repo root (e.g. packaged deployment); defaults to the path
+/// relative to this crate for local dev.
+fn web_remote_dir() -> PathBuf {
+    std::env::var("OBCAST_WEB_REMOTE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/remote"))
+}
+
 fn default_profile() -> StreamProfile {
     StreamProfile {
         segment_ms: 2000,
@@ -138,7 +147,9 @@ async fn main() {
         .route("/hls/:stream/:rendition/:tail", get(origin::rendition_tail))
         .route("/api/:stream/status", get(api::status))
         .route("/api/:stream/playout", post(api::set_playout))
-        .with_state(app_state);
+        .route("/api/:stream/ws", get(api::ws_handler))
+        .with_state(app_state)
+        .nest_service("/remote", ServeDir::new(web_remote_dir()));
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await

@@ -93,14 +93,19 @@ Piggybacked on uploads, or `POST /ingest/{stream}/heartbeat` with an
 
 ## 4. Control plane (web ↔ server)
 
+Every control-plane route is per-stream, matching the media and link planes.
+`set_device` is accepted by the schema but not implemented yet — playout
+always uses the host's default audio output; requesting it returns
+`501 Not Implemented`.
+
 ### Status snapshot
 ```
-GET /api/status  ->  ControlStatus { stream, server, encoder?, link }
+GET /api/{stream}/status  ->  ControlStatus { stream, server, encoder?, link }
 ```
 
 ### Playout commands
 ```
-POST /api/playout   Body: <PlayoutCommand JSON>
+POST /api/{stream}/playout   Body: <PlayoutCommand JSON>
 ```
 `PlayoutCommand` variants (tagged by `"cmd"`):
 
@@ -111,11 +116,12 @@ POST /api/playout   Body: <PlayoutCommand JSON>
 | `pause`/`resume` | —                            | hold / continue                     |
 | `seek`       | `{ position }`                   | jump within the DVR window          |
 | `go_live`    | —                                | snap to the live edge               |
-| `set_device` | `{ device_id }`                  | choose HW output                    |
+| `set_device` | `{ device_id }`                  | not implemented — returns 501       |
 | `set_volume` | `{ gain }`                       | linear gain                         |
 
 `position` is a `PlayoutPosition`: `{"kind":"live"}`,
 `{"kind":"seq","value":123}`, or `{"kind":"seconds_behind_live","value":30}`.
+A position outside the DVR window is clamped to `[dvr_start_seq, live_seq]`.
 
 Because the playout head is part of `ServerState`, any seek immediately reshapes
 the encoder's upload plan — e.g. seeking back 30 s makes the encoder protect
@@ -123,11 +129,32 @@ continuity around the new (earlier) head and stop upgrading near the old one.
 
 ### Live updates
 ```
-WS /api/ws  ->  stream of ControlEvent
+WS /api/{stream}/ws  ->  stream of ControlEvent
 ```
-`ControlEvent` variants (tagged by `"type"`): `status` (full snapshot),
-`position` (head advanced), `meters` (peak/RMS dBFS for VU display), `ack`
-(command accepted/rejected).
+`ControlEvent` is internally tagged by `"type"`; for the `Status` variant the
+wrapped `ControlStatus` fields are flattened alongside the tag (not nested
+under a `value` key) — e.g. `{"type":"status","stream":"obshow","server":{...},...}`.
+
+Sent: a full `status` on connect and on every `ServerState` change (piggybacking
+the same broadcast the SSE link-plane feed uses), `position` when the playout
+head moves, and `meters` (peak/RMS dBFS, derived from the actual post-gain
+audio callback) on a fixed ~200ms tick. `ack` is defined in the schema for
+future use but not yet sent — commands go through the plain HTTP response of
+`POST /api/{stream}/playout` instead. The socket does not accept inbound
+commands; it is read-only from the client's perspective.
+
+### Web remote (reference UI)
+```
+GET /remote/  ->  static single-page app (see web/remote/)
+```
+Talks to the REST + WS endpoints above. It exposes two independent audio
+paths and does not conflate them:
+- **Server hardware output** — the real playout engine (§5), controlled by
+  the buttons on the page. This is the position that feeds back into
+  `ServerState` and reshapes the encoder's upload plan.
+- **Listen-along preview** — a plain `hls.js` pull of `/hls/{stream}/master.m3u8`
+  into a browser `<audio>` element, for checking levels/timing by ear. It has
+  its own independent buffering and is not the playhead described above.
 
 ### Listener endpoints (HLS)
 ```

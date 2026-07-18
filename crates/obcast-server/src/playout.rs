@@ -44,6 +44,10 @@ pub struct PlayoutHandle {
     paused: AtomicBool,
     position_seq: AtomicI64,  // -1 = none
     volume_millis: AtomicU32, // gain * 1000, fixed-point for atomic access
+    // Linear peak/RMS of the most recent audio callback's output (post-gain),
+    // stored as raw f32 bits since there's no stable AtomicF32.
+    peak_bits: AtomicU32,
+    rms_bits: AtomicU32,
     cmd_tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
@@ -67,6 +71,15 @@ impl PlayoutHandle {
         self.volume_millis.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
+    /// Linear (peak, rms) of the most recently played audio, 0.0..=1.0ish.
+    /// Convert to dBFS at the call site for display.
+    pub fn meters(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.rms_bits.load(Ordering::Relaxed)),
+        )
+    }
+
     pub fn send(&self, cmd: EngineCommand) {
         let _ = self.cmd_tx.send(cmd);
     }
@@ -81,6 +94,8 @@ pub fn spawn(store: Arc<Mutex<DvrStore>>, rungs: Vec<RungId>) -> Arc<PlayoutHand
         paused: AtomicBool::new(false),
         position_seq: AtomicI64::new(-1),
         volume_millis: AtomicU32::new(1000),
+        peak_bits: AtomicU32::new(0),
+        rms_bits: AtomicU32::new(0),
         cmd_tx,
     });
 
@@ -134,6 +149,19 @@ fn run_engine(
             for s in &mut data[filled..] {
                 *s = 0.0;
             }
+
+            let peak = data.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            let mean_sq = if data.is_empty() {
+                0.0
+            } else {
+                data.iter().map(|s| s * s).sum::<f32>() / data.len() as f32
+            };
+            volume_handle
+                .peak_bits
+                .store(peak.to_bits(), Ordering::Relaxed);
+            volume_handle
+                .rms_bits
+                .store(mean_sq.sqrt().to_bits(), Ordering::Relaxed);
         },
         |err| tracing::error!(error = %err, "playout stream error"),
         None,
