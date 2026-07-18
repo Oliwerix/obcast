@@ -1,7 +1,12 @@
-//! obcast-client: encoder — ffmpeg capture+encode, disk ring buffer, and the
-//! closed-loop uploader (M2/M3, CLI only — GUI is a later milestone).
+//! obcast-client: encoder — cpal capture, ffmpeg ABR encode, disk ring
+//! buffer, and the closed-loop uploader, behind an egui GUI by default.
+//! `--headless` keeps the original CLI-only path (ffmpeg captures the
+//! device itself by platform-specific name) for unattended/server use.
 
+mod audio;
+mod config;
 mod encode;
+mod gui;
 mod inventory;
 mod shared;
 mod sse;
@@ -16,6 +21,11 @@ use obcast_proto::state::{Rung, StreamProfile};
 /// OBCast encoder client.
 #[derive(Parser)]
 struct Args {
+    /// Run the original CLI-only pipeline instead of the GUI (no device/
+    /// channel picker — pass --device explicitly, or omit for a test tone).
+    #[arg(long)]
+    headless: bool,
+
     /// Base URL of the obcast-server ingest API.
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     server: String,
@@ -26,7 +36,8 @@ struct Args {
     /// Local segment ring-buffer directory.
     #[arg(long, default_value = "./client-buffer")]
     out_dir: PathBuf,
-    /// PulseAudio source name to capture from. Omit to use a synthetic test tone.
+    /// PulseAudio source name to capture from (headless mode only). Omit
+    /// to use a synthetic test tone.
     #[arg(long)]
     device: Option<String>,
     #[arg(long, default_value_t = 2000)]
@@ -56,10 +67,44 @@ fn profile(segment_ms: u32) -> StreamProfile {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+
+    if args.headless {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+        rt.block_on(run_headless(args));
+        return;
+    }
+
+    let mut cfg = config::AppConfig::load();
+    // CLI overrides only apply if the caller actually passed non-default
+    // flags; the GUI otherwise owns these via its own persisted settings.
+    if args.server != "http://127.0.0.1:8080" {
+        cfg.server = args.server;
+    }
+    if args.stream != "obshow" {
+        cfg.stream = args.stream;
+    }
+    if let Some(token) = args.ingest_token {
+        cfg.ingest_token = token;
+    }
+    if args.out_dir.as_os_str() != "./client-buffer" {
+        cfg.out_dir = args.out_dir.to_string_lossy().into_owned();
+    }
+    if args.segment_ms != 2000 {
+        cfg.segment_ms = args.segment_ms;
+    }
+
+    if let Err(err) = gui::run(cfg) {
+        tracing::error!(error = %err, "GUI exited with an error");
+    }
+}
+
+async fn run_headless(args: Args) {
     let profile = profile(args.segment_ms);
 
     std::fs::create_dir_all(&args.out_dir).expect("failed to create output dir");

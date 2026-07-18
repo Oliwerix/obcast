@@ -78,6 +78,7 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
                 Ok(resp) if resp.status().is_success() => {
                     let elapsed = started.elapsed().as_secs_f32().max(0.001);
                     throughput_kbps = ((len as f32 * 8.0 / 1000.0) / elapsed) as u32;
+                    shared.note_upload(action.seq, throughput_kbps);
                     if let Ok(state) = resp.json::<ServerState>().await {
                         shared.update(state).await;
                     }

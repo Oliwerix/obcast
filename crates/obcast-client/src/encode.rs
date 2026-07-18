@@ -13,11 +13,19 @@ use obcast_proto::state::StreamProfile;
 #[derive(Debug, Clone)]
 pub enum Source {
     /// A PulseAudio source name (`pactl list sources`), or "default".
+    /// Linux-only and superseded by `Pcm` for the GUI, which captures via
+    /// `cpal` for cross-platform device/channel selection; kept for the
+    /// headless CLI path.
     Device(String),
     /// A synthetic tone, paced at real-time via `-re` — for testing without
     /// audio hardware. Real devices already pace themselves; `-re` would
     /// only introduce drift there, so it's applied to this branch only.
     SineTest,
+    /// Interleaved stereo f32 PCM piped in on stdin, already captured and
+    /// channel-mapped by `crate::audio` (cpal). This is what the GUI uses —
+    /// ffmpeg only ever sees a plain PCM stream, never a device name, which
+    /// is what makes device/channel selection actually cross-platform.
+    Pcm { sample_rate: u32 },
 }
 
 pub fn spawn(source: &Source, profile: &StreamProfile, out_dir: &Path) -> std::io::Result<Child> {
@@ -39,6 +47,16 @@ pub fn spawn(source: &Source, profile: &StreamProfile, out_dir: &Path) -> std::i
                 .arg("lavfi")
                 .arg("-i")
                 .arg("sine=frequency=440:sample_rate=44100");
+        }
+        Source::Pcm { sample_rate } => {
+            cmd.arg("-f")
+                .arg("f32le")
+                .arg("-ar")
+                .arg(sample_rate.to_string())
+                .arg("-ac")
+                .arg("2")
+                .arg("-i")
+                .arg("pipe:0");
         }
     }
 
@@ -62,7 +80,11 @@ pub fn spawn(source: &Source, profile: &StreamProfile, out_dir: &Path) -> std::i
             .arg(dir.join("%d.ts"));
     }
 
-    cmd.stdin(Stdio::null())
+    let stdin = match source {
+        Source::Pcm { .. } => Stdio::piped(),
+        _ => Stdio::null(),
+    };
+    cmd.stdin(stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     cmd.spawn()
