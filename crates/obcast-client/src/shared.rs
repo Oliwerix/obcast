@@ -1,13 +1,14 @@
 //! The encoder's model of `ServerState`, updated by both the SSE feed and
 //! every upload response (the piggyback path is usually the fresher one).
-//! Also carries small upload telemetry for the GUI status panel — read via
-//! `try_lock`/atomics so the GUI's per-frame poll never blocks on network
-//! tasks.
+//! Also carries small upload telemetry and an operator-facing status/error
+//! log for the GUI status panel — read via `try_lock`/atomics so the GUI's
+//! per-frame poll never blocks on network tasks.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use obcast_proto::control::{LogEntry, LogLevel};
 use obcast_proto::state::ServerState;
 use tokio::sync::Mutex;
 
@@ -19,6 +20,11 @@ use tokio::sync::Mutex;
 /// link-down window (`STALE_AFTER` in `obcast-server/src/api.rs`).
 const STALE_AFTER: Duration = Duration::from_secs(5);
 
+/// Cap on retained client-side log lines — enough operator history for a
+/// session (device errors, upload/abandon warnings, ffmpeg pipeline
+/// lifecycle) without unbounded growth; oldest entries are dropped first.
+const LOG_CAP: usize = 200;
+
 pub struct SharedState {
     pub server: Mutex<ServerState>,
     /// When `server` was last refreshed by `update()`. `None` until the first
@@ -26,13 +32,15 @@ pub struct SharedState {
     server_updated_at: Mutex<Option<Instant>>,
     last_uploaded_seq: AtomicI64,
     throughput_kbps: AtomicU32,
-    /// Last fatal error from the encoder pipeline (ffmpeg exit / stdin write
-    /// failure). Set by the controller when it tears the pipeline down, read
-    /// by the GUI each frame so a dead "live" session surfaces instead of
-    /// silently producing nothing.
-    encoder_error: RwLock<Option<String>>,
-    /// Latched one-shot: the pipeline died since the GUI last checked, so the
-    /// GUI should drop its own `live` state back to idle.
+    /// Operator-facing status/error log — a capped ring buffer, oldest first.
+    /// Shares `obcast_proto::control::LogEntry`'s shape with the server's own
+    /// operator log so both UIs render the same way, even though a client
+    /// entry never crosses the wire. Read by the GUI each frame (via
+    /// `recent_log`/`latest_log`) so a dead "live" session surfaces instead
+    /// of silently producing nothing.
+    log: std::sync::Mutex<VecDeque<LogEntry>>,
+    /// Latched one-shot: an `Error`-level line was logged since the GUI last
+    /// checked, so the GUI should drop its own `live` state back to idle.
     encoder_failed: AtomicBool,
 }
 
@@ -43,29 +51,51 @@ impl SharedState {
             server_updated_at: Mutex::new(None),
             last_uploaded_seq: AtomicI64::new(-1),
             throughput_kbps: AtomicU32::new(0),
-            encoder_error: RwLock::new(None),
+            log: std::sync::Mutex::new(VecDeque::new()),
             encoder_failed: AtomicBool::new(false),
         }
     }
 
-    /// Record that the encoder pipeline died and latch the failure flag.
-    pub fn set_encoder_error(&self, msg: String) {
-        *self.encoder_error.write().unwrap() = Some(msg);
-        self.encoder_failed.store(true, Ordering::Relaxed);
+    /// Append a status/error line to the operator-facing log. `Error`-level
+    /// entries also latch `encoder_failed`, so a dead pipeline flips the GUI
+    /// out of "live" without every call site needing to track that
+    /// separately (see `take_encoder_failed`).
+    pub fn push_log(&self, level: LogLevel, message: impl Into<String>) {
+        let entry = LogEntry {
+            at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            level,
+            message: message.into(),
+        };
+        if level == LogLevel::Error {
+            self.encoder_failed.store(true, Ordering::Relaxed);
+        }
+        let mut log = self.log.lock().unwrap();
+        log.push_back(entry);
+        while log.len() > LOG_CAP {
+            log.pop_front();
+        }
     }
 
-    /// Clear both the message and the latch — called when going live afresh.
-    pub fn clear_encoder_error(&self) {
-        *self.encoder_error.write().unwrap() = None;
-        self.encoder_failed.store(false, Ordering::Relaxed);
+    /// Snapshot of the retained log, oldest first, for the GUI panel to
+    /// render each frame.
+    pub fn recent_log(&self) -> Vec<LogEntry> {
+        self.log.lock().unwrap().iter().cloned().collect()
     }
 
-    pub fn encoder_error(&self) -> Option<String> {
-        self.encoder_error.read().unwrap().clone()
+    /// The single most recent log line, if any — cheap enough to poll every
+    /// GUI frame for the status bar's compact summary without cloning the
+    /// whole ring buffer (that's `recent_log`, used only while the full
+    /// panel is open).
+    pub fn latest_log(&self) -> Option<LogEntry> {
+        self.log.lock().unwrap().back().cloned()
     }
 
-    /// Returns true exactly once after a pipeline death, so the GUI can flip
-    /// itself out of "live" without repeatedly fighting the operator.
+    /// Returns true exactly once after an `Error`-level line was logged, so
+    /// the GUI can flip itself out of "live" without repeatedly fighting the
+    /// operator.
     pub fn take_encoder_failed(&self) -> bool {
         self.encoder_failed.swap(false, Ordering::Relaxed)
     }
