@@ -2,10 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>OBCast Remote</title>
+<title>OBCast — Shows</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
-<script src="https://unpkg.com/peaks.js/dist/peaks.js"></script>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -18,506 +16,205 @@
     background: #1c1f24; border: 1px solid #2a2e35; border-radius: 10px;
     padding: 16px 18px; margin-bottom: 14px;
   }
-  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: #8a8f98; margin: 0 0 12px; }
-  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   button {
     background: #2a2e35; color: #e6e6e6; border: 1px solid #383d46; border-radius: 6px;
     padding: 8px 14px; font-size: 13px; cursor: pointer;
   }
   button:hover { background: #383d46; }
   button:disabled { opacity: 0.4; cursor: default; }
-  button.primary { background: #3b6fd4; border-color: #3b6fd4; }
-  button.primary:hover { background: #4a7de0; }
-  input[type=text], input[type=number] {
-    background: #14161a; border: 1px solid #2a2e35; color: #e6e6e6; border-radius: 6px;
-    padding: 7px 10px; font-size: 13px;
-  }
-  input[type=range] { width: 140px; }
+  button.danger { background: #3a1e1e; border-color: #5a2a2a; color: #f87171; }
+  button.danger:hover { background: #4a2525; }
   .pill {
     display: inline-block; padding: 3px 9px; border-radius: 100px; font-size: 11px;
     font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em;
   }
-  .pill.playing { background: #1e4530; color: #4ade80; }
-  .pill.paused  { background: #4a3a12; color: #facc15; }
-  .pill.stopped { background: #3a1e1e; color: #f87171; }
-  .pill.up   { background: #1e4530; color: #4ade80; }
-  .pill.down { background: #3a1e1e; color: #f87171; }
-  table.status td { padding: 3px 10px 3px 0; font-size: 13px; color: #b8bcc4; }
-  table.status td.v { color: #e6e6e6; font-variant-numeric: tabular-nums; }
-  .meter-wrap { position: relative; background: #14161a; border-radius: 4px; height: 10px; width: 220px; overflow: hidden; }
-  .meter-bar { height: 100%; background: linear-gradient(90deg, #4ade80, #facc15 80%, #f87171 95%); width: 0%; transition: width 60ms linear; }
-  .meter-ppm { position: absolute; top: 0; height: 100%; width: 2px; left: 0%; background: #ffffff; transition: left 40ms linear; }
-  .note { font-size: 12px; color: #8a8f98; margin-top: 6px; }
-  audio, video { width: 100%; border-radius: 6px; margin-top: 8px; background: #000; }
-  #zoomview-container { width: 100%; height: 100px; background: #0e0f12; border-radius: 6px; margin-top: 4px; cursor: pointer; overflow: hidden; }
-  .legend { display: flex; gap: 16px; margin-top: 8px; font-size: 11px; color: #8a8f98; }
-  .legend span { display: inline-flex; align-items: center; gap: 5px; }
-  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
-  .la-quality { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #b8bcc4; font-variant-numeric: tabular-nums; }
-  .la-quality i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; background: #3a3f47; }
-  .la-spacer { flex: 1 1 auto; }
-  .pill.buffering { background: #4a3a12; color: #facc15; }
-  .pill.stalled   { background: #3a1e1e; color: #f87171; }
-  .pill.error     { background: #3a1e1e; color: #f87171; }
-  .pill.live      { background: #1e4530; color: #4ade80; }
+  .pill.live { background: #1e4530; color: #4ade80; }
+  .pill.past { background: #2a2e35; color: #8a8f98; }
+  table.shows { width: 100%; border-collapse: collapse; }
+  table.shows th {
+    text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: #8a8f98; font-weight: 600; padding: 8px 12px 8px 0; border-bottom: 1px solid #2a2e35;
+  }
+  table.shows td { padding: 12px 12px 12px 0; font-size: 13px; color: #b8bcc4; border-bottom: 1px solid #23262c; vertical-align: middle; }
+  table.shows tr:last-child td { border-bottom: none; }
+  table.shows td.v { color: #e6e6e6; font-variant-numeric: tabular-nums; }
+  a.show-name { color: #e6e6e6; font-weight: 600; text-decoration: none; font-size: 14px; }
+  a.show-name:hover { color: #4a7de0; text-decoration: underline; }
+  .muted { color: #8a8f98; font-size: 13px; }
+  .empty { color: #8a8f98; font-size: 14px; padding: 24px 4px; text-align: center; }
+  #banner { font-size: 13px; margin-bottom: 12px; display: none; }
+  #banner.err { display: block; background: #3a1e1e; color: #f87171; border: 1px solid #5a2a2a; border-radius: 6px; padding: 8px 12px; }
+  #banner.ok  { display: block; background: #1e4530; color: #4ade80; border: 1px solid #2a5a3f; border-radius: 6px; padding: 8px 12px; }
 </style>
 </head>
 <body>
 
-<h1>OBCast Remote</h1>
-<div class="sub">Stream: <span id="stream-name"></span> &middot; <a href="shows.html" style="color:#8a8f98;">&larr; all shows</a></div>
+<h1>OBCast — Shows</h1>
+<div class="sub">Every stream the server has received audio for. Open one to control it, or delete a past show to reclaim disk.</div>
+
+<div id="banner"></div>
 
 <div class="card">
-  <h2>Server hardware output — the real playhead</h2>
-  <div class="note" style="margin-top:0; margin-bottom:12px;">
-    This is the actual position that drives the encoder's upload scheduler. Start/stop/seek here
-    move the real broadcast output, not just your browser.
+  <div id="content">
+    <div class="empty">Loading shows…</div>
   </div>
-  <div class="row">
-    <span id="playout-pill" class="pill stopped">stopped</span>
-    <button id="btn-start" class="primary">Start live</button>
-    <button id="btn-stop">Stop</button>
-    <button id="btn-pause">Pause</button>
-    <button id="btn-resume">Resume</button>
-    <button id="btn-golive">Go live</button>
-  </div>
-  <div class="row" style="margin-top:12px;">
-    <label for="seek-secs" style="font-size:13px; color:#b8bcc4;">Seek to seconds behind live:</label>
-    <input id="seek-secs" type="number" min="0" value="30" style="width:70px;" />
-    <button id="btn-seek">Seek</button>
-  </div>
-  <div id="action-error" style="display:none; margin-top:12px; padding:8px 12px; border-radius:6px;
-       background:#3a1e1e; color:#f87171; font-size:13px;"></div>
-  <div class="row" style="margin-top:12px;">
-    <label style="font-size:13px; color:#b8bcc4;">Volume</label>
-    <input id="volume" type="range" min="0" max="150" value="100" />
-    <span id="volume-val" style="font-size:12px; color:#8a8f98;">100%</span>
-  </div>
-  <div class="row" style="margin-top:14px;">
-    <div>
-      <div style="font-size:11px; color:#8a8f98; margin-bottom:3px;">LEVEL (VU / PPM)</div>
-      <div class="meter-wrap">
-        <div id="meter-vu" class="meter-bar"></div>
-        <div id="meter-ppm" class="meter-ppm"></div>
-      </div>
-    </div>
-  </div>
-
-  <div id="zoomview-container" style="margin-top:16px;"></div>
-  <div class="legend">
-    <span><i style="background:#f87171;"></i>lo</span>
-    <span><i style="background:#facc15;"></i>mid</span>
-    <span><i style="background:#4ade80;"></i>hd</span>
-    <span><i style="background:#3a3f47;"></i>gap</span>
-  </div>
-  <div class="note">Click or drag the waveform to seek the server's hardware output. Color shows the ABR rung actually covering that audio.</div>
-</div>
-
-<div class="card">
-  <h2>Stream health</h2>
-  <table class="status">
-    <tr><td>Link</td><td class="v"><span id="link-pill" class="pill down">down</span></td></tr>
-    <tr><td>Last segment age</td><td class="v" id="seg-age">—</td></tr>
-    <tr><td>Current rung</td><td class="v" id="cur-rung">—</td></tr>
-    <tr><td>Gaps in window</td><td class="v" id="gaps">—</td></tr>
-    <tr><td>Playout position</td><td class="v" id="pos-seq">—</td></tr>
-    <tr><td>Live seq</td><td class="v" id="live-seq">—</td></tr>
-    <tr><td>Lead (buffer ahead of head)</td><td class="v" id="lead-ms">—</td></tr>
-  </table>
-</div>
-
-<div class="card">
-  <h2>Listen along (browser preview — not the real playhead)</h2>
-  <div class="note" style="margin-top:0;">
-    Independent HLS playback for checking levels/timing by ear. Has its own buffering and is
-    <strong>not</strong> connected to the server's hardware output above.
-  </div>
-  <audio id="player" style="display:none;"></audio>
-  <div class="row" style="margin-top:12px;">
-    <button id="la-playpause" class="primary" disabled>Play</button>
-    <span id="la-state" class="pill stopped">idle</span>
-    <span id="la-quality" class="la-quality"><i></i><span id="la-quality-label">—</span></span>
-    <span class="la-spacer"></span>
-    <button id="la-mute">Mute</button>
-    <input id="la-volume" type="range" min="0" max="100" value="100" />
-    <span id="la-volume-val" style="font-size:12px; color:#8a8f98;">100%</span>
-  </div>
-  <div class="note" id="la-time">—</div>
 </div>
 
 <script>
-const params = new URLSearchParams(location.search);
-const stream = params.get('stream') || 'obshow';
-document.getElementById('stream-name').textContent = stream;
-
 const apiBase = '';
 
-const actionError = document.getElementById('action-error');
-let actionErrorTimer = null;
-function showActionError(msg) {
-  actionError.textContent = msg;
-  actionError.style.display = 'block';
-  clearTimeout(actionErrorTimer);
-  actionErrorTimer = setTimeout(clearActionError, 8000);
-}
-function clearActionError() {
-  actionError.style.display = 'none';
-  actionError.textContent = '';
+// --- formatting helpers ---
+function humanBytes(bytes) {
+  if (bytes == null) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = bytes, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
 }
 
-// Control commands are no longer fire-and-forget: a rejected command (e.g. 409
-// "no segments buffered yet" when nothing has been ingested for this stream)
-// surfaces its reason instead of silently doing nothing. Returns whether the
-// command was accepted so callers can react if they need to.
-const post = async (path, body) => {
-  try {
-    const resp = await fetch(apiBase + path, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const text = (await resp.text().catch(() => '')).trim();
-      showActionError(`Command failed (${resp.status}): ${text || resp.statusText}`);
-      return false;
-    }
-    clearActionError();
-    return true;
-  } catch (e) {
-    showActionError(`Command failed: ${e.message || e}`);
-    return false;
-  }
-};
+function humanDuration(ms) {
+  if (ms == null) return '—';
+  const totalSecs = Math.round(ms / 1000);
+  const h = Math.floor(totalSecs / 3600);
+  const m = Math.floor((totalSecs % 3600) / 60);
+  const s = totalSecs % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
 
-document.getElementById('btn-start').onclick = () => post(`/api/${stream}/playout`, { cmd: 'start', position: { kind: 'live' } });
-document.getElementById('btn-stop').onclick = () => post(`/api/${stream}/playout`, { cmd: 'stop' });
-document.getElementById('btn-pause').onclick = () => post(`/api/${stream}/playout`, { cmd: 'pause' });
-document.getElementById('btn-resume').onclick = () => post(`/api/${stream}/playout`, { cmd: 'resume' });
-document.getElementById('btn-golive').onclick = () => post(`/api/${stream}/playout`, { cmd: 'go_live' });
-document.getElementById('btn-seek').onclick = () => {
-  const secs = parseInt(document.getElementById('seek-secs').value, 10) || 0;
-  post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: secs } });
-};
+function relativeTime(unixMs) {
+  if (unixMs == null) return '—';
+  const diff = Date.now() - unixMs;
+  if (diff < 0) return 'just now';
+  const secs = Math.round(diff / 1000);
+  if (secs < 10) return 'just now';
+  if (secs < 60) return `${secs} seconds ago`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  // older than a day: show an absolute local timestamp
+  return new Date(unixMs).toLocaleString();
+}
 
-const volumeInput = document.getElementById('volume');
-const volumeVal = document.getElementById('volume-val');
-let volumeDebounce = null;
-volumeInput.oninput = () => {
-  volumeVal.textContent = volumeInput.value + '%';
-  clearTimeout(volumeDebounce);
-  volumeDebounce = setTimeout(() => {
-    post(`/api/${stream}/playout`, { cmd: 'set_volume', gain: volumeInput.value / 100 });
-  }, 150);
-};
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
 
-function applyStatus(status) {
-  const s = status.server;
-  const playoutPill = document.getElementById('playout-pill');
-  playoutPill.textContent = s.playout.state;
-  playoutPill.className = 'pill ' + s.playout.state;
+// --- state ---
+let latestShows = [];
+let deleting = new Set(); // names with an in-flight delete
+const banner = document.getElementById('banner');
+const content = document.getElementById('content');
 
-  document.getElementById('pos-seq').textContent = s.playout.position_seq ?? '—';
-  document.getElementById('live-seq').textContent = s.live_seq ?? '—';
-  document.getElementById('lead-ms').textContent = s.lead_ms + ' ms';
-
-  const linkPill = document.getElementById('link-pill');
-  linkPill.textContent = status.link.connected ? 'up' : 'down';
-  linkPill.className = 'pill ' + (status.link.connected ? 'up' : 'down');
-  document.getElementById('seg-age').textContent = status.link.last_segment_age_ms + ' ms';
-  document.getElementById('cur-rung').textContent = status.link.current_rung ?? '—';
-  document.getElementById('gaps').textContent = status.link.gaps;
-
-  if (!volumeInput.matches(':active')) {
-    volumeInput.value = Math.round(s.playout.volume * 100);
-    volumeVal.textContent = volumeInput.value + '%';
+function showBanner(kind, text) {
+  banner.className = kind;
+  banner.textContent = text;
+  if (kind === 'ok') {
+    setTimeout(() => {
+      if (banner.textContent === text) { banner.className = ''; banner.textContent = ''; }
+    }, 4000);
   }
 }
 
-function applyMeters(vuDb, ppmDb) {
-  const toPct = db => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
-  document.getElementById('meter-vu').style.width = toPct(vuDb) + '%';
-  document.getElementById('meter-ppm').style.left = toPct(ppmDb) + '%';
-}
-
-// --- Waveform: BBC peaks.js, driven by the server's real playhead ---
-//
-// peaks.js is built to sit on an HTML5 <audio>/<video> element. There isn't
-// one here -- "playback" is the server's hardware output, not anything in
-// this browser -- so a custom `player` adapter is used instead. Its seek()
-// posts to the control API; its notion of "current time" and "playing" is
-// just a mirror of the ControlEvent stream, fed in via emitter.emit(...) as
-// documented at https://github.com/bbc/peaks.js/blob/master/doc/customizing.md.
-let peaksInstance = null;
-let waveformPointMs = null; // ms per waveform point, known once the first payload loads
-
-const RUNG_COLORS = { 0: '#f87171', 1: '#facc15', 2: '#4ade80' }; // lo/mid/hd
-const GAP_COLOR = '#3a3f47';
-function colorForRung(rung) {
-  return (rung === null || rung === undefined) ? GAP_COLOR : (RUNG_COLORS[rung] ?? '#8a8f98');
-}
-
-function makeServerPlayer() {
-  let currentTime = 0;
-  let playing = false;
-  let durationSecs = 0;
-  let dvrStartSeq = null;
-  let segMs = 2000;
-  let emitter = null;
-  return {
-    // -- required peaks.js adapter methods (doc/customizing.md "Player" interface) --
-    init(eventEmitter) { emitter = eventEmitter; return Promise.resolve(); },
-    destroy() {},
-    play() { post(`/api/${stream}/playout`, { cmd: 'resume' }); return Promise.resolve(); },
-    pause() { post(`/api/${stream}/playout`, { cmd: 'pause' }); },
-    seek(time) {
-      const secsBehindLive = Math.max(0, durationSecs - time);
-      post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: secsBehindLive } });
-    },
-    isPlaying() { return playing; },
-    isSeeking() { return false; },
-    getCurrentTime() { return currentTime; },
-    getDuration() { return durationSecs; },
-    setSource() { return Promise.resolve(); }, // no real media source to swap
-    // -- internal: fed by connectWs()'s status handler, not part of the adapter contract --
-    updateFromStatus(s) {
-      if (s.live_seq != null && s.dvr_start_seq != null) {
-        dvrStartSeq = s.dvr_start_seq;
-        durationSecs = ((s.live_seq - s.dvr_start_seq + 1) * segMs) / 1000;
-      }
-      if (s.playout.position_seq != null && dvrStartSeq != null) {
-        const newTime = ((s.playout.position_seq - dvrStartSeq) * segMs) / 1000;
-        if (Math.abs(newTime - currentTime) > 0.001) {
-          currentTime = newTime;
-          emitter?.emit('player.timeupdate', currentTime);
-        }
-      }
-      const wasPlaying = playing;
-      playing = s.playout.state === 'playing';
-      if (playing && !wasPlaying) emitter?.emit('player.playing', currentTime);
-      if (!playing && wasPlaying) emitter?.emit('player.pause', currentTime);
-    },
-    setSegmentMs(ms) { segMs = ms; },
-  };
-}
-const serverPlayer = makeServerPlayer();
-
-function initWaveform(json) {
-  peaks.init({
-    zoomview: {
-      container: document.getElementById('zoomview-container'),
-      waveformColor: GAP_COLOR,
-      playheadColor: '#e6e6e6',
-      autoScroll: false,
-    },
-    player: serverPlayer,
-    waveformData: { json },
-  }, (err, instance) => {
-    if (err) { console.error('peaks.js init failed', err); return; }
-    peaksInstance = instance;
-    applySegmentColors(json);
-  });
-}
-
-// waveform-data.js's JSON format has no segment_ms field; derive it from how
-// many consecutive points share the same seq in our `seqs` extension array.
-function pointsPerSegment(json) {
-  if (!json.seqs || json.seqs.length < 2) return 1;
-  let count = 1;
-  const first = json.seqs[0];
-  while (count < json.seqs.length && json.seqs[count] === first) count++;
-  return count;
-}
-
-function pointMs(json) {
-  return (json.samples_per_pixel / json.sample_rate) * 1000;
-}
-
-/// One non-overlay segment per DVR seq, colored by that seq's rung.
-/// overlay:false makes the segment draw its own waveform peaks in `color` in
-/// place of the base waveform, so adjacent no-gap segments read as one
-/// continuously color-coded waveform rather than boxes drawn on top of it.
-function applySegmentColors(json) {
-  peaksInstance.segments.removeAll();
-  const pMs = pointMs(json);
-
-  let i = 0;
-  while (i < json.seqs.length) {
-    const seq = json.seqs[i];
-    const rung = json.rungs[i];
-    let j = i;
-    while (j < json.seqs.length && json.seqs[j] === seq) j++;
-    peaksInstance.segments.add({
-      startTime: (i * pMs) / 1000,
-      endTime: (j * pMs) / 1000,
-      color: colorForRung(rung),
-      editable: false,
-      overlay: false,
-      id: `seq-${seq}`,
-    });
-    i = j;
-  }
-}
-
-async function applyWaveform() {
-  const resp = await fetch(`/api/${stream}/waveform`);
-  if (!resp.ok) return;
-  const json = await resp.json();
-  if (json.length === 0) return;
-
-  waveformPointMs = pointMs(json);
-  serverPlayer.setSegmentMs(waveformPointMs * pointsPerSegment(json));
-
-  if (!peaksInstance) {
-    initWaveform(json);
-  } else {
-    peaksInstance.setSource({ waveformData: { json } }, (err) => {
-      if (err) { console.error('waveform refresh failed', err); return; }
-      applySegmentColors(json);
-    });
-  }
-}
-
-function connectWs() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/api/${stream}/ws`);
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    // ControlEvent is internally tagged ("type"); Status's fields (stream,
-    // server, encoder, link) are flattened alongside it, not nested.
-    if (msg.type === 'status') {
-      applyStatus(msg);
-      serverPlayer.updateFromStatus(msg.server);
-    } else if (msg.type === 'meters') {
-      applyMeters(msg.vu_db, msg.ppm_db);
-    }
-  };
-  ws.onclose = () => setTimeout(connectWs, 1000);
-  ws.onerror = () => ws.close();
-}
-connectWs();
-applyWaveform();
-setInterval(applyWaveform, 5000);
-
-// Listen-along player: independent HLS pull, not tied to server playout state.
-// Its own hls.js instance, media events drive a small custom transport UI, and
-// fatal hls.js errors self-recover (network -> startLoad, media -> recoverMediaError)
-// so a transient hiccup on this preview doesn't need a page reload.
-const audio = document.getElementById('player');
-const hlsUrl = `/hls/${stream}/master.m3u8`;
-
-const laPlayPause = document.getElementById('la-playpause');
-const laStatePill = document.getElementById('la-state');
-const laQualityDot = document.querySelector('#la-quality i');
-const laQualityLabel = document.getElementById('la-quality-label');
-const laMute = document.getElementById('la-mute');
-const laVolume = document.getElementById('la-volume');
-const laVolumeVal = document.getElementById('la-volume-val');
-const laTime = document.getElementById('la-time');
-
-let laHls = null;
-let laLevels = [];
-let laRecoverTimer = null;
-
-function setLaState(state, label) {
-  laStatePill.textContent = label ?? state;
-  laStatePill.className = 'pill ' + state;
-}
-
-// Map an hls.js level index to lo/mid/hd naming + the waveform's RUNG_COLORS,
-// ranking levels by bitrate so the label stays meaningful for any rung count.
-const LA_RUNG_NAMES = ['lo', 'mid', 'hd'];
-function setLaQuality(idx) {
-  if (idx == null || idx < 0 || !laLevels.length || !laLevels[idx]) {
-    laQualityDot.style.background = GAP_COLOR;
-    laQualityLabel.textContent = '—';
+function render() {
+  if (latestShows.length === 0) {
+    content.innerHTML = '<div class="empty">No shows yet.</div>';
     return;
   }
-  const ranked = laLevels
-    .map((l, i) => ({ i, bitrate: l.bitrate || 0 }))
-    .sort((a, b) => a.bitrate - b.bitrate);
-  const rank = ranked.findIndex(x => x.i === idx);
-  const rung = ranked.length <= 1
-    ? 0
-    : Math.round((rank / (ranked.length - 1)) * (LA_RUNG_NAMES.length - 1));
-  const kbps = Math.round((laLevels[idx].bitrate || 0) / 1000);
-  laQualityDot.style.background = RUNG_COLORS[rung] ?? '#8a8f98';
-  laQualityLabel.textContent = kbps ? `${LA_RUNG_NAMES[rung]} · ${kbps}k` : LA_RUNG_NAMES[rung];
+
+  const rows = latestShows.map(show => {
+    const name = show.name;
+    const enc = escapeHtml(name);
+    const href = 'stream.html?stream=' + encodeURIComponent(name);
+    const pill = show.live
+      ? '<span class="pill live">live</span>'
+      : '<span class="pill past">past</span>';
+    const isDeleting = deleting.has(name);
+    const delLabel = isDeleting ? 'Deleting…' : 'Delete';
+    const delAttr = isDeleting ? 'disabled' : '';
+    return `
+      <tr data-name="${enc}">
+        <td><a class="show-name" href="${escapeHtml(href)}">${enc}</a></td>
+        <td>${pill}</td>
+        <td class="v">${humanBytes(show.size_bytes)}</td>
+        <td class="v">${humanDuration(show.duration_ms)}</td>
+        <td class="v">${show.segment_count ?? 0}</td>
+        <td class="muted">${escapeHtml(relativeTime(show.modified_unix_ms))}</td>
+        <td><button class="danger" data-del="${enc}" ${delAttr}>${delLabel}</button></td>
+      </tr>`;
+  }).join('');
+
+  content.innerHTML = `
+    <table class="shows">
+      <thead>
+        <tr>
+          <th>Show</th><th>Status</th><th>Size</th><th>Duration</th>
+          <th>Segments</th><th>Last active</th><th></th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+  content.querySelectorAll('button[data-del]').forEach(btn => {
+    btn.onclick = () => onDelete(btn.getAttribute('data-del'));
+  });
 }
 
-function updateMuteBtn() {
-  laMute.textContent = (audio.muted || audio.volume === 0) ? 'Unmute' : 'Mute';
-}
-
-laPlayPause.onclick = () => {
-  if (audio.paused) audio.play().catch(() => {});
-  else audio.pause();
-};
-
-laVolume.oninput = () => {
-  const v = laVolume.value / 100;
-  audio.volume = v;
-  if (v > 0) audio.muted = false;
-  laVolumeVal.textContent = laVolume.value + '%';
-  updateMuteBtn();
-};
-
-laMute.onclick = () => {
-  audio.muted = !audio.muted;
-  updateMuteBtn();
-};
-
-audio.addEventListener('playing', () => { setLaState('live', 'live'); laPlayPause.textContent = 'Pause'; });
-audio.addEventListener('pause',   () => { setLaState('paused', 'paused'); laPlayPause.textContent = 'Play'; });
-audio.addEventListener('waiting', () => setLaState('buffering', 'buffering'));
-audio.addEventListener('stalled', () => setLaState('stalled', 'stalled'));
-audio.addEventListener('ended',   () => { setLaState('stopped', 'ended'); laPlayPause.textContent = 'Play'; });
-audio.addEventListener('timeupdate', () => {
-  let behind = 0;
-  if (audio.buffered.length) {
-    behind = Math.max(0, audio.buffered.end(audio.buffered.length - 1) - audio.currentTime);
+async function onDelete(name) {
+  if (deleting.has(name)) return;
+  if (!confirm(`Delete show "${name}"?\n\nThis permanently removes all audio files the server received for it. This cannot be undone.`)) {
+    return;
   }
-  laTime.textContent = behind < 1 ? 'At live edge' : `~${behind.toFixed(1)}s behind live edge`;
-});
-
-function buildLaHls() {
-  const hls = new Hls();
-  laHls = hls;
-  hls.on(Hls.Events.MANIFEST_PARSED, () => {
-    laLevels = hls.levels || [];
-    laPlayPause.disabled = false;
-    setLaQuality(hls.currentLevel);
-  });
-  hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
-    laLevels = hls.levels || laLevels;
-    setLaQuality(data.level);
-  });
-  hls.on(Hls.Events.ERROR, (_e, data) => {
-    if (!data.fatal) return;
-    setLaState('error', 'error — recovering');
-    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-      clearTimeout(laRecoverTimer);
-      laRecoverTimer = setTimeout(() => hls.startLoad(), 1000);
-    } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-      hls.recoverMediaError();
+  deleting.add(name);
+  render();
+  try {
+    const resp = await fetch(apiBase + '/api/shows/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (resp.status === 204) {
+      latestShows = latestShows.filter(s => s.name !== name);
+      showBanner('ok', `Deleted "${name}".`);
+    } else if (resp.status === 404) {
+      latestShows = latestShows.filter(s => s.name !== name);
+      showBanner('err', `"${name}" no longer exists — it may have already been deleted.`);
     } else {
-      hls.destroy();
-      clearTimeout(laRecoverTimer);
-      laRecoverTimer = setTimeout(buildLaHls, 2000);
+      showBanner('err', `Failed to delete "${name}" (server returned ${resp.status}).`);
     }
-  });
-  hls.loadSource(hlsUrl);
-  hls.attachMedia(audio);
+  } catch (e) {
+    showBanner('err', `Failed to delete "${name}": ${e.message || 'network error'}.`);
+  } finally {
+    deleting.delete(name);
+    render();
+  }
 }
 
-setLaState('stopped', 'idle');
-setLaQuality(null);
-updateMuteBtn();
-
-if (Hls.isSupported()) {
-  buildLaHls();
-} else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
-  // Safari native HLS: no hls.js level info, so quality stays '—'.
-  audio.src = hlsUrl;
-  laPlayPause.disabled = false;
+async function refresh() {
+  try {
+    const resp = await fetch(apiBase + '/api/shows');
+    if (!resp.ok) {
+      if (banner.className !== 'err') showBanner('err', `Could not load shows (server returned ${resp.status}).`);
+      return;
+    }
+    const data = await resp.json();
+    if (!Array.isArray(data)) {
+      showBanner('err', 'Could not load shows: unexpected response from server.');
+      return;
+    }
+    latestShows = data;
+    if (banner.className === 'err') { banner.className = ''; banner.textContent = ''; }
+    render();
+  } catch (e) {
+    // Keep whatever is on screen; surface the problem without wiping the list.
+    if (latestShows.length === 0) {
+      content.innerHTML = '<div class="empty">Could not reach the server. Retrying…</div>';
+    }
+    showBanner('err', `Could not load shows: ${e.message || 'network error'}.`);
+  }
 }
+
+refresh();
+setInterval(refresh, 7000);
 </script>
 
 </body>

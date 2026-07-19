@@ -72,7 +72,7 @@ Chosen for single-binary robustness in the field and one shared type crate acros
 | Encode / decode    | `ffmpeg` via subprocess, one process → N rungs (currently AAC-LC on every rung; native `aac` can't emit HE-AAC, so the low rung needs `libfdk_aac` to get its intended win). `symphonia` for decode-only paths |
 | Client GUI         | `egui`/`eframe` (chosen, done); also a `--headless` CLI path with no GUI |
 | DVR store          | Filesystem segments + in-memory index (optionally `rusqlite`)     |
-| Web listen / UI    | `hls.js` + `peaks.js`, loaded from CDN by a single static `web/remote/index.html` — no bundler/build step |
+| Web listen / UI    | `hls.js` + `peaks.js`, loaded from CDN by static `web/remote/index.html` (shows overview) + `stream.html` (per-show remote) — no bundler/build step |
 | Packaging          | `cargo dist` / static binaries (client), Docker (server)          |
 
 Keep the ingest / control / HLS contracts in `obcast-proto` and `docs/protocol.md` — they are the
@@ -91,7 +91,8 @@ obcast/
     protocol.md                    # control plane + feedback loop (authoritative)
     getting-started.md             # quick-start / run guide
   web/
-    remote/index.html              # static web remote (control + listen + waveform), no build step
+    remote/index.html              # shows overview (list/delete), served at "/remote/"
+    remote/stream.html             # per-show remote (control + listen + waveform), no build step
   crates/
     obcast-proto/                  # state/control types + scheduler + tests
       src/
@@ -126,8 +127,9 @@ obcast/
 The layout is flat files per crate (not nested module dirs). On the server, `api.rs` is the control
 module and `waveform.rs` backs the web remote's colored waveform. On the client, the on-disk ring
 buffer is just the `{rung}/{seq}.ts` file convention read by `inventory.rs` — there is no separate
-`buffer` module. The web remote is a single dependency-free `web/remote/index.html` pulling `hls.js`
-and `peaks.js` from CDNs.
+`buffer` module. The web remote is dependency-free static HTML pulling `hls.js` and `peaks.js` from
+CDNs: `web/remote/index.html` is the shows overview served at `/remote/`, linking out to
+`web/remote/stream.html?stream={name}` for per-show control/listen/waveform.
 
 ---
 
@@ -223,7 +225,7 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   which is auto-created by any read-only GET (`status`/`waveform`/`ws`) and never torn down, so a
   stream whose encoder died (or was never fed at all, e.g. a typo'd name) still showed a green "live"
   pill indefinitely. `live` now requires a segment within the last 5 s (`shows.rs`, matching
-  `api.rs`'s existing link-health window). The web remote's control buttons (`index.html`) were also
+  `api.rs`'s existing link-health window). The web remote's control buttons (`stream.html`) were also
   fire-and-forget — a rejected command (e.g. 409 "no segments buffered yet") failed with zero
   feedback; they now surface the server's rejection reason in a visible banner. The client GUI
   similarly used to go silently dead if its ffmpeg pipeline crashed mid-session (stdin write failure

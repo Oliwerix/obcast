@@ -102,8 +102,10 @@ This is the real playhead: its position feeds back into `ServerState` and
 reshapes what the encoder uploads next (see `protocol.md` §5). Two ways to
 drive it:
 
-**Web remote** — open `http://127.0.0.1:8080/remote/?stream=myshow` for
-start/stop/seek buttons, live health, VU meters, and a waveform (BBC
+**Web remote** — open `http://127.0.0.1:8080/remote/` for the shows overview
+(every stream the server has received audio for, live or past), or jump
+straight to one with `http://127.0.0.1:8080/remote/stream.html?stream=myshow`
+for start/stop/seek buttons, live health, VU meters, and a waveform (BBC
 peaks.js) you can click or drag to seek — colored by ABR rung, so you can
 see where quality is low at a glance.
 
