@@ -15,7 +15,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::JoinHandle;
 
-use obcast_proto::state::{PlayoutState, Rung, StreamProfile};
+use obcast_proto::state::{PlayoutState, StreamProfile};
 
 use crate::audio::{self, AudioHandle};
 use crate::config::AppConfig;
@@ -111,26 +111,7 @@ impl ObcastApp {
     }
 
     fn profile(&self) -> StreamProfile {
-        StreamProfile {
-            segment_ms: self.cfg.segment_ms,
-            rungs: vec![
-                Rung {
-                    id: 0,
-                    name: "lo".into(),
-                    bitrate_kbps: 32,
-                },
-                Rung {
-                    id: 1,
-                    name: "mid".into(),
-                    bitrate_kbps: 128,
-                },
-                Rung {
-                    id: 2,
-                    name: "hd".into(),
-                    bitrate_kbps: 320,
-                },
-            ],
-        }
+        StreamProfile::default_ladder(self.cfg.segment_ms)
     }
 
     fn toggle_live(&mut self) {
@@ -166,6 +147,7 @@ impl ObcastApp {
                     PlayoutState::Playing => "🟢 playing",
                     PlayoutState::Paused => "🟡 paused",
                     PlayoutState::Stopped => "⚪ stopped",
+                    PlayoutState::Stalled => "🟠 stalled",
                 };
                 ui.label(format!("server: {playout}"));
                 ui.label(format!("lead {} ms", state.lead_ms));

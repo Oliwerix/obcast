@@ -109,6 +109,7 @@
     <span><i style="background:#facc15;"></i>mid</span>
     <span><i style="background:#4ade80;"></i>hd</span>
     <span><i style="background:#3a3f47;"></i>gap</span>
+    <span><i style="background:#a78bfa;"></i>decode error</span>
   </div>
   <div class="note">Click or drag the waveform to seek the server's hardware output. Color shows the ABR rung actually covering that audio.</div>
 </div>
@@ -250,7 +251,12 @@ let waveformPointMs = null; // ms per waveform point, known once the first paylo
 
 const RUNG_COLORS = { 0: '#f87171', 1: '#facc15', 2: '#4ade80' }; // lo/mid/hd
 const GAP_COLOR = '#3a3f47';
-function colorForRung(rung) {
+// A flat line here is an artifact of a decode failure, not necessarily real
+// silence — kept visually distinct from both a genuine gap and rung colors
+// (see WaveformJson.decode_failed / obcast-server/src/waveform.rs).
+const DECODE_ERROR_COLOR = '#a78bfa';
+function colorForRung(rung, failed) {
+  if (failed) return DECODE_ERROR_COLOR;
   return (rung === null || rung === undefined) ? GAP_COLOR : (RUNG_COLORS[rung] ?? '#8a8f98');
 }
 
@@ -342,12 +348,13 @@ function applySegmentColors(json) {
   while (i < json.seqs.length) {
     const seq = json.seqs[i];
     const rung = json.rungs[i];
+    const failed = json.decode_failed ? json.decode_failed[i] : false;
     let j = i;
     while (j < json.seqs.length && json.seqs[j] === seq) j++;
     peaksInstance.segments.add({
       startTime: (i * pMs) / 1000,
       endTime: (j * pMs) / 1000,
-      color: colorForRung(rung),
+      color: colorForRung(rung, failed),
       editable: false,
       overlay: false,
       id: `seq-${seq}`,

@@ -99,7 +99,11 @@ const P_UPGRADE: u32 = 2_000_000;
 fn anchor(server: &ServerState, inv: &LocalInventory) -> Seq {
     use crate::state::PlayoutState::*;
     match server.playout.state {
-        Playing | Paused => server.playout.position_seq,
+        // Stalled is still nominally "playing" position-wise (see
+        // `store::build_server_state`'s matching anchor logic on the server
+        // side) — the scheduler should keep defending the same head a
+        // stalled playout is stuck on, not fall back to the live edge.
+        Playing | Paused | Stalled => server.playout.position_seq,
         Stopped => None,
     }
     .or(server.playout.position_seq)
@@ -477,6 +481,118 @@ mod tests {
         let mut inv = inv_full(0, 20, &[]);
         inv.available.remove(&20);
         assert_eq!(stalled_continuity_seq(&srv, &inv, &profile()), None);
+    }
+
+    #[test]
+    fn far_behind_head_only_fills_near_anchor_and_near_live_edge_not_the_middle() {
+        // Playout paused/seeked far back (anchor=5) while the encoder has kept
+        // producing all the way out to 205 — e.g. a long DVR pause. Continuity
+        // only needs to secure `target_ms` ahead of the anchor; live-edge only
+        // needs to keep the newest `target_ms` covered. The large middle
+        // region between those two windows must be left alone this tick —
+        // deliberate (bounded per-tick budget), but previously unasserted
+        // (the "coverage-window-vs-far-behind-head" gap flagged in CLAUDE.md).
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 16000,
+        };
+        let srv = server(PlayoutState::Playing, Some(5), water);
+        let inv = inv_full(0, 205, &[]); // nothing acked by the server anywhere yet
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000,
+            headroom: 0.9,
+            max_actions: 100,
+        };
+        let plan = plan_uploads(&input);
+
+        assert!(!plan.is_empty());
+        // Every action is either near the anchor (continuity window) or near
+        // the live/encoded edge (live-edge window) — never in the untouched
+        // middle.
+        for a in &plan {
+            assert!(
+                a.seq <= 8 || a.seq >= 202,
+                "seq {} falls in the middle region neither window should touch this tick",
+                a.seq
+            );
+        }
+        for mid in [50, 100, 150, 201] {
+            assert!(plan.iter().all(|a| a.seq != mid));
+        }
+        // Lead from continuity alone (8000ms) doesn't reach `high_ms`
+        // (16000ms), so no upgrades this tick.
+        assert!(plan.iter().all(|a| a.reason != UploadReason::Upgrade));
+    }
+
+    #[test]
+    fn misconfigured_water_levels_with_low_above_target_stays_in_survival() {
+        // Water levels are meant to satisfy low_ms <= target_ms <= high_ms,
+        // but nothing enforces that — an operator typo could easily invert
+        // them. Here low_ms > target_ms: continuity secures the full
+        // target_ms lead, but `survival` (lead_ms < low_ms) still reads true
+        // because low_ms was misconfigured above target_ms. Not a crash —
+        // this locks in the actual (slightly surprising) behavior so a
+        // future change doesn't silently alter it unnoticed.
+        let water = WaterLevels {
+            low_ms: 8000,
+            target_ms: 4000,
+            high_ms: 2000,
+        };
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let inv = inv_full(0, 50, &[]);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000,
+            headroom: 0.9,
+            max_actions: 50,
+        };
+        let plan = plan_uploads(&input);
+
+        assert!(!plan.is_empty());
+        assert!(plan.iter().all(|a| a.reason == UploadReason::Continuity));
+        assert!(plan.iter().all(|a| a.rung == 0));
+        assert!(plan.iter().all(|a| a.seq >= 20));
+        // Survival (mis-triggered by low_ms > target_ms) suppresses live-edge
+        // and upgrade tiers entirely, even though `high_ms` is trivially
+        // satisfied.
+        assert!(plan.iter().all(|a| a.reason != UploadReason::LiveEdge));
+        assert!(plan.iter().all(|a| a.reason != UploadReason::Upgrade));
+    }
+
+    #[test]
+    fn misconfigured_water_levels_all_zero_does_not_panic() {
+        // Degenerate all-zero config (e.g. an unset/defaulted-wrong TOML)
+        // must not panic or divide by zero — `seg_ms.max(1)` and the derived
+        // window sizes' `.max(1)` guards are what protect this; assert the
+        // contract holds rather than relying on it silently.
+        let water = WaterLevels {
+            low_ms: 0,
+            target_ms: 0,
+            high_ms: 0,
+        };
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let inv = inv_full(0, 50, &[]);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000,
+            headroom: 0.9,
+            max_actions: 50,
+        };
+        let plan = plan_uploads(&input); // must not panic
+                                         // Hard invariant that must hold no matter how water levels are
+                                         // misconfigured: never upgrade a segment at or behind the playout head.
+        assert!(plan
+            .iter()
+            .filter(|a| a.reason == UploadReason::Upgrade)
+            .all(|a| a.seq > 20));
     }
 
     #[test]

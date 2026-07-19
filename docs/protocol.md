@@ -78,8 +78,18 @@ survive a thin link even when segment uploads are failing. The encoder always
 uses the **highest `rev`** it has seen and ignores older ones.
 
 ### Encoder telemetry (for operator dashboards)
-Piggybacked on uploads, or `POST /ingest/{stream}/heartbeat` with an
-[`EncoderState`](../crates/obcast-proto/src/state.rs) body when uploads are idle.
+```
+POST /ingest/{stream}/heartbeat    Body: <EncoderState JSON>
+Header: X-Auth: <ingest token>   (only if OBCAST_INGEST_TOKEN is set)
+```
+Sent by the encoder client once a second regardless of whether an upload
+happened that tick, so telemetry (current rung, throughput, backlog, locally
+abandoned seqs) stays fresh even while idling in survival mode with nothing
+new to send. The server stores the latest snapshot per stream and surfaces it
+as `ControlStatus.encoder` and real `LinkHealth.throughput_kbps` (§4) — purely
+additive dashboard data. It never feeds back into `plan_uploads`; the
+upload-scheduling loop (§1) runs entirely off `ServerState`, piggybacked on
+uploads and the SSE feed above.
 
 ### `ServerState` fields that drive the scheduler
 - `playout.state` + `playout.position_seq` — the anchor for all urgency.
@@ -102,11 +112,23 @@ always uses the host's default audio output; requesting it returns
 ```
 GET /api/{stream}/status  ->  ControlStatus { stream, server, encoder?, link }
 ```
+`status`, `waveform`, and `ws` are read-only: unlike ingest (which starts a
+new stream on first upload) they never spin up a stream that's never been
+ingested into. A name with no in-memory handle and no on-disk show directory
+returns `404`, rather than silently creating an empty one — see CLAUDE.md §8
+"per-stream resource leak".
 
 ### Playout commands
 ```
 POST /api/{stream}/playout   Body: <PlayoutCommand JSON>
+Header: X-Auth: <control token>   (only if OBCAST_CONTROL_TOKEN is set on the server)
 ```
+Deliberately a separate credential from ingest's `X-Auth` token (§2) — an OB
+site's upload credential shouldn't also be able to stop/seek/set-volume the
+server's hardware output. Unset `OBCAST_CONTROL_TOKEN` (the default) disables
+this check, same "no token configured = auth disabled" semantics as ingest.
+A missing/incorrect header is rejected with `401 Unauthorized`.
+
 `PlayoutCommand` variants (tagged by `"cmd"`):
 
 | cmd          | payload                          | effect                              |

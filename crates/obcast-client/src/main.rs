@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use obcast_proto::state::{Rung, StreamProfile};
+use obcast_proto::state::StreamProfile;
 
 /// OBCast encoder client.
 #[derive(Parser)]
@@ -45,26 +45,7 @@ struct Args {
 }
 
 fn profile(segment_ms: u32) -> StreamProfile {
-    StreamProfile {
-        segment_ms,
-        rungs: vec![
-            Rung {
-                id: 0,
-                name: "lo".into(),
-                bitrate_kbps: 32,
-            },
-            Rung {
-                id: 1,
-                name: "mid".into(),
-                bitrate_kbps: 128,
-            },
-            Rung {
-                id: 2,
-                name: "hd".into(),
-                bitrate_kbps: 320,
-            },
-        ],
-    }
+    StreamProfile::default_ladder(segment_ms)
 }
 
 fn main() {

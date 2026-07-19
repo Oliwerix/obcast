@@ -12,7 +12,7 @@ use axum::Json;
 use futures::Stream;
 use serde::Deserialize;
 
-use obcast_proto::state::{RungId, Seq, ServerState};
+use obcast_proto::state::{EncoderState, RungId, Seq, ServerState};
 
 use crate::{AppState, StreamHandle};
 
@@ -93,15 +93,52 @@ pub async fn upload_segment(
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let state = {
+    let (state, evicted) = {
         let mut store = handle.store.lock().await;
-        store.record(rung, seq);
-        store.build_server_state(handle.playout_status())
+        let evicted = store.record(rung, seq);
+        (store.build_server_state(handle.playout_status()), evicted)
     };
     *handle.last_ingest.lock().await = Some(std::time::Instant::now());
     let _ = handle.tx.send(state.clone());
     tracing::info!(stream, rung, seq, bytes = body.len(), "segment ingested");
+    reap(&stream, evicted).await;
     Ok(Json(state))
+}
+
+/// Delete segment files evicted from the DVR window index. Best-effort: a
+/// missing file (already gone, or never written because the encoder
+/// abandoned it before uploading) isn't an error, just nothing to reap.
+async fn reap(stream: &str, paths: Vec<std::path::PathBuf>) {
+    for path in paths {
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => tracing::debug!(stream, path = %path.display(), "reaped evicted DVR segment"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(stream, path = %path.display(), error = %err, "failed to reap evicted DVR segment")
+            }
+        }
+    }
+}
+
+/// `POST /ingest/{stream}/heartbeat`: encoder telemetry, independent of any
+/// segment upload — lets the server populate `ControlStatus.encoder` and
+/// real `throughput_kbps` even during a lull where nothing is being
+/// uploaded (e.g. survival mode holding steady). See `docs/protocol.md` §3.
+/// Purely additive dashboard/observability data — the encoder<->server
+/// upload-scheduling feedback loop (CLAUDE.md §1) is driven entirely by
+/// `ServerState`, piggybacked on uploads and the SSE feed; this route never
+/// participates in that loop.
+pub async fn heartbeat(
+    State(app): State<Arc<AppState>>,
+    Path(stream): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<EncoderState>,
+) -> Result<StatusCode, ApiError> {
+    let handle = app.stream(&stream).await;
+    check_auth(&handle, &headers)?;
+
+    handle.store.lock().await.set_encoder_state(body);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

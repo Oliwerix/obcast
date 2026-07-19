@@ -45,6 +45,13 @@ pub struct WaveformJson {
     /// obcast extension: seq each point belongs to, for click-to-seek math
     /// on the client without re-deriving it from time + segment_ms.
     seqs: Vec<Seq>,
+    /// obcast extension: true at points whose segment *had* a recorded rung
+    /// (i.e. `rungs[i]` is `Some`) but couldn't actually be decoded — file
+    /// missing on disk despite being indexed, or `ffmpeg` failed on it. A
+    /// flat `(0, 0)` line at such a point is an artifact of the failure, not
+    /// necessarily real silence; distinct from a true gap, where `rungs[i]`
+    /// is `None` because no rung was ever recorded for that seq at all.
+    decode_failed: Vec<bool>,
 }
 
 /// Decode every playable segment in `[start, end]` and build one JSON
@@ -59,24 +66,50 @@ pub fn build(store: &DvrStore, profile: &StreamProfile, start: Seq, end: Seq) ->
     let mut data = Vec::new();
     let mut rungs = Vec::new();
     let mut seqs = Vec::new();
+    let mut decode_failed = Vec::new();
 
     for seq in start..=end {
         let rung = store.best_rung(seq);
-        let peaks = rung
-            .and_then(|r| {
+        let (segment_points, failed) = match rung {
+            // A true gap: no rung was ever recorded for this seq. Not a
+            // failure — there's simply nothing to decode.
+            None => (vec![(0, 0); points_per_segment], false),
+            Some(r) => {
                 let path = store.segment_path(r, seq);
-                path.exists()
-                    .then(|| decode_mono_i16(&path, DECODE_SAMPLE_RATE))
-                    .flatten()
-            })
-            .map(|samples| extract_peaks(&samples, samples_per_point as usize, points_per_segment));
+                if !path.exists() {
+                    tracing::warn!(
+                        seq,
+                        rung = r,
+                        path = %path.display(),
+                        "waveform: segment recorded in the DVR index but missing on disk"
+                    );
+                    (vec![(0, 0); points_per_segment], true)
+                } else {
+                    match decode_mono_i16(&path, DECODE_SAMPLE_RATE) {
+                        Some(samples) => (
+                            extract_peaks(&samples, samples_per_point as usize, points_per_segment),
+                            false,
+                        ),
+                        None => {
+                            tracing::warn!(
+                                seq,
+                                rung = r,
+                                path = %path.display(),
+                                "waveform: failed to decode segment, rendering as a flagged flat line"
+                            );
+                            (vec![(0, 0); points_per_segment], true)
+                        }
+                    }
+                }
+            }
+        };
 
-        let segment_points = peaks.unwrap_or_else(|| vec![(0, 0); points_per_segment]);
         for (min, max) in segment_points {
             data.push(min);
             data.push(max);
             rungs.push(rung);
             seqs.push(seq);
+            decode_failed.push(failed);
         }
     }
 
@@ -91,6 +124,7 @@ pub fn build(store: &DvrStore, profile: &StreamProfile, start: Seq, end: Seq) ->
         data,
         rungs,
         seqs,
+        decode_failed,
     }
 }
 
@@ -155,4 +189,61 @@ fn decode_mono_i16(path: &std::path::Path, sample_rate: u32) -> Option<Vec<i16>>
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::DvrStore;
+    use obcast_proto::state::{Rung, WaterLevels};
+    use std::path::PathBuf;
+
+    fn profile() -> StreamProfile {
+        StreamProfile {
+            segment_ms: 2000,
+            rungs: vec![Rung {
+                id: 0,
+                name: "lo".into(),
+                bitrate_kbps: 32,
+            }],
+        }
+    }
+
+    #[test]
+    fn gap_segments_are_not_flagged_as_decode_failures() {
+        // Nothing was ever recorded for seq 0, so `best_rung` is `None` — a
+        // true gap, distinct from a decode failure.
+        let store = DvrStore::new(
+            profile(),
+            WaterLevels::default(),
+            60_000,
+            PathBuf::from("/tmp/obcast-waveform-test-gap"),
+        );
+        let json = build(&store, &profile(), 0, 0);
+        assert!(json.rungs.iter().all(|r| r.is_none()));
+        assert!(
+            json.decode_failed.iter().all(|f| !f),
+            "a true gap must not be flagged as a decode failure"
+        );
+    }
+
+    #[test]
+    fn indexed_but_missing_file_is_flagged_as_a_decode_failure() {
+        // Recorded in the index, but no file was ever actually written to
+        // disk at that path — should be flagged, not silently rendered as a
+        // flat (0, 0) line indistinguishable from real silence.
+        let mut store = DvrStore::new(
+            profile(),
+            WaterLevels::default(),
+            60_000,
+            PathBuf::from("/tmp/obcast-waveform-test-missing"),
+        );
+        store.record(0, 0);
+        let json = build(&store, &profile(), 0, 0);
+        assert!(json.rungs.iter().all(|r| *r == Some(0)));
+        assert!(
+            json.decode_failed.iter().all(|f| *f),
+            "an indexed-but-missing-on-disk segment must be flagged as a decode failure"
+        );
+    }
 }

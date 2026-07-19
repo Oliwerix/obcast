@@ -25,10 +25,13 @@ Config is via environment variables, all optional:
 | `OBCAST_DATA_DIR`        | `./data`       | where segments and DVR state are stored     |
 | `OBCAST_LISTEN_ADDR`     | `0.0.0.0:8080` | HTTP listen address                         |
 | `OBCAST_INGEST_TOKEN`    | unset          | if set, `POST /ingest/*` requires `X-Auth`  |
+| `OBCAST_CONTROL_TOKEN`   | unset          | if set, `POST /api/{stream}/playout` requires `X-Auth` (separate credential from ingest's) |
 | `OBCAST_WEB_REMOTE_DIR`  | `web/remote`   | static files served at `/remote`            |
 
-Each `{stream}` name is created lazily on first contact (first ingest, first
-status request, etc.) — there's no separate "create a stream" step.
+Each `{stream}` name is created lazily on first ingest — there's no separate
+"create a stream" step. Read-only routes (`status`/`waveform`/`ws`/HLS
+listen) never create a stream themselves; they 404 for a name that's never
+been ingested into.
 
 ### Picking the playout audio subsystem/device
 

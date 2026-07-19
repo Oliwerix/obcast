@@ -12,7 +12,7 @@ use serde::Serialize;
 use obcast_proto::scheduler::{
     plan_uploads, stalled_continuity_seq, LocalInventory, SchedulerInput,
 };
-use obcast_proto::state::{RungId, Seq, ServerState, StreamProfile};
+use obcast_proto::state::{EncoderState, RungId, Seq, ServerState, StreamProfile};
 
 use crate::inventory;
 use crate::shared::SharedState;
@@ -33,6 +33,13 @@ pub struct Config {
 /// freeze the playout head forever (see `playout.rs`'s matching backstop).
 const ABANDON_AFTER: Duration = Duration::from_secs(20);
 
+/// How often to POST `EncoderState` to `/ingest/{stream}/heartbeat`. Purely
+/// dashboard/observability telemetry (see `docs/protocol.md` §3) — the real
+/// upload-scheduling feedback loop (CLAUDE.md §1) runs off `ServerState`,
+/// piggybacked on every upload reply and the SSE feed, independent of this.
+/// Matches the server's own SSE heartbeat cadence (`ingest.rs::state_feed`).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Serialize)]
 struct AbandonBody<'a> {
     seqs: &'a [Seq],
@@ -50,6 +57,9 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
     // don't re-POST `/abandon` for it every tick forever).
     let mut stalled: Option<(Seq, tokio::time::Instant)> = None;
     let mut abandoned_locally: BTreeSet<Seq> = BTreeSet::new();
+
+    let mut heartbeat_rev: u64 = 0;
+    let mut last_heartbeat: Option<tokio::time::Instant> = None;
 
     loop {
         tick.tick().await;
@@ -119,6 +129,34 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
             headroom: 0.9,
             max_actions: 16,
         });
+
+        if last_heartbeat.is_none_or(|t| t.elapsed() >= HEARTBEAT_INTERVAL) {
+            heartbeat_rev += 1;
+            last_heartbeat = Some(tokio::time::Instant::now());
+            let backlog = inv
+                .available
+                .keys()
+                .filter(|seq| !inv.server_best.contains_key(seq))
+                .count() as u32;
+            let body = EncoderState {
+                rev: heartbeat_rev,
+                active_rungs: rungs.clone(),
+                encoded_seq: (!inv.available.is_empty()).then_some(inv.encoded_seq),
+                primary_rung: actions.first().map(|a| a.rung).unwrap_or(low),
+                throughput_kbps,
+                backlog,
+                abandoned: abandoned_locally.iter().copied().collect(),
+            };
+            let mut req = client
+                .post(format!("{}/ingest/{}/heartbeat", cfg.base_url, cfg.stream))
+                .json(&body);
+            if let Some(token) = &cfg.ingest_token {
+                req = req.header("X-Auth", token.clone());
+            }
+            if let Err(err) = req.send().await {
+                tracing::warn!(error = %err, "heartbeat failed, will retry next tick");
+            }
+        }
 
         for action in actions {
             let path = cfg

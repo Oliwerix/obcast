@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use axum::routing::{delete, get, post};
 use axum::Router;
-use obcast_proto::state::{PlayoutStatus, Rung, ServerState, StreamProfile, WaterLevels};
+use obcast_proto::state::{PlayoutStatus, ServerState, StreamProfile, WaterLevels};
 use tokio::sync::{broadcast, Mutex};
 use tower_http::services::ServeDir;
 
@@ -57,17 +57,12 @@ pub struct AppState {
     water: WaterLevels,
     dvr_window_ms: u32,
     ingest_token: Option<String>,
+    control_token: Option<String>,
     audio: AudioConfig,
 }
 
 impl AppState {
-    /// Look up a stream's handle, lazily creating it (and its playout
-    /// engine thread) on first contact.
-    pub async fn stream(&self, name: &str) -> Arc<StreamHandle> {
-        let mut streams = self.streams.lock().await;
-        if let Some(handle) = streams.get(name) {
-            return handle.clone();
-        }
+    fn create_stream_handle(&self, name: &str) -> Arc<StreamHandle> {
         let store = Arc::new(Mutex::new(DvrStore::new(
             self.profile.clone(),
             self.water,
@@ -83,15 +78,53 @@ impl AppState {
         );
 
         let (tx, _rx) = broadcast::channel(64);
-        let handle = Arc::new(StreamHandle {
+        Arc::new(StreamHandle {
             store,
             playout,
             tx,
             ingest_token: self.ingest_token.clone(),
             last_ingest: Mutex::new(None),
-        });
+        })
+    }
+
+    /// Look up a stream's handle, lazily creating it (and its playout
+    /// engine thread) on first contact. Reserved for the ingest/media-plane
+    /// entry points (`ingest.rs`), where "this name doesn't exist yet"
+    /// legitimately means "a new stream is starting" — see
+    /// `stream_if_known` for every read-only route, which must NOT do this.
+    pub async fn stream(&self, name: &str) -> Arc<StreamHandle> {
+        let mut streams = self.streams.lock().await;
+        if let Some(handle) = streams.get(name) {
+            return handle.clone();
+        }
+        let handle = self.create_stream_handle(name);
         streams.insert(name.to_string(), handle.clone());
         handle
+    }
+
+    /// Same lazy lookup as `stream()`, but safe for read-only control/HLS
+    /// routes (`status`/`waveform`/`ws`, the HLS origin): never spins up a
+    /// brand-new stream (permanent OS thread + `DvrStore`) for a name
+    /// nobody has ever ingested into. Re-attaches an existing in-memory
+    /// handle, or lazily re-opens one for a name with a real on-disk show
+    /// directory (e.g. after a server restart); anything else — typos,
+    /// probes, a listener guessing at names — gets `None` instead of
+    /// leaking a thread forever. See CLAUDE.md §8 "per-stream resource
+    /// leak".
+    pub async fn stream_if_known(&self, name: &str) -> Option<Arc<StreamHandle>> {
+        let mut streams = self.streams.lock().await;
+        if let Some(handle) = streams.get(name) {
+            return Some(handle.clone());
+        }
+        if !tokio::fs::try_exists(self.data_dir.join(name))
+            .await
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let handle = self.create_stream_handle(name);
+        streams.insert(name.to_string(), handle.clone());
+        Some(handle)
     }
 
     /// A snapshot of currently in-memory streams, without creating any new
@@ -114,6 +147,16 @@ impl AppState {
         &self.data_dir
     }
 
+    /// The control-plane credential, checked *before* any stream lookup —
+    /// see `api.rs::set_playout`. Deliberately not read off a `StreamHandle`
+    /// (unlike `control_token` there, which is just a per-handle cache of
+    /// this same value): checking here means auth can reject a request
+    /// before `stream()` ever runs, so a bad/missing token can't be used to
+    /// spin up a stream's permanent playout thread just to get rejected.
+    pub(crate) fn control_token(&self) -> Option<&str> {
+        self.control_token.as_deref()
+    }
+
     pub(crate) fn segment_ms(&self) -> u32 {
         self.profile.segment_ms
     }
@@ -128,29 +171,6 @@ fn web_remote_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/remote"))
 }
 
-fn default_profile() -> StreamProfile {
-    StreamProfile {
-        segment_ms: 2000,
-        rungs: vec![
-            Rung {
-                id: 0,
-                name: "lo".into(),
-                bitrate_kbps: 32,
-            },
-            Rung {
-                id: 1,
-                name: "mid".into(),
-                bitrate_kbps: 128,
-            },
-            Rung {
-                id: 2,
-                name: "hd".into(),
-                bitrate_kbps: 320,
-            },
-        ],
-    }
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -163,21 +183,27 @@ async fn main() {
         .parse()
         .expect("invalid OBCAST_LISTEN_ADDR");
     let ingest_token = std::env::var("OBCAST_INGEST_TOKEN").ok();
+    // Deliberately a separate credential from `ingest_token`: an OB site's
+    // upload token shouldn't also be able to stop/seek/set-volume the
+    // server's hardware output. See CLAUDE.md §8 "auth split".
+    let control_token = std::env::var("OBCAST_CONTROL_TOKEN").ok();
     let server_cfg = config::ServerConfig::load();
 
     let app_state = Arc::new(AppState {
         streams: Mutex::new(HashMap::new()),
         data_dir,
-        profile: default_profile(),
+        profile: StreamProfile::default_ladder(2000),
         water: WaterLevels::default(),
         dvr_window_ms: 5 * 60 * 1000,
         ingest_token,
+        control_token,
         audio: server_cfg.audio,
     });
 
     let app = Router::new()
         .route("/ingest/:stream/segment", post(ingest::upload_segment))
         .route("/ingest/:stream/abandon", post(ingest::abandon))
+        .route("/ingest/:stream/heartbeat", post(ingest::heartbeat))
         .route("/ingest/:stream/state", get(ingest::state_feed))
         .route("/hls/:stream/master.m3u8", get(origin::master_playlist))
         .route("/hls/:stream/:rendition/:tail", get(origin::rendition_tail))
