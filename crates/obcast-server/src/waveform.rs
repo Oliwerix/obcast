@@ -258,7 +258,7 @@ mod tests {
             60_000,
             PathBuf::from("/tmp/obcast-waveform-test-missing"),
         );
-        store.record(0, 0);
+        store.record(0, 0, None);
         let json = build(&store, &profile(), 0, 0, &LogSink::new());
         assert!(json.rungs.iter().all(|r| *r == Some(0)));
         assert!(
