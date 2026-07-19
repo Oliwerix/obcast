@@ -6,6 +6,7 @@
 mod api;
 mod config;
 mod ingest;
+mod logs;
 mod origin;
 mod playout;
 mod shows;
@@ -20,21 +21,28 @@ use std::time::Instant;
 
 use axum::routing::{delete, get, post};
 use axum::Router;
+use obcast_proto::control::{LogEntry, LogLevel};
 use obcast_proto::state::{PlayoutStatus, ServerState, StreamProfile, WaterLevels};
 use tokio::sync::{broadcast, Mutex};
 use tower_http::services::ServeDir;
 
 use config::AudioConfig;
+use logs::LogSink;
 use playout::PlayoutHandle;
 use store::DvrStore;
 
-/// Per-stream state: the DVR index, the playout engine handle, and the SSE
-/// broadcaster. `store` is behind an `Arc` (not just a `Mutex`) because the
-/// playout engine thread holds its own clone alongside every HTTP handler.
+/// Per-stream state: the DVR index, the playout engine handle, the SSE
+/// broadcaster, and the status/error log sink. `store` is behind an `Arc`
+/// (not just a `Mutex`) because the playout engine thread holds its own
+/// clone alongside every HTTP handler; `log` is the same `Arc<LogSink>` the
+/// playout thread was handed at spawn time (see `AppState::create_stream_handle`),
+/// so both sides append to (and broadcast from) one shared backlog without a
+/// circular `Arc<StreamHandle>` reference into the playout engine.
 pub struct StreamHandle {
     pub store: Arc<Mutex<DvrStore>>,
     pub playout: Arc<PlayoutHandle>,
     pub tx: broadcast::Sender<ServerState>,
+    pub log: Arc<LogSink>,
     pub ingest_token: Option<String>,
     pub last_ingest: Mutex<Option<Instant>>,
 }
@@ -48,6 +56,18 @@ impl StreamHandle {
             volume: self.playout.volume(),
             detail: self.playout.detail(),
         }
+    }
+
+    /// Records a warn/error-level status message to this stream's log
+    /// backlog and pushes it live to any subscribed WS clients. Additive to
+    /// `tracing` — call alongside the existing `tracing::warn!`/`error!` at a
+    /// call site, not instead of it.
+    pub fn push_log(&self, level: LogLevel, message: impl Into<String>) {
+        self.log.push(level, message);
+    }
+
+    pub fn recent_log(&self) -> Vec<LogEntry> {
+        self.log.recent()
     }
 }
 
@@ -71,11 +91,18 @@ impl AppState {
             self.data_dir.join(name),
         )));
         let rungs = self.profile.rungs.iter().map(|r| r.id).collect();
+        // Constructed before both `playout::spawn` and `StreamHandle` below
+        // and cloned into each, so the playout engine's dedicated thread and
+        // every HTTP handler push to (and can subscribe to) the same log
+        // backlog without the playout thread needing a handle back to the
+        // `StreamHandle` that wraps it (which would be a circular `Arc`).
+        let log = Arc::new(LogSink::new());
         let playout = playout::spawn(
             store.clone(),
             rungs,
             self.audio.clone(),
             self.profile.segment_ms,
+            log.clone(),
         );
 
         let (tx, _rx) = broadcast::channel(64);
@@ -83,6 +110,7 @@ impl AppState {
             store,
             playout,
             tx,
+            log,
             ingest_token: self.ingest_token.clone(),
             last_ingest: Mutex::new(None),
         })

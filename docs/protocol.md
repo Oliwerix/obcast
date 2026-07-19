@@ -132,13 +132,21 @@ always uses the host's default audio output; requesting it returns
 
 ### Status snapshot
 ```
-GET /api/{stream}/status  ->  ControlStatus { stream, server, encoder?, link }
+GET /api/{stream}/status  ->  ControlStatus { stream, server, encoder?, link, recent_log }
 ```
 `status`, `waveform`, and `ws` are read-only: unlike ingest (which starts a
 new stream on first upload) they never spin up a stream that's never been
 ingested into. A name with no in-memory handle and no on-disk show directory
 returns `404`, rather than silently creating an empty one — see CLAUDE.md §8
 "per-stream resource leak".
+
+`recent_log` is a capped (200 entries), oldest-first backlog of `LogEntry {
+at_ms, level, message }` — warn/error-level server status messages (segment
+abandons, DVR reap failures, waveform decode failures, playout stalls/device
+errors), persisted per-stream so a freshly-opened web remote sees recent
+history rather than only what happens to arrive after it connects.
+`#[serde(default)]` on the server type, so an older client/server pair
+without this field still interoperates.
 
 ### Playout commands
 ```
@@ -181,11 +189,19 @@ under a `value` key) — e.g. `{"type":"status","stream":"obshow","server":{...}
 
 Sent: a full `status` on connect and on every `ServerState` change (piggybacking
 the same broadcast the SSE link-plane feed uses), `position` when the playout
-head moves, and `meters` (`{vu_db_l, vu_db_r, ppm_db_l, ppm_db_r}`, dBFS, on a
-fixed ~50ms tick). `ack` is defined in the schema for future use but not yet
-sent — commands go through the plain HTTP response of `POST /api/{stream}/playout`
-instead. The socket does not accept inbound commands; it is read-only from the
-client's perspective.
+head moves, `meters` (`{vu_db_l, vu_db_r, ppm_db_l, ppm_db_r}`, dBFS, on a
+fixed ~50ms tick), and `log` (a `LogEntry` — `{type:"log", at_ms, level, message}`,
+tag flattened alongside the fields same as `status`) each time a new
+warn/error status message is recorded, pushed live as it happens rather than
+waiting for the next `status` snapshot. `ack` is defined in the schema for
+future use but not yet sent — commands go through the plain HTTP response of
+`POST /api/{stream}/playout` instead. The socket does not accept inbound
+commands; it is read-only from the client's perspective.
+
+The web remote (`stream.html`) seeds its log panel once from the first
+`status` event's `recent_log`, then appends each subsequent `log` event live,
+capping its own displayed list to the same 200-entry backlog size the server
+retains.
 
 `meters` carries two independently-computed ballistics per channel (L/R), both
 fed from the actual post-gain playout audio callback (`obcast_proto::meter`),

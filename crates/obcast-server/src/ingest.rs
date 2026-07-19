@@ -12,6 +12,7 @@ use axum::Json;
 use futures::Stream;
 use serde::Deserialize;
 
+use obcast_proto::control::LogLevel;
 use obcast_proto::state::{EncoderState, RungId, Seq, ServerState};
 
 use crate::{AppState, StreamHandle};
@@ -101,20 +102,27 @@ pub async fn upload_segment(
     *handle.last_ingest.lock().await = Some(std::time::Instant::now());
     let _ = handle.tx.send(state.clone());
     tracing::info!(stream, rung, seq, bytes = body.len(), "segment ingested");
-    reap(&stream, evicted).await;
+    reap(&stream, &handle, evicted).await;
     Ok(Json(state))
 }
 
 /// Delete segment files evicted from the DVR window index. Best-effort: a
 /// missing file (already gone, or never written because the encoder
 /// abandoned it before uploading) isn't an error, just nothing to reap.
-async fn reap(stream: &str, paths: Vec<std::path::PathBuf>) {
+async fn reap(stream: &str, handle: &StreamHandle, paths: Vec<std::path::PathBuf>) {
     for path in paths {
         match tokio::fs::remove_file(&path).await {
             Ok(()) => tracing::debug!(stream, path = %path.display(), "reaped evicted DVR segment"),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                tracing::warn!(stream, path = %path.display(), error = %err, "failed to reap evicted DVR segment")
+                tracing::warn!(stream, path = %path.display(), error = %err, "failed to reap evicted DVR segment");
+                handle.push_log(
+                    LogLevel::Warn,
+                    format!(
+                        "failed to reap evicted DVR segment {}: {err}",
+                        path.display()
+                    ),
+                );
             }
         }
     }
@@ -161,6 +169,7 @@ pub async fn abandon(
     }
     for seq in &body.seqs {
         tracing::warn!(stream, seq, "segment abandoned");
+        handle.push_log(LogLevel::Warn, format!("segment {seq} abandoned"));
     }
     let state = current_state(&handle).await;
     let _ = handle.tx.send(state);
