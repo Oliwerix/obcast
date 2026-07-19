@@ -59,7 +59,6 @@ fn resolve_output_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> 
 }
 
 const CHANNELS: usize = 2;
-const RING_CAPACITY_FRAMES: usize = 48_000 * CHANNELS; // ~1s at 48kHz stereo
 
 pub enum EngineCommand {
     Start { position: Seq },
@@ -274,7 +273,20 @@ fn run_engine(
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let ring = HeapRb::<f32>::new(RING_CAPACITY_FRAMES);
+    // Sized in segments rather than a fixed duration: decode is one blocking
+    // `ffmpeg` subprocess per segment (see `decode_to_pcm`), and a higher rung
+    // (e.g. the 320kbps "hd" rung vs. 32kbps "lo") has more bytes to read and
+    // demux per segment, so it eats more of a fixed time margin. Previously
+    // this was a flat ~1s capacity with the refill gate leaving only ~0.5s of
+    // slack before the ring ran dry — plenty for spawning ffmpeg to decode a
+    // small `lo` segment, but not always enough for a `hd` one under any load
+    // (competing disk/CPU from the encoder side, a slow spawn, etc.), which
+    // surfaced as spurious "buffer underrun" stalls specifically on the high
+    // rung. Sizing off `segment_ms` instead gives decode a full segment's
+    // wall-clock time of slack (see the refill gate below) regardless of
+    // sample rate or segment length.
+    let segment_samples = (segment_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
+    let ring = HeapRb::<f32>::new(segment_samples * 3);
     let (mut producer, mut consumer) = ring.split();
 
     let volume_handle = handle.clone();
@@ -420,9 +432,12 @@ fn run_engine(
         if should_feed {
             if let Some(seq) = current {
                 // Only decode the next segment once the ring has room for a
-                // full second, so decode paces itself to playback instead of
-                // racing ahead of it unbounded.
-                if producer.vacant_len() > sample_rate as usize {
+                // full segment, so decode paces itself to playback instead of
+                // racing ahead of it unbounded — while still giving the
+                // blocking `ffmpeg` decode (see comment at the ring's
+                // creation) a full segment_ms of real-time slack rather than
+                // starting only once the ring is nearly drained.
+                if producer.vacant_len() >= segment_samples {
                     let (path, abandoned) = rt.block_on(async {
                         let store = store.lock().await;
                         (
