@@ -62,6 +62,20 @@ pub fn spawn(source: &Source, profile: &StreamProfile, out_dir: &Path) -> std::i
 
     for rung in &profile.rungs {
         let dir = out_dir.join(rung.id.to_string());
+        // ffmpeg's segment muxer always numbers a fresh process's output
+        // from 0 (`%d.ts`), overwriting only as far as it has re-encoded so
+        // far this session. If `out_dir` is reused across runs, leftover
+        // higher-numbered files from a *previous* session survive and
+        // `inventory::scan` can't tell them apart from this session's own
+        // output — it reports them as available and as the newest encoded
+        // seq, which sends stale audio, inflates `encoded_seq` far past what
+        // this session has actually produced, and ultimately makes the
+        // scheduler abandon real (not-yet-encoded) segments as permanent
+        // gaps. Clearing each rung dir before spawning keeps a reused
+        // `out_dir` in sync with this session's own numbering.
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
         std::fs::create_dir_all(&dir)?;
         cmd.arg("-map")
             .arg("0:a")
