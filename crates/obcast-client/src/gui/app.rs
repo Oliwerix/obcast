@@ -1,6 +1,6 @@
 //! The encoder GUI. Two halves:
 //!  - `ObcastApp` (this file, `egui`/`eframe`, runs on the OS main thread):
-//!    device/channel/gain controls, K-14 metering, Go Live control.
+//!    device/channel/gain controls, VU/PPM metering, Go Live control.
 //!  - `controller` (a tokio task): owns the ffmpeg child process and the
 //!    sse/uploader tasks, and forwards PCM from the audio engine into
 //!    ffmpeg's stdin. The GUI only ever talks to it over an unbounded
@@ -19,8 +19,8 @@ use obcast_proto::control::{LogEntry, LogLevel};
 use obcast_proto::state::{PlayoutState, StreamProfile};
 
 use crate::audio::{self, AudioHandle};
-use crate::config::AppConfig;
-use crate::gui::meter::{self, k14_meter, mini_meter, MeterReading};
+use crate::config::{AppConfig, PeakMode};
+use crate::gui::meter::{self, level_meter, mini_meter, MeterReading};
 use crate::shared::SharedState;
 use crate::{encode, sse, uploader};
 use std::sync::Arc;
@@ -444,20 +444,41 @@ impl ObcastApp {
     }
 
     fn meter_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Levels — K-14");
+        ui.heading("Levels");
         let ((vu_l, ppm_l), (vu_r, ppm_r)) = self.audio.meters();
+        let (peak_l, peak_r) = self.audio.peaks_db();
         let clipped_l = self.audio.take_clip_l();
         let clipped_r = self.audio.take_clip_r();
         let mono = self.audio.mono();
 
         ui.horizontal(|ui| {
+            ui.label("Flying peak marker:");
+            let mut mode = self.cfg.peak_mode;
+            if ui
+                .selectable_value(&mut mode, PeakMode::Ppm, "PPM")
+                .clicked()
+                || ui
+                    .selectable_value(&mut mode, PeakMode::DigitalPeak, "dBFS peak")
+                    .clicked()
+            {
+                self.cfg.peak_mode = mode;
+                self.persist_config();
+            }
+        });
+
+        let (peak_display_l, peak_display_r) = match self.cfg.peak_mode {
+            PeakMode::Ppm => (ppm_l, ppm_r),
+            PeakMode::DigitalPeak => (peak_l, peak_r),
+        };
+
+        ui.horizontal(|ui| {
             let reading_l = MeterReading {
                 vu_db: vu_l,
-                ppm_db: ppm_l,
+                peak_db: peak_display_l,
                 clipped: clipped_l,
             };
             let label_l = if mono { "MONO" } else { "L" };
-            let resp_l = k14_meter(ui, label_l, &reading_l, egui::vec2(90.0, 280.0));
+            let resp_l = level_meter(ui, label_l, &reading_l, egui::vec2(130.0, 280.0));
             if resp_l.clicked() {
                 self.audio.reset_clips();
             }
@@ -465,10 +486,10 @@ impl ObcastApp {
             if !mono {
                 let reading_r = MeterReading {
                     vu_db: vu_r,
-                    ppm_db: ppm_r,
+                    peak_db: peak_display_r,
                     clipped: clipped_r,
                 };
-                let resp_r = k14_meter(ui, "R", &reading_r, egui::vec2(90.0, 280.0));
+                let resp_r = level_meter(ui, "R", &reading_r, egui::vec2(130.0, 280.0));
                 if resp_r.clicked() {
                     self.audio.reset_clips();
                 }
@@ -477,11 +498,18 @@ impl ObcastApp {
             ui.add_space(16.0);
             ui.vertical(|ui| {
                 ui.label(
-                    egui::RichText::new("K-14: 0 = -14 dBFS, 14 dB headroom to clip.").small(),
+                    egui::RichText::new(
+                        "0 VU = -18 dBFS. Left scale: VU-relative. Right scale: dBFS.",
+                    )
+                    .small(),
                 );
-                ui.label(format!("L  vu {vu_l:>5.1} dB   ppm {ppm_l:>5.1} dB"));
+                ui.label(format!(
+                    "L  vu {vu_l:>5.1} dB   pk {peak_display_l:>5.1} dB"
+                ));
                 if !mono {
-                    ui.label(format!("R  vu {vu_r:>5.1} dB   ppm {ppm_r:>5.1} dB"));
+                    ui.label(format!(
+                        "R  vu {vu_r:>5.1} dB   pk {peak_display_r:>5.1} dB"
+                    ));
                 }
                 if clipped_l || clipped_r {
                     ui.colored_label(

@@ -189,8 +189,8 @@ under a `value` key) — e.g. `{"type":"status","stream":"obshow","server":{...}
 
 Sent: a full `status` on connect and on every `ServerState` change (piggybacking
 the same broadcast the SSE link-plane feed uses), `position` when the playout
-head moves, `meters` (`{vu_db_l, vu_db_r, ppm_db_l, ppm_db_r}`, dBFS, on a
-fixed ~50ms tick), and `log` (a `LogEntry` — `{type:"log", at_ms, level, message}`,
+head moves, `meters` (`{vu_db_l, vu_db_r, ppm_db_l, ppm_db_r, peak_db_l, peak_db_r}`,
+dBFS, on a fixed ~50ms tick), and `log` (a `LogEntry` — `{type:"log", at_ms, level, message}`,
 tag flattened alongside the fields same as `status`) each time a new
 warn/error status message is recorded, pushed live as it happens rather than
 waiting for the next `status` snapshot. `ack` is defined in the schema for
@@ -203,17 +203,21 @@ The web remote (`stream.html`) seeds its log panel once from the first
 capping its own displayed list to the same 200-entry backlog size the server
 retains.
 
-`meters` carries two independently-computed ballistics per channel (L/R), both
-fed from the actual post-gain playout audio callback (`obcast_proto::meter`),
-meant to be superimposed on one meter widget per channel: `vu_db_{l,r}` is IEC
-60268-17 "standard volume indicator" (VU) — symmetric attack/release, 300 ms
-integration time, the slow "loudness" bar — and `ppm_db_{l,r}` is IEC 60268-10
+`meters` carries three independently-computed ballistics per channel (L/R),
+all fed from the actual post-gain playout audio callback
+(`obcast_proto::meter`), meant to be superimposed on one meter widget per
+channel: `vu_db_{l,r}` is IEC 60268-17 "standard volume indicator" (VU) —
+symmetric attack/release, 300 ms integration time, the slow "loudness" bar,
+displayed with its 0 reference at -18 dBFS; `ppm_db_{l,r}` is IEC 60268-10
 Type I (DIN) peak programme meter — fast attack (5 ms burst reads 2 dB down,
 per the standard's integration-time definition), slow decay (-20 dB in 1.5 s)
 — a "flying PPM" peak needle that stays visible well after a transient has
-passed. This reflects what the server is *actually playing out* right now;
-the encoder client computes its own independent per-channel VU/PPM pairs from
-the captured soundcard input for its own meters.
+passed; and `peak_db_{l,r}` is the true digital sample peak (zero attack,
+same -20 dB/1.5 s decay as PPM) — an alternate flying-peak reading a client
+can switch its meter to show instead of `ppm_db_{l,r}`. This reflects what
+the server is *actually playing out* right now; the encoder client computes
+its own independent per-channel VU/PPM/Peak triples from the captured
+soundcard input for its own meters.
 
 ### Waveform
 ```

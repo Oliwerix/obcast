@@ -44,12 +44,18 @@
   .pill.down { background: #3a1e1e; color: #f87171; }
   table.status td { padding: 3px 10px 3px 0; font-size: 13px; color: #b8bcc4; }
   table.status td.v { color: #e6e6e6; font-variant-numeric: tabular-nums; }
-  .meter-ch { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
-  .meter-ch:first-child { margin-top: 0; }
-  .meter-ch-label { width: 12px; font-size: 10px; color: #8a8f98; font-weight: 600; }
-  .meter-wrap { position: relative; background: #14161a; border-radius: 4px; height: 10px; width: 220px; overflow: hidden; }
-  .meter-bar { height: 100%; background: linear-gradient(90deg, #4ade80, #facc15 80%, #f87171 95%); width: 0%; }
-  .meter-ppm { position: absolute; top: 0; height: 100%; width: 2px; left: 0%; background: #ffffff; }
+  .meter-row { display: flex; align-items: flex-start; gap: 16px; }
+  .meter-ch { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .meter-ch-label { font-size: 10px; color: #8a8f98; font-weight: 600; }
+  .meter-canvas { border-radius: 4px; display: block; }
+  .meter-toggle { display: inline-flex; border: 1px solid #383d46; border-radius: 6px; overflow: hidden; }
+  .meter-toggle button {
+    border: none; border-radius: 0; background: #1c1f24; color: #b8bcc4;
+    padding: 4px 10px; font-size: 11px; cursor: pointer;
+  }
+  .meter-toggle button + button { border-left: 1px solid #383d46; }
+  .meter-toggle button.active { background: #3b6fd4; color: #fff; }
+  .meter-toggle button:hover:not(.active) { background: #2a2e35; }
   .note { font-size: 12px; color: #8a8f98; margin-top: 6px; }
   audio, video { width: 100%; border-radius: 6px; margin-top: 8px; background: #000; }
   #zoomview-container { width: 100%; height: 100px; background: #0e0f12; border-radius: 6px; margin-top: 4px; cursor: pointer; overflow: hidden; }
@@ -121,21 +127,24 @@
   </div>
   <div class="row" style="margin-top:14px;">
     <div>
-      <div style="font-size:11px; color:#8a8f98; margin-bottom:3px;">LEVEL (VU / PPM)</div>
-      <div class="meter-ch">
-        <span class="meter-ch-label">L</span>
-        <div class="meter-wrap">
-          <div id="meter-vu-l" class="meter-bar"></div>
-          <div id="meter-ppm-l" class="meter-ppm"></div>
+      <div class="row" style="margin-bottom:8px;">
+        <span style="font-size:11px; color:#8a8f98;">LEVELS</span>
+        <span class="meter-toggle">
+          <button id="peak-mode-ppm">PPM</button>
+          <button id="peak-mode-peak">dBFS peak</button>
+        </span>
+      </div>
+      <div class="meter-row">
+        <div class="meter-ch">
+          <span class="meter-ch-label">L</span>
+          <canvas id="meter-canvas-l" class="meter-canvas" width="130" height="220"></canvas>
+        </div>
+        <div class="meter-ch">
+          <span class="meter-ch-label">R</span>
+          <canvas id="meter-canvas-r" class="meter-canvas" width="130" height="220"></canvas>
         </div>
       </div>
-      <div class="meter-ch">
-        <span class="meter-ch-label">R</span>
-        <div class="meter-wrap">
-          <div id="meter-vu-r" class="meter-bar"></div>
-          <div id="meter-ppm-r" class="meter-ppm"></div>
-        </div>
-      </div>
+      <div class="note">0 VU = -18 dBFS. Left scale: VU-relative. Right scale: dBFS.</div>
     </div>
   </div>
 
@@ -438,12 +447,169 @@ function populateInitialLog(entries) {
   entries.forEach(appendLogEntry);
 }
 
-function applyMeters(vuDbL, vuDbR, ppmDbL, ppmDbR) {
-  const toPct = db => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
-  document.getElementById('meter-vu-l').style.width = toPct(vuDbL) + '%';
-  document.getElementById('meter-ppm-l').style.left = toPct(ppmDbL) + '%';
-  document.getElementById('meter-vu-r').style.width = toPct(vuDbR) + '%';
-  document.getElementById('meter-ppm-r').style.left = toPct(ppmDbR) + '%';
+// Dual-scale vertical VU/PPM meter, drawn to match the encoder client's
+// egui widget (crates/obcast-client/src/gui/meter.rs) pixel-for-pixel in
+// spirit: 0 VU at -18 dBFS, a left ruler read VU-relative and a right ruler
+// read as plain dBFS off the same tick grid, and a fill that only recolors
+// the in-zone portion for yellow but flips solid red for the whole bar once
+// the level crosses into red.
+const METER_VU_REF_DBFS = -18;
+const METER_YELLOW_SPAN_DB = 4;
+const METER_RED_THRESHOLD_DBFS = METER_VU_REF_DBFS + METER_YELLOW_SPAN_DB;
+const METER_MIN_DBFS = -50;
+const METER_MAX_DBFS = 0;
+const METER_GREEN = '#35c75f';
+const METER_YELLOW = '#e8c52a';
+const METER_RED = '#e23d3d';
+const METER_TRACK = '#202226';
+const METER_PEAK_COLOR = '#f5f5f5';
+
+function meterFrac(dbfs) {
+  const clamped = Math.min(METER_MAX_DBFS, Math.max(METER_MIN_DBFS, dbfs));
+  return (clamped - METER_MIN_DBFS) / (METER_MAX_DBFS - METER_MIN_DBFS);
+}
+function meterZones() {
+  return [
+    [METER_MIN_DBFS, METER_VU_REF_DBFS, METER_GREEN],
+    [METER_VU_REF_DBFS, METER_RED_THRESHOLD_DBFS, METER_YELLOW],
+    [METER_RED_THRESHOLD_DBFS, METER_MAX_DBFS, METER_RED],
+  ];
+}
+function hexWithAlpha(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function drawLevelMeter(canvas, vuDb, peakDb) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = METER_TRACK;
+  ctx.fillRect(0, 0, w, h);
+
+  const leftRulerW = 30, rightRulerW = 28;
+  const barLeft = leftRulerW, barRight = Math.max(barLeft + 10, w - rightRulerW);
+  const barTop = 10, barBottom = h;
+  const barHeight = barBottom - barTop;
+  const barW = barRight - barLeft;
+  const yFor = dbfs => barBottom - meterFrac(dbfs) * barHeight;
+
+  // Faint always-visible zone guide so the scale reads at any level.
+  meterZones().forEach(([lo, hi, color]) => {
+    const y0 = yFor(hi), y1 = yFor(lo);
+    ctx.fillStyle = hexWithAlpha(color, 0.12);
+    ctx.fillRect(barLeft, y0, barW, y1 - y0);
+  });
+
+  // VU fill: segmented by zone, except a full solid-red override once the
+  // level crosses into red.
+  const fillTop = yFor(vuDb);
+  if (vuDb >= METER_RED_THRESHOLD_DBFS) {
+    ctx.fillStyle = METER_RED;
+    ctx.fillRect(barLeft, fillTop, barW, barBottom - fillTop);
+  } else {
+    meterZones().forEach(([lo, hi, color]) => {
+      const segHi = Math.min(hi, vuDb);
+      if (segHi <= lo) return;
+      const y0 = yFor(segHi), y1 = yFor(lo);
+      ctx.fillStyle = color;
+      ctx.fillRect(barLeft, y0, barW, y1 - y0);
+    });
+  }
+
+  // Flying peak marker — PPM or true digital peak, per the toggle.
+  const peakY = yFor(peakDb);
+  ctx.strokeStyle = METER_PEAK_COLOR;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(barLeft, peakY);
+  ctx.lineTo(barRight, peakY);
+  ctx.stroke();
+
+  // Shared tick grid, read two ways: left edge VU-relative (0 = -18 dBFS),
+  // right edge plain dBFS (0 at the top).
+  ctx.font = '8px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  ctx.strokeStyle = '#6b7078';
+  ctx.fillStyle = '#8a8f98';
+  ctx.lineWidth = 1;
+  for (let tick = METER_MAX_DBFS; tick >= METER_MIN_DBFS; tick -= 6) {
+    const y = yFor(tick);
+
+    ctx.beginPath();
+    ctx.moveTo(barLeft - 5, y);
+    ctx.lineTo(barLeft - 2, y);
+    ctx.stroke();
+    const vuRelative = tick - METER_VU_REF_DBFS;
+    const vuLabel = vuRelative === 0 ? '0' : (vuRelative > 0 ? `+${vuRelative}` : `${vuRelative}`);
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(vuLabel, barLeft - 7, y);
+
+    ctx.beginPath();
+    ctx.moveTo(barRight + 2, y);
+    ctx.lineTo(barRight + 5, y);
+    ctx.stroke();
+    ctx.textAlign = 'left';
+    ctx.fillText(String(tick), barRight + 7, y);
+  }
+
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#5a5f66';
+  ctx.fillText('VU', barLeft - 2, 0);
+  ctx.textAlign = 'left';
+  ctx.fillText('dBFS', barRight + 2, 0);
+}
+
+// Backs the canvas with real device pixels so the ruler text stays crisp on
+// hi-DPI displays, while all drawing above still happens in logical (CSS)
+// pixel coordinates.
+function setupMeterCanvas(canvas) {
+  const ratio = window.devicePixelRatio || 1;
+  const cssW = canvas.width, cssH = canvas.height;
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  canvas.width = cssW * ratio;
+  canvas.height = cssH * ratio;
+  canvas.getContext('2d').setTransform(ratio, 0, 0, ratio, 0, 0);
+}
+
+const meterCanvasL = document.getElementById('meter-canvas-l');
+const meterCanvasR = document.getElementById('meter-canvas-r');
+setupMeterCanvas(meterCanvasL);
+setupMeterCanvas(meterCanvasR);
+
+// Which flying-peak reading to show — persisted per-browser, same idea as
+// the encoder client's persisted `peak_mode` config field.
+let peakMode = localStorage.getItem('obcast-peak-mode') === 'peak' ? 'peak' : 'ppm';
+let lastMeters = { vuL: -100, vuR: -100, ppmL: -100, ppmR: -100, peakL: -100, peakR: -100 };
+
+function redrawMeters() {
+  const peakL = peakMode === 'peak' ? lastMeters.peakL : lastMeters.ppmL;
+  const peakR = peakMode === 'peak' ? lastMeters.peakR : lastMeters.ppmR;
+  drawLevelMeter(meterCanvasL, lastMeters.vuL, peakL);
+  drawLevelMeter(meterCanvasR, lastMeters.vuR, peakR);
+}
+
+function setPeakMode(mode) {
+  peakMode = mode;
+  localStorage.setItem('obcast-peak-mode', mode);
+  document.getElementById('peak-mode-ppm').classList.toggle('active', mode === 'ppm');
+  document.getElementById('peak-mode-peak').classList.toggle('active', mode === 'peak');
+  redrawMeters();
+}
+document.getElementById('peak-mode-ppm').onclick = () => setPeakMode('ppm');
+document.getElementById('peak-mode-peak').onclick = () => setPeakMode('peak');
+setPeakMode(peakMode);
+
+function applyMeters(vuDbL, vuDbR, ppmDbL, ppmDbR, peakDbL, peakDbR) {
+  // Older servers without the peak_db_{l,r} fields: fall back to PPM so the
+  // toggle degrades to "always PPM" instead of drawing at -100 dBFS.
+  lastMeters = {
+    vuL: vuDbL, vuR: vuDbR, ppmL: ppmDbL, ppmR: ppmDbR,
+    peakL: peakDbL ?? ppmDbL, peakR: peakDbR ?? ppmDbR,
+  };
+  redrawMeters();
 }
 
 // --- Waveform: BBC peaks.js, driven by the server's real playhead ---
@@ -608,7 +774,7 @@ function connectWs() {
         logInitialized = true;
       }
     } else if (msg.type === 'meters') {
-      applyMeters(msg.vu_db_l, msg.vu_db_r, msg.ppm_db_l, msg.ppm_db_r);
+      applyMeters(msg.vu_db_l, msg.vu_db_r, msg.ppm_db_l, msg.ppm_db_r, msg.peak_db_l, msg.peak_db_r);
     } else if (msg.type === 'log') {
       appendLogEntry(msg);
     }

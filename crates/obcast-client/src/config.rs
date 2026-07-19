@@ -9,6 +9,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Which reading the meter's flying peak marker shows: the broadcast-standard
+/// IEC 60268-10 PPM ballistic, or the raw true digital sample peak
+/// (`obcast_proto::meter::Peak`). See `gui::meter`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeakMode {
+    #[default]
+    Ppm,
+    DigitalPeak,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -27,6 +38,7 @@ pub struct AppConfig {
     pub left_channel: u16,
     pub right_channel: u16,
     pub gain_db: f32,
+    pub peak_mode: PeakMode,
 }
 
 impl Default for AppConfig {
@@ -43,6 +55,7 @@ impl Default for AppConfig {
             left_channel: 0,
             right_channel: 1,
             gain_db: 0.0,
+            peak_mode: PeakMode::Ppm,
         }
     }
 }

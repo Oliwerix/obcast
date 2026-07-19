@@ -246,8 +246,16 @@ async fn ws_session(stream: String, handle: Arc<StreamHandle>, mut socket: WebSo
                         }
                     }
                 }
-                let (vu_db_l, vu_db_r, ppm_db_l, ppm_db_r) = handle.playout.meters();
-                let event = ControlEvent::Meters { vu_db_l, vu_db_r, ppm_db_l, ppm_db_r };
+                let (vu_db_l, vu_db_r, ppm_db_l, ppm_db_r, peak_db_l, peak_db_r) =
+                    handle.playout.meters();
+                let event = ControlEvent::Meters {
+                    vu_db_l,
+                    vu_db_r,
+                    ppm_db_l,
+                    ppm_db_r,
+                    peak_db_l,
+                    peak_db_r,
+                };
                 if send_event(&mut socket, &event).await.is_err() {
                     return;
                 }

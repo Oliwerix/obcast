@@ -76,12 +76,16 @@ pub struct PlayoutHandle {
     paused: AtomicBool,
     position_seq: AtomicI64,  // -1 = none
     volume_millis: AtomicU32, // gain * 1000, fixed-point for atomic access
-    // Per-channel dBFS VU/PPM ballistics of the playout output (post-gain),
-    // stored as raw f32 bits since there's no stable AtomicF32.
+    // Per-channel dBFS VU/PPM/Peak ballistics of the playout output
+    // (post-gain), stored as raw f32 bits since there's no stable AtomicF32.
     vu_l_bits: AtomicU32,
     vu_r_bits: AtomicU32,
     ppm_l_bits: AtomicU32,
     ppm_r_bits: AtomicU32,
+    /// True digital sample peak (`obcast_proto::meter::Peak`) — the
+    /// alternate flying-peak reading alongside PPM above.
+    peak_l_bits: AtomicU32,
+    peak_r_bits: AtomicU32,
     /// Set by the output audio callback whenever it has to zero-pad because
     /// the ring buffer ran dry (decode/segment availability can't keep pace,
     /// or the stall-skip backstop is bridging a missing segment) — the
@@ -153,14 +157,19 @@ impl PlayoutHandle {
         self.volume_millis.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
-    /// `(vu_db_l, vu_db_r, ppm_db_l, ppm_db_r)` of the playout output — IEC
-    /// ballistics in dBFS, ready to display without further conversion.
-    pub fn meters(&self) -> (f32, f32, f32, f32) {
+    /// `(vu_db_l, vu_db_r, ppm_db_l, ppm_db_r, peak_db_l, peak_db_r)` of the
+    /// playout output — IEC ballistics in dBFS, ready to display without
+    /// further conversion. `peak_db_{l,r}` is the true digital sample peak
+    /// (`obcast_proto::meter::Peak`), the alternate flying-peak reading
+    /// alongside PPM.
+    pub fn meters(&self) -> (f32, f32, f32, f32, f32, f32) {
         (
             f32::from_bits(self.vu_l_bits.load(Ordering::Relaxed)),
             f32::from_bits(self.vu_r_bits.load(Ordering::Relaxed)),
             f32::from_bits(self.ppm_l_bits.load(Ordering::Relaxed)),
             f32::from_bits(self.ppm_r_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.peak_l_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.peak_r_bits.load(Ordering::Relaxed)),
         )
     }
 
@@ -208,6 +217,8 @@ pub fn spawn(
         vu_r_bits: AtomicU32::new(0),
         ppm_l_bits: AtomicU32::new(0),
         ppm_r_bits: AtomicU32::new(0),
+        peak_l_bits: AtomicU32::new(0),
+        peak_r_bits: AtomicU32::new(0),
         underrun: AtomicBool::new(false),
         device_name: RwLock::new(String::new()),
         device_error: RwLock::new(None),
@@ -296,6 +307,8 @@ fn run_engine(
     let mut vu_r = obcast_proto::meter::Vu::new();
     let mut ppm_l = obcast_proto::meter::Ppm::new();
     let mut ppm_r = obcast_proto::meter::Ppm::new();
+    let mut peak_l = obcast_proto::meter::Peak::new();
+    let mut peak_r = obcast_proto::meter::Peak::new();
     // Reused each callback to hand the ballistics a contiguous per-channel
     // slice without allocating on the real-time audio thread.
     let mut scratch_l: Vec<f32> = Vec::new();
@@ -330,8 +343,10 @@ fn run_engine(
             }
             vu_l.process(&scratch_l, sample_rate);
             ppm_l.process(&scratch_l, sample_rate);
+            peak_l.process(&scratch_l, sample_rate);
             vu_r.process(&scratch_r, sample_rate);
             ppm_r.process(&scratch_r, sample_rate);
+            peak_r.process(&scratch_r, sample_rate);
             volume_handle
                 .vu_l_bits
                 .store(vu_l.value_db().to_bits(), Ordering::Relaxed);
@@ -344,6 +359,12 @@ fn run_engine(
             volume_handle
                 .ppm_r_bits
                 .store(ppm_r.value_db().to_bits(), Ordering::Relaxed);
+            volume_handle
+                .peak_l_bits
+                .store(peak_l.value_db().to_bits(), Ordering::Relaxed);
+            volume_handle
+                .peak_r_bits
+                .store(peak_r.value_db().to_bits(), Ordering::Relaxed);
         },
         {
             let err_handle = handle.clone();
