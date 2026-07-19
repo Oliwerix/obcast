@@ -192,9 +192,11 @@ impl DvrStore {
         let anchor = match playout.state {
             // Stalled is still nominally "playing" position-wise — the head
             // just isn't producing audible audio right now — so it anchors
-            // the same as Playing/Paused.
+            // the same as Playing/Paused. Error means the engine can't
+            // produce audio at all (e.g. no output device) — no head to
+            // defend, same as Stopped.
             Playing | Paused | Stalled => playout.position_seq,
-            Stopped => None,
+            Stopped | Error => None,
         }
         .or(playout.position_seq)
         .or(live_seq);
@@ -274,6 +276,17 @@ mod tests {
             position_seq: None,
             device: None,
             volume: 1.0,
+            detail: None,
+        }
+    }
+
+    fn errored(detail: &str) -> PlayoutStatus {
+        PlayoutStatus {
+            state: PlayoutState::Error,
+            position_seq: None,
+            device: None,
+            volume: 1.0,
+            detail: Some(detail.into()),
         }
     }
 
@@ -320,10 +333,22 @@ mod tests {
             position_seq: Some(3),
             device: None,
             volume: 1.0,
+            detail: None,
         };
         let state = s.build_server_state(playing);
         assert_eq!(state.frontier_seq, Some(10));
         assert_eq!(state.lead_ms, 8 * 2000); // seqs 3..=10 inclusive
+    }
+
+    #[test]
+    fn errored_anchors_on_live_edge_like_stopped() {
+        let mut s = store(60_000);
+        for seq in 0..=5 {
+            s.record(0, seq);
+        }
+        let state = s.build_server_state(errored("no matching audio output device"));
+        assert_eq!(state.frontier_seq, Some(5));
+        assert_eq!(state.lead_ms, 2000);
     }
 
     #[test]
@@ -337,6 +362,7 @@ mod tests {
             position_seq: Some(0),
             device: None,
             volume: 1.0,
+            detail: None,
         };
         let state = s.build_server_state(playing.clone());
         assert_eq!(state.frontier_seq, Some(1)); // stops at the gap (seq 2)

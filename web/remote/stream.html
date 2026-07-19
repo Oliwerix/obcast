@@ -39,7 +39,7 @@
   }
   .pill.playing { background: #1e4530; color: #4ade80; }
   .pill.paused  { background: #4a3a12; color: #facc15; }
-  .pill.stopped { background: #3a1e1e; color: #f87171; }
+  .pill.stopped { background: #2a2e35; color: #8a8f98; }
   .pill.up   { background: #1e4530; color: #4ade80; }
   .pill.down { background: #3a1e1e; color: #f87171; }
   table.status td { padding: 3px 10px 3px 0; font-size: 13px; color: #b8bcc4; }
@@ -57,7 +57,7 @@
   .la-quality i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; background: #3a3f47; }
   .la-spacer { flex: 1 1 auto; }
   .pill.buffering { background: #4a3a12; color: #facc15; }
-  .pill.stalled   { background: #3a1e1e; color: #f87171; }
+  .pill.stalled   { background: #4a3a12; color: #facc15; }
   .pill.error     { background: #3a1e1e; color: #f87171; }
   .pill.live      { background: #1e4530; color: #4ade80; }
 </style>
@@ -75,14 +75,21 @@
   </div>
   <div class="row">
     <span id="playout-pill" class="pill stopped">stopped</span>
-    <button id="btn-start" class="primary">Start live</button>
-    <button id="btn-stop">Stop</button>
-    <button id="btn-pause">Pause</button>
-    <button id="btn-resume">Resume</button>
-    <button id="btn-golive">Go live</button>
+    <span id="playout-reason" class="note" style="margin:0;"></span>
+  </div>
+  <div class="row" style="margin-top:10px;">
+    <span id="playout-time" style="font-variant-numeric: tabular-nums; font-size:22px; font-weight:600;">--:--</span>
+    <span id="playout-behind" class="note" style="margin:0;">&mdash;</span>
+  </div>
+  <div class="row" style="margin-top:14px;">
+    <button id="btn-seek-back" title="Seek back 10s">&laquo; 10s</button>
+    <button id="btn-playpause" class="primary">&#9654; Play</button>
+    <button id="btn-stop">&#9632; Stop</button>
+    <button id="btn-seek-fwd" title="Seek forward 10s">10s &raquo;</button>
+    <button id="btn-golive" title="Snap to the live edge">Live</button>
   </div>
   <div class="row" style="margin-top:12px;">
-    <label for="seek-secs" style="font-size:13px; color:#b8bcc4;">Seek to seconds behind live:</label>
+    <label for="seek-secs" style="font-size:13px; color:#b8bcc4;">Seek to specific offset (seconds behind live):</label>
     <input id="seek-secs" type="number" min="0" value="30" style="width:70px;" />
     <button id="btn-seek">Seek</button>
   </div>
@@ -188,11 +195,43 @@ const post = async (path, body) => {
   }
 };
 
-document.getElementById('btn-start').onclick = () => post(`/api/${stream}/playout`, { cmd: 'start', position: { kind: 'live' } });
+// Transport: a single Play/Pause toggle (its action depends on the current
+// playout state) plus Stop, relative seek back/forward, and Go live. The
+// separate Start/Pause/Resume/Go-live button row this replaced required the
+// operator to already know which of four buttons was valid right now;
+// collapsing to one toggle removes that guesswork.
+const SEEK_STEP_SECS = 10;
+let lastStatus = null;
+let segmentMs = 2000; // CLAUDE.md default; refined once the waveform loads
+
+document.getElementById('btn-playpause').onclick = () => {
+  const state = lastStatus?.server?.playout?.state ?? 'stopped';
+  if (state === 'playing' || state === 'stalled') {
+    post(`/api/${stream}/playout`, { cmd: 'pause' });
+  } else if (state === 'paused') {
+    post(`/api/${stream}/playout`, { cmd: 'resume' });
+  } else {
+    post(`/api/${stream}/playout`, { cmd: 'start', position: { kind: 'live' } });
+  }
+};
 document.getElementById('btn-stop').onclick = () => post(`/api/${stream}/playout`, { cmd: 'stop' });
-document.getElementById('btn-pause').onclick = () => post(`/api/${stream}/playout`, { cmd: 'pause' });
-document.getElementById('btn-resume').onclick = () => post(`/api/${stream}/playout`, { cmd: 'resume' });
 document.getElementById('btn-golive').onclick = () => post(`/api/${stream}/playout`, { cmd: 'go_live' });
+
+function currentSecsBehindLive() {
+  const s = lastStatus?.server;
+  if (!s || s.live_seq == null || s.playout.position_seq == null) return null;
+  return Math.max(0, (s.live_seq - s.playout.position_seq) * segmentMs / 1000);
+}
+function seekRelative(deltaSecs) {
+  const cur = currentSecsBehindLive() ?? 0;
+  const target = Math.max(0, Math.round(cur + deltaSecs));
+  post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: target } });
+}
+// "Back" moves further behind live (bigger seconds-behind-live); "forward"
+// moves toward live (smaller), matching a normal DVR scrub direction.
+document.getElementById('btn-seek-back').onclick = () => seekRelative(SEEK_STEP_SECS);
+document.getElementById('btn-seek-fwd').onclick = () => seekRelative(-SEEK_STEP_SECS);
+
 document.getElementById('btn-seek').onclick = () => {
   const secs = parseInt(document.getElementById('seek-secs').value, 10) || 0;
   post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: secs } });
@@ -209,11 +248,71 @@ volumeInput.oninput = () => {
   }, 150);
 };
 
+// Human explanation for the pill. The server's `playout.detail` (added
+// alongside `PlayoutState::Error`) is authoritative when present — it names
+// the exact device failure or the segment a stall is waiting on. Older
+// servers (or a `detail`-less moment) fall back to a heuristic built from
+// the link/lead data already in `status`, so the reason line is never just
+// blank for a stalled/errored pill.
+function computeReason(status) {
+  const s = status.server, l = status.link;
+  if (s.playout.detail) return s.playout.detail;
+  if (s.playout.state === 'error') return 'playout engine error (no further detail from server)';
+  if (s.playout.state === 'stalled') {
+    if (!l.connected) return `encoder link is down (last segment ${Math.round(l.last_segment_age_ms / 1000)}s ago)`;
+    if (l.gaps > 0) return `${l.gaps} gap${l.gaps === 1 ? '' : 's'} in the DVR window near playout`;
+    if (s.lead_ms < s.water.low_ms) return `buffer nearly empty (${s.lead_ms}ms lead, below the ${s.water.low_ms}ms floor)`;
+    return 'audio buffer underrun — waiting on the encoder to catch up';
+  }
+  return '';
+}
+
+function fmtTime(totalSecs) {
+  const t = Math.max(0, Math.round(totalSecs));
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const sec = t % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(sec).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}
+
+function updateTransportButtons(status) {
+  const state = status?.server?.playout?.state ?? 'stopped';
+  const btn = document.getElementById('btn-playpause');
+  if (state === 'playing' || state === 'stalled') {
+    btn.innerHTML = '&#9616;&#9616; Pause';
+  } else if (state === 'paused') {
+    btn.innerHTML = '&#9654; Resume';
+  } else {
+    btn.innerHTML = '&#9654; Play';
+  }
+}
+
+function updatePlayoutTime(status) {
+  const s = status.server;
+  const posEl = document.getElementById('playout-time');
+  const behindEl = document.getElementById('playout-behind');
+  if (s.dvr_start_seq == null || s.playout.position_seq == null) {
+    posEl.textContent = '--:--';
+    behindEl.textContent = '—';
+    return;
+  }
+  const elapsedSecs = Math.max(0, (s.playout.position_seq - s.dvr_start_seq) * segmentMs / 1000);
+  posEl.textContent = fmtTime(elapsedSecs);
+  const behind = currentSecsBehindLive();
+  behindEl.textContent = behind == null ? '—' : (behind < 1 ? 'at live edge' : `${Math.round(behind)}s behind live`);
+}
+
 function applyStatus(status) {
+  lastStatus = status;
   const s = status.server;
   const playoutPill = document.getElementById('playout-pill');
   playoutPill.textContent = s.playout.state;
   playoutPill.className = 'pill ' + s.playout.state;
+  document.getElementById('playout-reason').textContent = computeReason(status);
+  updateTransportButtons(status);
+  updatePlayoutTime(status);
 
   document.getElementById('pos-seq').textContent = s.playout.position_seq ?? '—';
   document.getElementById('live-seq').textContent = s.live_seq ?? '—';
@@ -230,6 +329,19 @@ function applyStatus(status) {
     volumeInput.value = Math.round(s.playout.volume * 100);
     volumeVal.textContent = volumeInput.value + '%';
   }
+}
+
+// The pill's own 'error'/'stalled' classes already exist for server-reported
+// states; a lost WS connection is a distinct client-observed failure (the
+// server may be fine — we just can't hear from it), so it gets the same
+// visual treatment with its own reason rather than freezing the last-known
+// pill with no indication anything's wrong.
+function setConnectionLost() {
+  const pill = document.getElementById('playout-pill');
+  pill.textContent = 'error';
+  pill.className = 'pill error';
+  document.getElementById('playout-reason').textContent =
+    'lost connection to the control server — reconnecting…';
 }
 
 function applyMeters(vuDb, ppmDb) {
@@ -370,7 +482,8 @@ async function applyWaveform() {
   if (json.length === 0) return;
 
   waveformPointMs = pointMs(json);
-  serverPlayer.setSegmentMs(waveformPointMs * pointsPerSegment(json));
+  segmentMs = waveformPointMs * pointsPerSegment(json);
+  serverPlayer.setSegmentMs(segmentMs);
 
   if (!peaksInstance) {
     initWaveform(json);
@@ -396,7 +509,7 @@ function connectWs() {
       applyMeters(msg.vu_db, msg.ppm_db);
     }
   };
-  ws.onclose = () => setTimeout(connectWs, 1000);
+  ws.onclose = () => { setConnectionLost(); setTimeout(connectWs, 1000); };
   ws.onerror = () => ws.close();
 }
 connectWs();

@@ -88,6 +88,17 @@ pub struct PlayoutHandle {
     /// Name of the output device actually opened, set once by the engine
     /// thread at startup; empty until then or if no device was found.
     device_name: RwLock<String>,
+    /// Set once, permanently, if the engine thread fails to open the audio
+    /// device/stream at startup — makes `playout_state()` report `Error`
+    /// instead of a silently-dead `Stopped` (see `run_engine`'s early-return
+    /// branches). `None` means playout initialized fine.
+    device_error: RwLock<Option<String>>,
+    /// Human-readable reason for the most recent stall-causing event (decode
+    /// failure, encoder-abandoned segment, or the stall-skip timeout);
+    /// cleared as soon as a segment decodes and plays normally again. Best
+    /// effort — read alongside `underrun` by `detail()`, not perfectly
+    /// synchronized with it since they're set from different code paths.
+    stall_reason: RwLock<Option<String>>,
     cmd_tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
@@ -103,7 +114,9 @@ impl PlayoutHandle {
     }
 
     pub fn playout_state(&self) -> PlayoutState {
-        if !self.running.load(Ordering::Relaxed) {
+        if self.device_error.read().unwrap().is_some() {
+            PlayoutState::Error
+        } else if !self.running.load(Ordering::Relaxed) {
             PlayoutState::Stopped
         } else if self.paused.load(Ordering::Relaxed) {
             PlayoutState::Paused
@@ -112,6 +125,20 @@ impl PlayoutHandle {
         } else {
             PlayoutState::Playing
         }
+    }
+
+    /// Human-readable reason behind the current `Error`/`Stalled` state, for
+    /// operator UIs that want to answer "why?" rather than just show a
+    /// color. `None` for `Stopped`/`Playing`/`Paused`, and also `None` for
+    /// `Stalled` if no specific cause has been recorded yet.
+    pub fn detail(&self) -> Option<String> {
+        if let Some(err) = self.device_error.read().unwrap().clone() {
+            return Some(err);
+        }
+        if self.underrun.load(Ordering::Relaxed) {
+            return self.stall_reason.read().unwrap().clone();
+        }
+        None
     }
 
     pub fn volume(&self) -> f32 {
@@ -162,6 +189,8 @@ pub fn spawn(
         ppm_bits: AtomicU32::new(0),
         underrun: AtomicBool::new(false),
         device_name: RwLock::new(String::new()),
+        device_error: RwLock::new(None),
+        stall_reason: RwLock::new(None),
         cmd_tx,
     });
 
@@ -196,17 +225,20 @@ fn run_engine(
 ) {
     let host = resolve_host(&audio_cfg.host);
     let Some(device) = resolve_output_device(&host, &audio_cfg.device) else {
-        tracing::error!(
-            host = %audio_cfg.host,
-            device = %audio_cfg.device,
-            "no matching audio output device; playout disabled"
+        let msg = format!(
+            "no matching audio output device (host={:?}, device={:?})",
+            audio_cfg.host, audio_cfg.device
         );
+        tracing::error!(host = %audio_cfg.host, device = %audio_cfg.device, "{msg}; playout disabled");
+        *handle.device_error.write().unwrap() = Some(msg);
         drain_forever(&mut cmd_rx);
         return;
     };
     *handle.device_name.write().unwrap() = device_name(&device);
     let Ok(supported) = device.default_output_config() else {
-        tracing::error!("output device has no default config; playout disabled");
+        let msg = "output device has no default config".to_string();
+        tracing::error!("{msg}; playout disabled");
+        *handle.device_error.write().unwrap() = Some(msg);
         drain_forever(&mut cmd_rx);
         return;
     };
@@ -254,13 +286,22 @@ fn run_engine(
                 .ppm_bits
                 .store(ppm.value_db().to_bits(), Ordering::Relaxed);
         },
-        |err| tracing::error!(error = %err, "playout stream error"),
+        {
+            let err_handle = handle.clone();
+            move |err| {
+                tracing::error!(error = %err, "playout stream error");
+                *err_handle.device_error.write().unwrap() =
+                    Some(format!("output stream error: {err}"));
+            }
+        },
         None,
     );
     let stream = match stream {
         Ok(s) => s,
         Err(err) => {
-            tracing::error!(error = %err, "failed to build output stream; playout disabled");
+            let msg = format!("failed to build output stream: {err}");
+            tracing::error!("{msg}; playout disabled");
+            *handle.device_error.write().unwrap() = Some(msg);
             drain_forever(&mut cmd_rx);
             return;
         }
@@ -278,6 +319,7 @@ fn run_engine(
             Ok(EngineCommand::Start { position }) => {
                 current = Some(position);
                 stall_since = None;
+                *handle.stall_reason.write().unwrap() = None;
                 handle
                     .position_seq
                     .store(position as i64, Ordering::Relaxed);
@@ -292,6 +334,7 @@ fn run_engine(
             Ok(EngineCommand::Stop) => {
                 current = None;
                 stall_since = None;
+                *handle.stall_reason.write().unwrap() = None;
                 handle.running.store(false, Ordering::Relaxed);
                 handle.position_seq.store(-1, Ordering::Relaxed);
                 let _ = stream.pause();
@@ -308,6 +351,7 @@ fn run_engine(
             Ok(EngineCommand::Seek { position }) => {
                 current = Some(position);
                 stall_since = None;
+                *handle.stall_reason.write().unwrap() = None;
                 handle
                     .position_seq
                     .store(position as i64, Ordering::Relaxed);
@@ -346,9 +390,16 @@ fn run_engine(
                         // below for when it stops waiting), protecting "no
                         // audio lost to a short outage" per CLAUDE.md §5.
                         match decode_to_pcm(&path, sample_rate) {
-                            Ok(pcm) => push_all(&mut producer, &pcm),
+                            Ok(pcm) => {
+                                push_all(&mut producer, &pcm);
+                                // Real audio decoded and queued — whatever
+                                // stalled things before is no longer why.
+                                *handle.stall_reason.write().unwrap() = None;
+                            }
                             Err(err) => {
-                                tracing::warn!(seq, error = %err, "decode failed, skipping segment")
+                                tracing::warn!(seq, error = %err, "decode failed, skipping segment");
+                                *handle.stall_reason.write().unwrap() =
+                                    Some(format!("segment {seq} failed to decode: {err}"));
                             }
                         }
                         advance = true;
@@ -358,6 +409,8 @@ fn run_engine(
                         // any longer would freeze the head on a gap that's
                         // already known permanent.
                         tracing::warn!(seq, "segment abandoned by encoder, skipping");
+                        *handle.stall_reason.write().unwrap() =
+                            Some(format!("segment {seq} was abandoned by the encoder"));
                         advance = true;
                     } else {
                         // Missing, not (yet) abandoned. Wait up to `timeout`
@@ -368,12 +421,18 @@ fn run_engine(
                         // gap freezes `position_seq` forever, violating the
                         // "never block the playout head" invariant.
                         let since = stall_since.get_or_insert_with(Instant::now);
+                        *handle.stall_reason.write().unwrap() =
+                            Some(format!("waiting on segment {seq} from the encoder"));
                         if since.elapsed() >= timeout {
                             tracing::warn!(
                                 seq,
                                 timeout_ms = timeout.as_millis() as u64,
                                 "segment missing past stall timeout, skipping to avoid freezing the playout head"
                             );
+                            *handle.stall_reason.write().unwrap() = Some(format!(
+                                "segment {seq} missing for over {}ms, skipped",
+                                timeout.as_millis()
+                            ));
                             advance = true;
                         }
                     }

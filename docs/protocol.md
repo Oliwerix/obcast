@@ -91,6 +91,28 @@ additive dashboard data. It never feeds back into `plan_uploads`; the
 upload-scheduling loop (§1) runs entirely off `ServerState`, piggybacked on
 uploads and the SSE feed above.
 
+### Playout states
+`playout.state` (`PlayoutState`) is one of `stopped` / `playing` / `paused` /
+`stalled` / `error`:
+- `stopped` — nobody has asked it to play.
+- `playing` — rendering real audio.
+- `paused` — head held in place on request.
+- `stalled` — running and not paused, but the hardware output isn't actually
+  producing audible audio right now (buffer underrun, or the stall-skip
+  backstop in `playout.rs` is bridging a missing segment). Anchors the
+  scheduler the same as `playing`/`paused` — the head is still real, just not
+  audible this instant.
+- `error` — the playout engine itself is broken (e.g. the configured
+  hardware output device failed to open, or a runtime stream error) and
+  cannot produce audio until the server is reconfigured/restarted. Anchors
+  like `stopped` (no head to defend).
+
+`playout.detail` (`Option<String>`) is a human-readable reason, populated for
+`error` (why the device/stream failed) and best-effort for `stalled` (which
+segment it's waiting on / what happened to it); `None` otherwise. This is
+what lets the web remote answer "stalled — why?" / "errored — why?" instead
+of just showing a color.
+
 ### `ServerState` fields that drive the scheduler
 - `playout.state` + `playout.position_seq` — the anchor for all urgency.
 - `frontier_seq` — highest seq contiguously playable from the anchor.
