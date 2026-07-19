@@ -103,8 +103,11 @@ fn anchor(server: &ServerState, inv: &LocalInventory) -> Seq {
         // `store::build_server_state`'s matching anchor logic on the server
         // side) — the scheduler should keep defending the same head a
         // stalled playout is stuck on, not fall back to the live edge.
+        // Error means the engine can't produce audio at all (e.g. no output
+        // device) — same "no anchor, fall back to live edge" treatment as
+        // Stopped, since there's no head to defend.
         Playing | Paused | Stalled => server.playout.position_seq,
-        Stopped => None,
+        Stopped | Error => None,
     }
     .or(server.playout.position_seq)
     .or(server.live_seq)
@@ -330,6 +333,7 @@ mod tests {
                 position_seq: pos,
                 device: None,
                 volume: 1.0,
+                detail: None,
             },
             frontier_seq: pos,
             lead_ms: 0,
@@ -613,6 +617,27 @@ mod tests {
         let plan = plan_uploads(&input);
         // Anchor is the live edge (50); continuity fills the missing tail so a
         // go-live has audio ready.
+        assert!(plan.iter().any(|a| a.seq >= 41));
+    }
+
+    #[test]
+    fn errored_playout_anchors_on_live_edge_same_as_stopped() {
+        // A broken playout engine (e.g. no output device) has no head to
+        // defend, so it should get the exact same treatment as Stopped:
+        // protect the live edge for an instant go-live once fixed.
+        let water = WaterLevels::default();
+        let srv = server(PlayoutState::Error, None, water);
+        let cov: Vec<(Seq, Option<RungId>)> = (0..=40).map(|s| (s, Some(0))).collect();
+        let inv = inv_full(0, 50, &cov);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000,
+            headroom: 0.9,
+            max_actions: 20,
+        };
+        let plan = plan_uploads(&input);
         assert!(plan.iter().any(|a| a.seq >= 41));
     }
 }

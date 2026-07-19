@@ -102,6 +102,12 @@ pub enum PlayoutState {
     /// Distinct from `Playing` so operator dashboards can't mistake silence
     /// for real playback.
     Stalled,
+    /// The playout engine itself is broken — e.g. the configured hardware
+    /// output device failed to open — and cannot produce audio at all until
+    /// the server is reconfigured/restarted. Distinct from `Stopped` (which
+    /// just means nobody asked it to play) so operator dashboards can tell
+    /// "idle" apart from "broken." See `PlayoutStatus::detail` for why.
+    Error,
 }
 
 /// Full playout status snapshot.
@@ -114,6 +120,12 @@ pub struct PlayoutStatus {
     pub device: Option<String>,
     /// Linear gain 0.0..=1.0 (or higher for boost).
     pub volume: f32,
+    /// Human-readable reason behind `Error` (device/stream failure) or
+    /// `Stalled` (why the head isn't producing audible audio right now);
+    /// `None` for `Stopped`/`Playing`/`Paused` and whenever the specific
+    /// cause isn't known. Lets operator UIs answer "stalled/errored — why?"
+    /// instead of just showing a color.
+    pub detail: Option<String>,
 }
 
 /// Buffer thresholds (in ms of contiguous audio ahead of the playout head) that
@@ -185,6 +197,7 @@ impl ServerState {
                 position_seq: None,
                 device: None,
                 volume: 1.0,
+                detail: None,
             },
             frontier_seq: None,
             lead_ms: 0,

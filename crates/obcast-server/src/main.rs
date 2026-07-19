@@ -46,6 +46,7 @@ impl StreamHandle {
             position_seq: self.playout.position(),
             device: self.playout.device_name(),
             volume: self.playout.volume(),
+            detail: self.playout.detail(),
         }
     }
 }

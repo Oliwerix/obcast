@@ -148,8 +148,12 @@ impl ObcastApp {
                     PlayoutState::Paused => "🟡 paused",
                     PlayoutState::Stopped => "⚪ stopped",
                     PlayoutState::Stalled => "🟠 stalled",
+                    PlayoutState::Error => "🔴 error",
                 };
                 ui.label(format!("server: {playout}"));
+                if let Some(detail) = &state.playout.detail {
+                    ui.label(format!("({detail})"));
+                }
                 ui.label(format!("lead {} ms", state.lead_ms));
                 if let Some(seq) = state.live_seq {
                     ui.label(format!("live seq {seq}"));
