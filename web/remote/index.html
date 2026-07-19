@@ -128,7 +128,10 @@ function render() {
   const rows = latestShows.map(show => {
     const name = show.name;
     const enc = escapeHtml(name);
-    const href = 'stream.html?stream=' + encodeURIComponent(name);
+    // Absolute path: a bare "/remote" request (no trailing slash) is served
+    // index.html directly with no redirect, so a relative href here would
+    // resolve against "/" instead of "/remote/" and 404.
+    const href = '/remote/stream.html?stream=' + encodeURIComponent(name);
     const pill = show.live
       ? '<span class="pill live">live</span>'
       : '<span class="pill past">past</span>';

@@ -534,6 +534,13 @@ fn channel_label(ch: u16, total: u16) -> String {
     }
 }
 
+/// A live PCM feed must produce a block at least this often (in units of
+/// `segment_ms`) or the pipeline is considered stalled. Mirrors the bound
+/// already used for a permanent continuity gap elsewhere in this codebase
+/// (`playout.rs`'s `3 * segment_ms` skip-ahead backstop, `uploader.rs`'s
+/// `ABANDON_AFTER`) rather than inventing a new one.
+const PCM_STALL_MULTIPLIER: u32 = 3;
+
 /// Owns the ffmpeg child, the sse/uploader tasks, and the PCM feed into
 /// ffmpeg's stdin. Multiplexes GUI commands and PCM blocks in one loop so
 /// there's a single owner for the stdin handle — no locking needed.
@@ -547,6 +554,17 @@ async fn controller(
     let mut child: Option<Child> = None;
     let mut sse_handle: Option<JoinHandle<()>> = None;
     let mut upload_handle: Option<JoinHandle<()>> = None;
+
+    // Tracks whether audio capture is actually still flowing while live.
+    // Unlike a broken ffmpeg pipe (which fails loudly on the next stdin
+    // write, see the `pcm_rx.recv()` arm below), a lost input device can
+    // simply stop invoking cpal's data callback with no error at all — the
+    // `pcm_rx` channel then just goes quiet forever, ffmpeg's stdin never
+    // sees a write (so never errors), and nothing ever told the operator.
+    // This watchdog is what catches that silent case.
+    let mut segment_ms: u32 = 0;
+    let mut last_pcm_at: Option<tokio::time::Instant> = None;
+    let mut watchdog = tokio::time::interval(Duration::from_millis(500));
 
     loop {
         tokio::select! {
@@ -563,11 +581,16 @@ async fn controller(
                             continue;
                         }
 
+                        segment_ms = profile.segment_ms;
                         match encode::spawn(&encode::Source::Pcm { sample_rate }, &profile, &out_dir) {
                             Ok(mut c) => {
                                 stdin = c.stdin.take();
                                 child = Some(c);
                                 audio.set_live(true);
+                                // Seed so the watchdog counts from go-live,
+                                // not from whenever the first block happens
+                                // to land.
+                                last_pcm_at = Some(tokio::time::Instant::now());
 
                                 let client = reqwest::Client::new();
                                 sse_handle = Some(tokio::spawn(sse::run(
@@ -602,6 +625,10 @@ async fn controller(
             }
             pcm = pcm_rx.recv() => {
                 let Some(block) = pcm else { return };
+                // A block arrived, so capture is alive regardless of what
+                // happens to it downstream — this is what the watchdog below
+                // checks for staleness.
+                last_pcm_at = Some(tokio::time::Instant::now());
                 let mut write_err = None;
                 if let Some(s) = stdin.as_mut() {
                     let mut bytes = Vec::with_capacity(block.len() * 4);
@@ -624,6 +651,21 @@ async fn controller(
                     tracing::error!(error = %detail, "encoder pipeline died");
                     shared.set_encoder_error(detail);
                     stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
+                }
+            }
+            _ = watchdog.tick() => {
+                if child.is_some() {
+                    let stalled = last_pcm_at
+                        .is_some_and(|t| t.elapsed() >= Duration::from_millis((segment_ms as u64) * PCM_STALL_MULTIPLIER as u64));
+                    if stalled {
+                        let detail = match audio.last_error() {
+                            Some(err) => format!("audio capture stopped ({err}); live stopped"),
+                            None => "no audio received from capture device; live stopped".to_string(),
+                        };
+                        tracing::error!(error = %detail, "encoder pipeline stalled: no PCM from capture device");
+                        shared.set_encoder_error(detail);
+                        stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
+                    }
                 }
             }
         }

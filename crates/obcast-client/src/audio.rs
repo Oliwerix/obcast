@@ -330,7 +330,18 @@ fn open_stream(
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
 
-    let err_fn = |err| tracing::error!(error = %err, "capture stream error");
+    // Beyond logging, record the error onto the handle and flip `running`
+    // false — previously this only logged, so a mid-session device loss
+    // (unplugged, exclusive-mode contention, etc.) left the GUI's device
+    // panel reporting a healthy, running device forever. Cloned per format
+    // arm below since the closure captures a non-`Copy` `Arc`.
+    let make_err_fn = |handle: Arc<AudioHandle>| {
+        move |err: cpal::Error| {
+            tracing::error!(error = %err, "capture stream error");
+            *handle.last_error.write().unwrap() = Some(err.to_string());
+            handle.running.store(false, Ordering::Relaxed);
+        }
+    };
 
     // Ballistic filter state lives here and is moved into the callback so it
     // persists across callbacks — the whole point of the 300 ms VU / 650 ms
@@ -346,7 +357,7 @@ fn open_stream(
             device.build_input_stream(
                 config,
                 move |data: &[f32], _| process_block(data, ch, sample_rate, &h, &tx, &mut meters),
-                err_fn,
+                make_err_fn(handle.clone()),
                 None,
             )?
         }
@@ -359,7 +370,7 @@ fn open_stream(
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     process_block(&f, ch, sample_rate, &h, &tx, &mut meters)
                 },
-                err_fn,
+                make_err_fn(handle.clone()),
                 None,
             )?
         }
@@ -375,7 +386,7 @@ fn open_stream(
                         .collect();
                     process_block(&f, ch, sample_rate, &h, &tx, &mut meters)
                 },
-                err_fn,
+                make_err_fn(handle.clone()),
                 None,
             )?
         }
