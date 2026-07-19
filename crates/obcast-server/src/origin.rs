@@ -33,8 +33,13 @@ fn segment_response(bytes: Vec<u8>) -> Response {
 pub async fn master_playlist(
     State(app): State<Arc<AppState>>,
     Path(stream): Path<String>,
-) -> Response {
-    let handle = app.stream(&stream).await;
+) -> Result<Response, StatusCode> {
+    // Read-only listener entry point: must not auto-vivify a stream nobody
+    // has ever ingested into (see `AppState::stream_if_known`).
+    let handle = app
+        .stream_if_known(&stream)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
     let store = handle.store.lock().await;
     let profile = store.profile();
 
@@ -50,7 +55,7 @@ pub async fn master_playlist(
         let _ = writeln!(out, "{}/index.m3u8", rung.id);
     }
 
-    playlist_response(out)
+    Ok(playlist_response(out))
 }
 
 /// Handles both `/{rendition}/index.m3u8` and `/{rendition}/{seq}.ts` under
@@ -61,7 +66,7 @@ pub async fn rendition_tail(
     Path((stream, rendition, tail)): Path<(String, RungId, String)>,
 ) -> Result<Response, StatusCode> {
     if tail == "index.m3u8" {
-        return Ok(rendition_playlist(&app, &stream).await);
+        return rendition_playlist(&app, &stream).await;
     }
     let Some(seq_str) = tail.strip_suffix(".ts") else {
         return Err(StatusCode::NOT_FOUND);
@@ -70,8 +75,13 @@ pub async fn rendition_tail(
     segment(&app, &stream, rendition, seq).await
 }
 
-async fn rendition_playlist(app: &AppState, stream: &str) -> Response {
-    let handle = app.stream(stream).await;
+async fn rendition_playlist(app: &AppState, stream: &str) -> Result<Response, StatusCode> {
+    // Read-only listener entry point: same no-auto-vivify rule as
+    // `master_playlist`.
+    let handle = app
+        .stream_if_known(stream)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
     let store = handle.store.lock().await;
     let seg_secs = store.profile().segment_ms as f32 / 1000.0;
     let seqs: Vec<Seq> = store.playable_seqs().collect();
@@ -89,7 +99,7 @@ async fn rendition_playlist(app: &AppState, stream: &str) -> Response {
         let _ = writeln!(out, "{seq}.ts");
     }
 
-    playlist_response(out)
+    Ok(playlist_response(out))
 }
 
 async fn segment(
@@ -98,7 +108,12 @@ async fn segment(
     rendition: RungId,
     seq: Seq,
 ) -> Result<Response, StatusCode> {
-    let handle = app.stream(stream).await;
+    // Read-only listener entry point: same no-auto-vivify rule as
+    // `master_playlist`.
+    let handle = app
+        .stream_if_known(stream)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
     let store = handle.store.lock().await;
 
     let rung = if store.has_rung(seq, rendition) {

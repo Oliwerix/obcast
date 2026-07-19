@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use obcast_proto::state::{
-    PlayoutStatus, RungId, SegCoverage, Seq, ServerState, StreamProfile, WaterLevels,
+    EncoderState, PlayoutStatus, RungId, SegCoverage, Seq, ServerState, StreamProfile, WaterLevels,
 };
 
 /// How many segments ahead of the anchor `coverage` reports.
@@ -30,6 +30,11 @@ pub struct DvrStore {
     index: BTreeMap<Seq, BTreeSet<RungId>>,
     /// Seqs the encoder gave up on; treated as satisfied for frontier purposes.
     abandoned: BTreeSet<Seq>,
+    /// Latest encoder telemetry from `POST /ingest/{stream}/heartbeat` (or
+    /// piggybacked on an upload), for the control API's `ControlStatus.encoder`
+    /// and real `throughput_kbps` — see `docs/protocol.md` §3. `None` until the
+    /// first heartbeat arrives.
+    encoder_state: Option<EncoderState>,
 }
 
 impl DvrStore {
@@ -57,6 +62,7 @@ impl DvrStore {
             rev: epoch_millis(),
             index: BTreeMap::new(),
             abandoned: BTreeSet::new(),
+            encoder_state: None,
         }
     }
 
@@ -87,12 +93,41 @@ impl DvrStore {
     /// Record that `(rung, seq)` now exists on disk. Idempotent — re-recording
     /// the same pair is a no-op on the index (the caller may still overwrite
     /// the file, which is also safe).
-    pub fn record(&mut self, rung: RungId, seq: Seq) {
+    ///
+    /// Returns the on-disk paths of any segments this record just evicted
+    /// from the DVR window index — this type stays I/O-free (see module
+    /// docs), so it's on the caller to actually delete them.
+    pub fn record(&mut self, rung: RungId, seq: Seq) -> Vec<PathBuf> {
         let is_new = self.index.entry(seq).or_default().insert(rung);
         if is_new {
             self.rev += 1;
-            self.evict_old();
+            return self
+                .evict_old()
+                .into_iter()
+                .flat_map(|(seq, rungs)| rungs.into_iter().map(move |r| (seq, r)))
+                .map(|(seq, r)| self.segment_path(r, seq))
+                .collect();
         }
+        Vec::new()
+    }
+
+    /// Latest encoder telemetry, if any heartbeat has arrived yet.
+    pub fn encoder_state(&self) -> Option<&EncoderState> {
+        self.encoder_state.as_ref()
+    }
+
+    /// Record encoder telemetry from a heartbeat. Idempotent-ish: an
+    /// out-of-order/older `rev` is dropped rather than overwriting a newer
+    /// snapshot, matching how `ServerState.rev` is treated on the client side.
+    pub fn set_encoder_state(&mut self, state: EncoderState) {
+        if self
+            .encoder_state
+            .as_ref()
+            .is_some_and(|cur| cur.rev >= state.rev)
+        {
+            return;
+        }
+        self.encoder_state = Some(state);
     }
 
     /// Mark seqs as permanently abandoned so frontier/playout can skip them.
@@ -129,16 +164,24 @@ impl DvrStore {
         self.index.get(&seq).and_then(|r| r.iter().max().copied())
     }
 
-    /// Drop index entries older than the DVR window behind the live edge.
-    /// Segment files on disk are left for the caller to reap separately.
-    fn evict_old(&mut self) {
-        let Some(live) = self.live_seq() else { return };
+    /// Drop index entries older than the DVR window behind the live edge and
+    /// return the `(seq, rungs)` pairs removed, so `record()` can hand the
+    /// caller the on-disk paths to reap. Stays pure/I/O-free itself — no
+    /// files are touched here (see module docs).
+    fn evict_old(&mut self) -> Vec<(Seq, BTreeSet<RungId>)> {
+        let Some(live) = self.live_seq() else {
+            return Vec::new();
+        };
         let floor = live.saturating_sub(self.dvr_window_segs);
         let stale: Vec<Seq> = self.index.range(..floor).map(|(s, _)| *s).collect();
+        let mut evicted = Vec::with_capacity(stale.len());
         for s in stale {
-            self.index.remove(&s);
+            if let Some(rungs) = self.index.remove(&s) {
+                evicted.push((s, rungs));
+            }
             self.abandoned.remove(&s);
         }
+        evicted
     }
 
     pub fn build_server_state(&self, playout: PlayoutStatus) -> ServerState {
@@ -147,7 +190,10 @@ impl DvrStore {
 
         use obcast_proto::state::PlayoutState::*;
         let anchor = match playout.state {
-            Playing | Paused => playout.position_seq,
+            // Stalled is still nominally "playing" position-wise — the head
+            // just isn't producing audible audio right now — so it anchors
+            // the same as Playing/Paused.
+            Playing | Paused | Stalled => playout.position_seq,
             Stopped => None,
         }
         .or(playout.position_seq)
@@ -339,5 +385,70 @@ mod tests {
         }
         assert!(s.dvr_start_seq().unwrap() > 0);
         assert_eq!(s.live_seq(), Some(20));
+    }
+
+    #[test]
+    fn record_returns_evicted_paths_for_the_caller_to_reap() {
+        // Same window as above: eviction should start kicking in well before
+        // seq 20, and every returned path should point at the rung/seq that
+        // fell out of the window, so the caller (ingest.rs) can delete the
+        // right files instead of leaking them on disk forever.
+        let mut s = store(8_000);
+        let mut all_evicted = Vec::new();
+        for seq in 0..=20 {
+            all_evicted.extend(s.record(0, seq));
+        }
+        assert!(
+            !all_evicted.is_empty(),
+            "old segments falling out of the DVR window should be returned for reaping"
+        );
+        for path in &all_evicted {
+            assert!(path.to_string_lossy().ends_with(".ts"));
+            assert!(path.starts_with(s.data_dir()));
+        }
+        // A still-open write (no eviction yet) returns nothing to reap.
+        let mut fresh = store(8_000);
+        assert!(fresh.record(0, 0).is_empty());
+    }
+
+    #[test]
+    fn record_is_a_noop_on_reupload_and_reaps_nothing() {
+        // Re-recording an already-indexed (rung, seq) must not report it as
+        // newly evicted — it never left the index in the first place.
+        let mut s = store(60_000);
+        assert!(s.record(0, 1).is_empty());
+        assert!(s.record(0, 1).is_empty());
+    }
+
+    #[test]
+    fn encoder_state_is_none_until_a_heartbeat_arrives_and_rejects_stale_revs() {
+        let mut s = store(60_000);
+        assert!(s.encoder_state().is_none());
+
+        let base = obcast_proto::state::EncoderState {
+            rev: 5,
+            active_rungs: vec![0, 1, 2],
+            encoded_seq: Some(10),
+            primary_rung: 1,
+            throughput_kbps: 128,
+            backlog: 0,
+            abandoned: vec![],
+        };
+        s.set_encoder_state(base.clone());
+        assert_eq!(s.encoder_state(), Some(&base));
+
+        // Lower rev: dropped, latest snapshot is kept.
+        let mut stale = base.clone();
+        stale.rev = 4;
+        stale.throughput_kbps = 999;
+        s.set_encoder_state(stale);
+        assert_eq!(s.encoder_state().unwrap().throughput_kbps, 128);
+
+        // Newer rev: accepted.
+        let mut newer = base;
+        newer.rev = 6;
+        newer.throughput_kbps = 256;
+        s.set_encoder_state(newer);
+        assert_eq!(s.encoder_state().unwrap().throughput_kbps, 256);
     }
 }

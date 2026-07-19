@@ -37,6 +37,34 @@ pub struct StreamProfile {
 }
 
 impl StreamProfile {
+    /// The one ABR ladder every OBCast component ships today (32/128/320
+    /// kbps AAC, low/mid/hd) — previously copied separately in
+    /// `obcast-server::main`, `obcast-client::main`, and
+    /// `obcast-client::gui::app`, which could silently drift out of sync.
+    /// `segment_ms` is the only axis that's actually configurable per run.
+    pub fn default_ladder(segment_ms: u32) -> Self {
+        Self {
+            segment_ms,
+            rungs: vec![
+                Rung {
+                    id: 0,
+                    name: "lo".into(),
+                    bitrate_kbps: 32,
+                },
+                Rung {
+                    id: 1,
+                    name: "mid".into(),
+                    bitrate_kbps: 128,
+                },
+                Rung {
+                    id: 2,
+                    name: "hd".into(),
+                    bitrate_kbps: 320,
+                },
+            ],
+        }
+    }
+
     pub fn low_rung(&self) -> RungId {
         self.rungs.first().map(|r| r.id).unwrap_or(0)
     }
@@ -67,6 +95,13 @@ pub enum PlayoutState {
     Stopped,
     Playing,
     Paused,
+    /// Running and not paused, but the hardware output is not actually
+    /// rendering real audio right now — e.g. `cpal` is zero-filling an
+    /// underrun because decode/segment availability can't keep pace, or the
+    /// stall-skip backstop (see `playout.rs`) is bridging a missing segment.
+    /// Distinct from `Playing` so operator dashboards can't mistake silence
+    /// for real playback.
+    Stalled,
 }
 
 /// Full playout status snapshot.

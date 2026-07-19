@@ -79,6 +79,12 @@ pub struct PlayoutHandle {
     // f32 bits since there's no stable AtomicF32.
     vu_bits: AtomicU32,
     ppm_bits: AtomicU32,
+    /// Set by the output audio callback whenever it has to zero-pad because
+    /// the ring buffer ran dry (decode/segment availability can't keep pace,
+    /// or the stall-skip backstop is bridging a missing segment) — the
+    /// ground truth for "is real audio actually coming out right now,"
+    /// independent of `running`/`paused`. See `playout_state()`.
+    underrun: AtomicBool,
     /// Name of the output device actually opened, set once by the engine
     /// thread at startup; empty until then or if no device was found.
     device_name: RwLock<String>,
@@ -101,6 +107,8 @@ impl PlayoutHandle {
             PlayoutState::Stopped
         } else if self.paused.load(Ordering::Relaxed) {
             PlayoutState::Paused
+        } else if self.underrun.load(Ordering::Relaxed) {
+            PlayoutState::Stalled
         } else {
             PlayoutState::Playing
         }
@@ -152,6 +160,7 @@ pub fn spawn(
         volume_millis: AtomicU32::new(1000),
         vu_bits: AtomicU32::new(0),
         ppm_bits: AtomicU32::new(0),
+        underrun: AtomicBool::new(false),
         device_name: RwLock::new(String::new()),
         cmd_tx,
     });
@@ -221,6 +230,12 @@ fn run_engine(
         move |data: &mut [f32], _| {
             let gain = volume_handle.volume();
             let filled = consumer.pop_slice(data);
+            // A partial fill means the ring ran dry this callback — real
+            // audio, but not all of it; still an underrun, since some of
+            // `data` below gets zero-padded either way.
+            volume_handle
+                .underrun
+                .store(filled < data.len(), Ordering::Relaxed);
             for s in &mut data[..filled] {
                 *s *= gain;
             }
@@ -268,6 +283,9 @@ fn run_engine(
                     .store(position as i64, Ordering::Relaxed);
                 handle.running.store(true, Ordering::Relaxed);
                 handle.paused.store(false, Ordering::Relaxed);
+                // No audio has actually reached the ring yet; the output
+                // callback will clear this on its first full buffer.
+                handle.underrun.store(true, Ordering::Relaxed);
                 let _ = stream.play();
                 tracing::info!(seq = position, "playout started");
             }

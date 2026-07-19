@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::Response;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
@@ -28,6 +28,31 @@ pub(crate) const STALE_AFTER: Duration = Duration::from_secs(5);
 
 /// How often the WS pushes `Meters`, independent of state-change events.
 const METERS_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Gate on the control-plane token, same `X-Auth` convention and
+/// "no token configured = auth disabled" semantics as ingest's
+/// `check_auth` (`ingest.rs`) — kept as a small local duplicate rather than
+/// shared, since the two check different tokens for different trust
+/// domains (upload credential vs. hardware-output control credential).
+/// Takes the expected token directly (`AppState::control_token()`) rather
+/// than a `StreamHandle`, so it can run *before* any stream lookup — see
+/// `set_playout`, where checking against an already-fetched handle would
+/// mean a bad/missing token still paid for spinning up a stream's
+/// permanent playout thread before being rejected.
+fn check_control_auth(expected: Option<&str>, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let got = headers.get("x-auth").and_then(|v| v.to_str().ok());
+    if got == Some(expected) {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing X-Auth".into(),
+        ))
+    }
+}
 
 async fn resolve_position(handle: &StreamHandle, pos: PlayoutPosition) -> Result<Seq, ApiError> {
     let store = handle.store.lock().await;
@@ -50,8 +75,10 @@ async fn resolve_position(handle: &StreamHandle, pos: PlayoutPosition) -> Result
 pub async fn set_playout(
     State(app): State<Arc<AppState>>,
     Path(stream): Path<String>,
+    headers: HeaderMap,
     Json(cmd): Json<PlayoutCommand>,
 ) -> Result<StatusCode, ApiError> {
+    check_control_auth(app.control_token(), &headers)?;
     let handle = app.stream(&stream).await;
 
     match cmd {
@@ -90,9 +117,12 @@ pub async fn set_playout(
 }
 
 async fn build_status(stream: &str, handle: &StreamHandle) -> ControlStatus {
-    let server = {
+    let (server, encoder) = {
         let store = handle.store.lock().await;
-        store.build_server_state(handle.playout_status())
+        (
+            store.build_server_state(handle.playout_status()),
+            store.encoder_state().cloned(),
+        )
     };
 
     let last_ingest = *handle.last_ingest.lock().await;
@@ -114,16 +144,19 @@ async fn build_status(stream: &str, handle: &StreamHandle) -> ControlStatus {
         .iter()
         .filter(|c| c.best_rung.is_none())
         .count() as u32;
+    // Real telemetry once a heartbeat has arrived (see `ingest::heartbeat`);
+    // 0 until then, same as before this was wired up.
+    let throughput_kbps = encoder.as_ref().map_or(0, |e| e.throughput_kbps);
 
     ControlStatus {
         stream: stream.to_string(),
         server,
-        encoder: None,
+        encoder,
         link: LinkHealth {
             connected,
             last_segment_age_ms,
             current_rung,
-            throughput_kbps: 0,
+            throughput_kbps,
             gaps,
         },
     }
@@ -132,9 +165,16 @@ async fn build_status(stream: &str, handle: &StreamHandle) -> ControlStatus {
 pub async fn status(
     State(app): State<Arc<AppState>>,
     Path(stream): Path<String>,
-) -> Json<ControlStatus> {
-    let handle = app.stream(&stream).await;
-    Json(build_status(&stream, &handle).await)
+) -> Result<Json<ControlStatus>, ApiError> {
+    // Read-only: must not auto-vivify a stream nobody has ever ingested
+    // into (see `AppState::stream_if_known`).
+    let Some(handle) = app.stream_if_known(&stream).await else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no such stream: {stream}"),
+        ));
+    };
+    Ok(Json(build_status(&stream, &handle).await))
 }
 
 /// `WS /api/{stream}/ws`: pushes a full `Status` snapshot on connect and on
@@ -146,7 +186,10 @@ pub async fn ws_handler(
     Path(stream): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let handle = app.stream(&stream).await;
+    // Read-only: same no-auto-vivify rule as `status` above.
+    let Some(handle) = app.stream_if_known(&stream).await else {
+        return (StatusCode::NOT_FOUND, format!("no such stream: {stream}")).into_response();
+    };
     ws.on_upgrade(move |socket| ws_session(stream, handle, socket))
 }
 
@@ -226,7 +269,13 @@ pub async fn waveform_handler(
     Path(stream): Path<String>,
     Query(q): Query<WaveformQuery>,
 ) -> Result<Json<WaveformJson>, ApiError> {
-    let handle = app.stream(&stream).await;
+    // Read-only: same no-auto-vivify rule as `status`.
+    let Some(handle) = app.stream_if_known(&stream).await else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no such stream: {stream}"),
+        ));
+    };
 
     let store = handle.store.clone();
     let result = tokio::task::spawn_blocking(move || {
