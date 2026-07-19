@@ -19,19 +19,38 @@ directories = "6.0.0"
 toml = "1.1.3"
 anyhow = "1.0.103"
 
-# Off by default so a plain `cargo build` never needs libjack/libpulse/
-# libpipewire dev headers. Enable per-machine to expose more audio
-# subsystems in the "Audio Subsystem" picker on Linux/BSD, e.g.
-# `cargo build -p obcast-client --features jack,pulseaudio,pipewire`.
-# `pipewire` talks to libpipewire directly (cpal's native PipeWire host,
-# not a compatibility shim) — on a PipeWire desktop it's the one to prefer,
-# since cpal's own platform default already picks it over PulseAudio/ALSA
-# when compiled in. Still worth adding `jack` alongside it if the operator
-# wants JACK's port-graph semantics (patching into other pro-audio JACK
-# clients via `pipewire-jack`) rather than a plain sink/source — PipeWire's
-# native cpal host doesn't expose that graph. `pulseaudio` is mainly for
-# hosts that are actually PulseAudio (no PipeWire installed).
+# WASAPI (Windows) and CoreAudio (macOS) are cpal's mandatory native hosts —
+# same standing as ALSA on Linux — so they need no feature flag and just
+# work out of the box; they're already what `cargo build` gives you with no
+# features enabled at all on those platforms.
+#
+# Everything below is opt-in because it needs extra system dev headers (or,
+# for ASIO, a proprietary SDK) that a plain `cargo build` shouldn't require:
+# `cargo build -p obcast-client --features jack,pulseaudio,pipewire` (Linux/BSD)
+# `cargo build -p obcast-client --features jack,asio` (Windows)
+# `cargo build -p obcast-client --features jack` (macOS)
+#
+# - `pipewire` (Linux/BSD): talks to libpipewire directly (cpal's native
+#   PipeWire host, not a compatibility shim) — on a PipeWire desktop it's the
+#   one to prefer, since cpal's own platform default already picks it over
+#   PulseAudio/ALSA when compiled in.
+# - `jack` (Linux/BSD/macOS/Windows): JACK's port-graph semantics — patching
+#   into other pro-audio JACK clients by name — rather than a plain
+#   sink/source. On a PipeWire machine this reaches `pipewire-jack`; that's
+#   additive to `pipewire` above, not a replacement, since the native
+#   PipeWire host doesn't expose graph routing.
+# - `pulseaudio` (Linux/BSD): for a machine that's genuinely PulseAudio
+#   without PipeWire (older/minimal distros) — redundant on a modern
+#   PipeWire desktop, where `pipewire-pulse` is just a shim in front of the
+#   same server `pipewire` already reaches directly.
+# - `asio` (Windows only — inert everywhere else): Steinberg's ASIO, the
+#   exclusive-mode low-latency backend most pro-audio interfaces on Windows
+#   actually want. Requires downloading the ASIO SDK yourself (its license
+#   forbids redistributing it) and pointing `CPAL_ASIO_DIR` at it before
+#   building — see cpal's README. Not needed at all if WASAPI's shared mode
+#   is good enough for the interface in use.
 [features]
 jack = ["cpal/jack"]
 pulseaudio = ["cpal/pulseaudio"]
 pipewire = ["cpal/pipewire"]
+asio = ["cpal/asio"]

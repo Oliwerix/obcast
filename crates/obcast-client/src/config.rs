@@ -19,8 +19,8 @@ pub struct AppConfig {
     pub out_dir: String,
 
     /// Audio subsystem (cpal host) to open `device_name` from, e.g. "ALSA",
-    /// "JACK", "PulseAudio", "PipeWire", "WASAPI", "CoreAudio". Empty =
-    /// platform default.
+    /// "JACK", "PulseAudio", "PipeWire", "WASAPI", "ASIO", "CoreAudio".
+    /// Empty = platform default.
     pub audio_host: String,
     pub device_name: String,
     pub mono: bool,
