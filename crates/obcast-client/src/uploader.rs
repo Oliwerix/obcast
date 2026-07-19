@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use obcast_proto::control::LogLevel;
 use obcast_proto::scheduler::{
     plan_uploads, stalled_continuity_seq, LocalInventory, SchedulerInput,
 };
@@ -105,15 +106,30 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
                 match req.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         tracing::warn!(seq, "gave up on permanently missing segment, abandoned");
+                        shared.push_log(
+                            LogLevel::Warn,
+                            format!("gave up on permanently missing segment {seq}, abandoned"),
+                        );
                         abandoned_locally.insert(seq);
                         inv.server_best.insert(seq, Some(low));
                         stalled = None;
                     }
                     Ok(resp) => {
                         tracing::warn!(seq, status = %resp.status(), "abandon request rejected, will retry");
+                        shared.push_log(
+                            LogLevel::Warn,
+                            format!(
+                                "abandon request for seq {seq} rejected ({}), will retry",
+                                resp.status()
+                            ),
+                        );
                     }
                     Err(err) => {
                         tracing::warn!(seq, error = %err, "abandon request failed, will retry");
+                        shared.push_log(
+                            LogLevel::Warn,
+                            format!("abandon request for seq {seq} failed ({err}), will retry"),
+                        );
                     }
                 }
             }
@@ -155,6 +171,10 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
             }
             if let Err(err) = req.send().await {
                 tracing::warn!(error = %err, "heartbeat failed, will retry next tick");
+                shared.push_log(
+                    LogLevel::Warn,
+                    format!("heartbeat failed ({err}), will retry next tick"),
+                );
             }
         }
 
@@ -190,9 +210,25 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
                 }
                 Ok(resp) => {
                     tracing::warn!(seq = action.seq, rung = action.rung, status = %resp.status(), "upload rejected");
+                    shared.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "upload of seq {} (rung {}) rejected ({})",
+                            action.seq,
+                            action.rung,
+                            resp.status()
+                        ),
+                    );
                 }
                 Err(err) => {
                     tracing::warn!(seq = action.seq, rung = action.rung, error = %err, "upload failed, retrying next tick");
+                    shared.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "upload of seq {} (rung {}) failed ({err}), retrying next tick",
+                            action.seq, action.rung
+                        ),
+                    );
                 }
             }
         }

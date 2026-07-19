@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use obcast_proto::control::LogLevel;
 use obcast_proto::state::ServerState;
 
 use crate::shared::SharedState;
@@ -18,6 +19,10 @@ pub async fn run(
     loop {
         if let Err(err) = connect_and_stream(&client, &base_url, &stream, &shared).await {
             tracing::warn!(error = %err, "state feed disconnected, reconnecting");
+            shared.push_log(
+                LogLevel::Warn,
+                format!("state feed disconnected ({err}), reconnecting"),
+            );
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }

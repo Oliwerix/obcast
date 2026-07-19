@@ -15,6 +15,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::JoinHandle;
 
+use obcast_proto::control::{LogEntry, LogLevel};
 use obcast_proto::state::{PlayoutState, StreamProfile};
 
 use crate::audio::{self, AudioHandle};
@@ -71,6 +72,8 @@ struct ObcastApp {
     selected_device: String,
     cfg: AppConfig,
     live: bool,
+    /// Whether the operator log panel (bottom of the window) is open.
+    show_log: bool,
 }
 
 impl ObcastApp {
@@ -103,6 +106,7 @@ impl ObcastApp {
             selected_device: cfg.device_name.clone(),
             cfg,
             live: false,
+            show_log: false,
         }
     }
 
@@ -168,15 +172,24 @@ impl ObcastApp {
                     self.shared.throughput_kbps()
                 ));
             }
-            if let Some(err) = self.shared.encoder_error() {
+            if let Some(entry) = self.shared.latest_log() {
                 ui.separator();
                 ui.colored_label(
-                    egui::Color32::from_rgb(0xe2, 0x3d, 0x3d),
-                    format!("⚠ {err}"),
+                    log_level_color(entry.level),
+                    format!("{} {}", log_level_tag(entry.level), entry.message),
                 );
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let log_text = if self.show_log { "Log ▼" } else { "Log ▲" };
+                if ui
+                    .button(log_text)
+                    .on_hover_text("Show the operator status/error log")
+                    .clicked()
+                {
+                    self.show_log = !self.show_log;
+                }
+                ui.add_space(8.0);
                 let (text, color) = if self.live {
                     ("■ Stop", egui::Color32::from_rgb(0x8a, 0x1f, 0x1f))
                 } else {
@@ -479,6 +492,35 @@ impl ObcastApp {
             });
         });
     }
+
+    /// Scrollable operator status/error log — see `SharedState::recent_log`.
+    /// Shown as a collapsible bottom panel (toggled from the status bar)
+    /// rather than always-on, so it doesn't compete for space with the
+    /// meters during normal operation but stays one click away.
+    fn log_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Log");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Close").clicked() {
+                    self.show_log = false;
+                }
+            });
+        });
+        ui.separator();
+
+        let entries = self.shared.recent_log();
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if entries.is_empty() {
+                    ui.label("(no log entries yet)");
+                }
+                for entry in &entries {
+                    log_line(ui, entry);
+                }
+            });
+    }
 }
 
 impl eframe::App for ObcastApp {
@@ -487,7 +529,8 @@ impl eframe::App for ObcastApp {
         ui.ctx().request_repaint_after(Duration::from_millis(33));
 
         // If the encoder pipeline died on its own, drop back out of "live" so
-        // the button and status reflect reality (the error text stays visible).
+        // the button and status reflect reality (the error text stays visible
+        // in the status bar's log summary and the full log panel).
         if self.live && self.shared.take_encoder_failed() {
             self.live = false;
         }
@@ -497,6 +540,16 @@ impl eframe::App for ObcastApp {
             self.status_bar(ui);
             ui.add_space(4.0);
         });
+
+        if self.show_log {
+            egui::Panel::bottom("log")
+                .resizable(true)
+                .default_size(220.0)
+                .min_size(120.0)
+                .show(ui, |ui| {
+                    self.log_panel(ui);
+                });
+        }
 
         egui::Panel::left("controls")
             .min_size(360.0)
@@ -509,6 +562,55 @@ impl eframe::App for ObcastApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.meter_panel(ui);
         });
+    }
+}
+
+/// One row of the log panel: wall-clock time, a color-coded level tag, and
+/// the message.
+fn log_line(ui: &mut egui::Ui, entry: &LogEntry) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format_log_time(entry.at_ms))
+                .monospace()
+                .small()
+                .color(egui::Color32::GRAY),
+        );
+        ui.colored_label(
+            log_level_color(entry.level),
+            egui::RichText::new(log_level_tag(entry.level))
+                .monospace()
+                .small()
+                .strong(),
+        );
+        ui.label(&entry.message);
+    });
+}
+
+/// `HH:MM:SS`, UTC-based (epoch millis are wall-clock, but converting to the
+/// operator's local timezone would need a `chrono`/`time` dependency this
+/// dependency-light crate doesn't otherwise carry — see CLAUDE.md §9).
+fn format_log_time(at_ms: u64) -> String {
+    let secs = at_ms / 1000;
+    let day_secs = secs % 86_400;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+fn log_level_color(level: LogLevel) -> egui::Color32 {
+    match level {
+        LogLevel::Error => egui::Color32::from_rgb(0xe2, 0x3d, 0x3d),
+        LogLevel::Warn => egui::Color32::from_rgb(0xe8, 0xc5, 0x2a),
+        LogLevel::Info => egui::Color32::LIGHT_GRAY,
+    }
+}
+
+fn log_level_tag(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Error => "ERROR",
+        LogLevel::Warn => "WARN ",
+        LogLevel::Info => "INFO ",
     }
 }
 
@@ -558,11 +660,10 @@ async fn controller(
                 match cmd {
                     Some(ControllerCmd::GoLive { profile, base_url, stream, ingest_token, out_dir, sample_rate }) => {
                         stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
-                        shared.clear_encoder_error();
 
                         if let Err(err) = tokio::fs::create_dir_all(&out_dir).await {
                             tracing::error!(error = %err, "failed to create buffer dir");
-                            shared.set_encoder_error(format!("failed to create buffer dir: {err}"));
+                            shared.push_log(LogLevel::Error, format!("failed to create buffer dir: {err}"));
                             audio.set_live(false);
                             continue;
                         }
@@ -591,10 +692,11 @@ async fn controller(
                                     shared.clone(),
                                 )));
                                 tracing::info!("live: encoder pipeline started");
+                                shared.push_log(LogLevel::Info, "live: encoder pipeline started");
                             }
                             Err(err) => {
                                 tracing::error!(error = %err, "failed to spawn ffmpeg");
-                                shared.set_encoder_error(format!("failed to start ffmpeg: {err}"));
+                                shared.push_log(LogLevel::Error, format!("failed to start ffmpeg: {err}"));
                                 audio.set_live(false);
                             }
                         }
@@ -602,6 +704,7 @@ async fn controller(
                     Some(ControllerCmd::StopLive) => {
                         stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
                         tracing::info!("live: encoder pipeline stopped");
+                        shared.push_log(LogLevel::Info, "live: encoder pipeline stopped");
                     }
                     None => {
                         stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
@@ -635,7 +738,7 @@ async fn controller(
                         None => format!("ffmpeg stdin write failed: {err}; live stopped"),
                     };
                     tracing::error!(error = %detail, "encoder pipeline died");
-                    shared.set_encoder_error(detail);
+                    shared.push_log(LogLevel::Error, detail);
                     stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
                 }
             }
@@ -649,7 +752,7 @@ async fn controller(
                             None => "no audio received from capture device; live stopped".to_string(),
                         };
                         tracing::error!(error = %detail, "encoder pipeline stalled: no PCM from capture device");
-                        shared.set_encoder_error(detail);
+                        shared.push_log(LogLevel::Error, detail);
                         stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
                     }
                 }
