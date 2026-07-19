@@ -64,6 +64,29 @@ pub struct LinkHealth {
     pub gaps: u32,
 }
 
+/// Severity of a logged status/error message. Mirrors `tracing`'s levels
+/// (only the three an operator actually needs to triage from a UI).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// One human-readable status/error line, timestamped for display. Used both
+/// by the server (surfaced to the web remote over `recent_log` / the WS
+/// `log` event) and by the encoder client (surfaced in its own GUI) — a
+/// shared shape so both UIs render the same way, even though a client log
+/// never crosses the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    /// Wall-clock, milliseconds since the Unix epoch.
+    pub at_ms: u64,
+    pub level: LogLevel,
+    pub message: String,
+}
+
 /// Response to `GET /api/status`: everything a web client needs to render the
 /// player, the scrub bar, and the health panel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,6 +96,11 @@ pub struct ControlStatus {
     /// Last known encoder telemetry (may be stale if the link is down).
     pub encoder: Option<EncoderState>,
     pub link: LinkHealth,
+    /// Backlog of recent status/error log lines, oldest first, capped to a
+    /// fixed window — lets a freshly-opened web remote show history instead
+    /// of waiting for the next live `log` event.
+    #[serde(default)]
+    pub recent_log: Vec<LogEntry>,
 }
 
 /// Envelope pushed over the control WebSocket (`/api/ws`) for live updates.
@@ -98,4 +126,7 @@ pub enum ControlEvent {
         ok: bool,
         detail: Option<String>,
     },
+    /// A new status/error line was logged — append to the client's local
+    /// history (already included once in `Status.recent_log`'s backlog).
+    Log(LogEntry),
 }
