@@ -103,6 +103,9 @@ pub async fn set_playout(
         PlayoutCommand::SetVolume { gain } => {
             handle.playout.send(EngineCommand::SetVolume { gain })
         }
+        PlayoutCommand::SetTestTone { enabled } => {
+            handle.playout.send(EngineCommand::SetTestTone { enabled })
+        }
         PlayoutCommand::SetDevice { .. } => {
             return Err(ApiError(
                 StatusCode::NOT_IMPLEMENTED,

@@ -55,6 +55,7 @@ impl StreamHandle {
             device: self.playout.device_name(),
             volume: self.playout.volume(),
             detail: self.playout.detail(),
+            test_tone: self.playout.test_tone(),
         }
     }
 

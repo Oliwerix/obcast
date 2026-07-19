@@ -126,6 +126,10 @@ pub struct PlayoutStatus {
     /// cause isn't known. Lets operator UIs answer "stalled/errored — why?"
     /// instead of just showing a color.
     pub detail: Option<String>,
+    /// True while the 1kHz test-tone pattern (see `PlayoutCommand::SetTestTone`)
+    /// is overriding the hardware output, independent of `state`.
+    #[serde(default)]
+    pub test_tone: bool,
 }
 
 /// Buffer thresholds (in ms of contiguous audio ahead of the playout head) that
@@ -198,6 +202,7 @@ impl ServerState {
                 device: None,
                 volume: 1.0,
                 detail: None,
+                test_tone: false,
             },
             frontier_seq: None,
             lead_ms: 0,

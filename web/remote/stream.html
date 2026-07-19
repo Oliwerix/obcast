@@ -121,9 +121,9 @@
   <div id="action-error" style="display:none; margin-top:12px; padding:8px 12px; border-radius:6px;
        background:#3a1e1e; color:#f87171; font-size:13px;"></div>
   <div class="row" style="margin-top:12px;">
-    <label style="font-size:13px; color:#b8bcc4;">Volume</label>
-    <input id="volume" type="range" min="0" max="150" value="100" />
-    <span id="volume-val" style="font-size:12px; color:#8a8f98;">100%</span>
+    <button id="btn-test-tone" title="1kHz sine: 2s both, then left, then right, looping">Play test tone</button>
+    <span id="test-tone-pill" class="pill stopped" style="display:none;">test tone</span>
+    <span class="note" style="margin:0;">1kHz &middot; both &rarr; L &rarr; R, looping</span>
   </div>
   <div class="row" style="margin-top:14px;">
     <div>
@@ -285,16 +285,18 @@ document.getElementById('btn-seek').onclick = () => {
   post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: secs } });
 };
 
-const volumeInput = document.getElementById('volume');
-const volumeVal = document.getElementById('volume-val');
-let volumeDebounce = null;
-volumeInput.oninput = () => {
-  volumeVal.textContent = volumeInput.value + '%';
-  clearTimeout(volumeDebounce);
-  volumeDebounce = setTimeout(() => {
-    post(`/api/${stream}/playout`, { cmd: 'set_volume', gain: volumeInput.value / 100 });
-  }, 150);
+const testToneBtn = document.getElementById('btn-test-tone');
+const testTonePill = document.getElementById('test-tone-pill');
+testToneBtn.onclick = () => {
+  const current = lastStatus?.server?.playout?.test_tone ?? false;
+  post(`/api/${stream}/playout`, { cmd: 'set_test_tone', enabled: !current });
 };
+function updateTestToneUi(active) {
+  testToneBtn.textContent = active ? 'Stop test tone' : 'Play test tone';
+  testTonePill.style.display = active ? 'inline-block' : 'none';
+  testTonePill.textContent = 'test tone playing';
+  testTonePill.className = 'pill ' + (active ? 'playing' : 'stopped');
+}
 
 // Human explanation for the pill. The server's `playout.detail` (added
 // alongside `PlayoutState::Error`) is authoritative when present — it names
@@ -373,10 +375,7 @@ function applyStatus(status) {
   document.getElementById('cur-rung').textContent = status.link.current_rung ?? '—';
   document.getElementById('gaps').textContent = status.link.gaps;
 
-  if (!volumeInput.matches(':active')) {
-    volumeInput.value = Math.round(s.playout.volume * 100);
-    volumeVal.textContent = volumeInput.value + '%';
-  }
+  updateTestToneUi(!!s.playout.test_tone);
 }
 
 // The pill's own 'error'/'stalled' classes already exist for server-reported

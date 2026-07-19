@@ -67,6 +67,72 @@ pub enum EngineCommand {
     Resume,
     Seek { position: Seq },
     SetVolume { gain: f32 },
+    SetTestTone { enabled: bool },
+}
+
+/// Which channel(s) a test-tone pattern section outputs to.
+#[derive(Clone, Copy)]
+enum ToneChannels {
+    Both,
+    Left,
+    Right,
+    Silent,
+}
+
+/// 1kHz sine test-tone pattern (CLAUDE.md web remote request): 2s both
+/// channels, 0.5s silence, 0.5s left, 0.5s silence, 0.5s right, 0.5s
+/// silence, looping. Every section duration is a whole number of 1kHz
+/// periods (1ms each), so the sine's phase is exactly zero at every section
+/// boundary and at the loop point — no clicks from gating the amplitude.
+const TEST_TONE_HZ: f64 = 1000.0;
+/// -18 dBFS: matches the meters' 0 VU reference point (see stream.html's
+/// METER_VU_REF_DBFS) so the tone reads as "0 VU" on the level meters.
+const TEST_TONE_AMPLITUDE: f32 = 0.125_892_5;
+const TEST_TONE_PATTERN: &[(f64, ToneChannels)] = &[
+    (2.0, ToneChannels::Both),
+    (0.5, ToneChannels::Silent),
+    (0.5, ToneChannels::Left),
+    (0.5, ToneChannels::Silent),
+    (0.5, ToneChannels::Right),
+    (0.5, ToneChannels::Silent),
+];
+
+/// Cumulative end-sample boundaries for `TEST_TONE_PATTERN` at a given
+/// sample rate, plus the total pattern length in samples — computed once at
+/// stream setup (sample rate is fixed for the stream's lifetime) rather than
+/// per-sample in the real-time audio callback.
+fn build_test_tone_pattern(sample_rate: u32) -> (Vec<(u64, ToneChannels)>, u64) {
+    let sr = sample_rate as f64;
+    let mut end = 0u64;
+    let bounds = TEST_TONE_PATTERN
+        .iter()
+        .map(|(secs, ch)| {
+            end += (secs * sr).round() as u64;
+            (end, *ch)
+        })
+        .collect();
+    (bounds, end.max(1))
+}
+
+fn test_tone_channels_at(pos: u64, bounds: &[(u64, ToneChannels)]) -> ToneChannels {
+    bounds
+        .iter()
+        .find(|(end, _)| pos < *end)
+        .map(|(_, ch)| *ch)
+        .unwrap_or(ToneChannels::Silent)
+}
+
+/// One interleaved (L, R) sample pair of the test tone at pattern position
+/// `pos` (already wrapped into `[0, total_samples)`).
+fn test_tone_sample(pos: u64, sample_rate: u32, bounds: &[(u64, ToneChannels)]) -> (f32, f32) {
+    let phase = 2.0 * std::f64::consts::PI * TEST_TONE_HZ * pos as f64 / sample_rate as f64;
+    let s = (phase.sin() as f32) * TEST_TONE_AMPLITUDE;
+    match test_tone_channels_at(pos, bounds) {
+        ToneChannels::Both => (s, s),
+        ToneChannels::Left => (s, 0.0),
+        ToneChannels::Right => (0.0, s),
+        ToneChannels::Silent => (0.0, 0.0),
+    }
 }
 
 /// Shared with the ingest/control layer so `ServerState` always reflects the
@@ -76,6 +142,9 @@ pub struct PlayoutHandle {
     paused: AtomicBool,
     position_seq: AtomicI64,  // -1 = none
     volume_millis: AtomicU32, // gain * 1000, fixed-point for atomic access
+    /// True while the test-tone pattern is overriding the hardware output
+    /// (see `EngineCommand::SetTestTone`), independent of `running`/`paused`.
+    test_tone: AtomicBool,
     // Per-channel dBFS VU/PPM/Peak ballistics of the playout output
     // (post-gain), stored as raw f32 bits since there's no stable AtomicF32.
     vu_l_bits: AtomicU32,
@@ -157,6 +226,10 @@ impl PlayoutHandle {
         self.volume_millis.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
+    pub fn test_tone(&self) -> bool {
+        self.test_tone.load(Ordering::Relaxed)
+    }
+
     /// `(vu_db_l, vu_db_r, ppm_db_l, ppm_db_r, peak_db_l, peak_db_r)` of the
     /// playout output — IEC ballistics in dBFS, ready to display without
     /// further conversion. `peak_db_{l,r}` is the true digital sample peak
@@ -213,6 +286,7 @@ pub fn spawn(
         paused: AtomicBool::new(false),
         position_seq: AtomicI64::new(-1),
         volume_millis: AtomicU32::new(1000),
+        test_tone: AtomicBool::new(false),
         vu_l_bits: AtomicU32::new(0),
         vu_r_bits: AtomicU32::new(0),
         ppm_l_bits: AtomicU32::new(0),
@@ -301,6 +375,11 @@ fn run_engine(
     let (mut producer, mut consumer) = ring.split();
 
     let volume_handle = handle.clone();
+    let (test_tone_bounds, test_tone_total_samples) = build_test_tone_pattern(sample_rate);
+    // Only ever touched by this callback, so a plain (non-atomic) counter is
+    // enough; reset to 0 whenever test tone is off so re-enabling it always
+    // starts the pattern fresh from "both channels."
+    let mut test_tone_pos: u64 = 0;
     // Persistent across callbacks: the 300 ms VU and 650 ms PPM time
     // constants span many callbacks, so these must not reset each call.
     let mut vu_l = obcast_proto::meter::Vu::new();
@@ -316,19 +395,32 @@ fn run_engine(
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
-            let gain = volume_handle.volume();
-            let filled = consumer.pop_slice(data);
-            // A partial fill means the ring ran dry this callback — real
-            // audio, but not all of it; still an underrun, since some of
-            // `data` below gets zero-padded either way.
-            volume_handle
-                .underrun
-                .store(filled < data.len(), Ordering::Relaxed);
-            for s in &mut data[..filled] {
-                *s *= gain;
-            }
-            for s in &mut data[filled..] {
-                *s = 0.0;
+            if volume_handle.test_tone.load(Ordering::Relaxed) {
+                // Test tone bypasses the segment ring buffer entirely — it's
+                // a hardware-output wiring check, independent of DVR/decode.
+                volume_handle.underrun.store(false, Ordering::Relaxed);
+                for frame in data.chunks_exact_mut(CHANNELS) {
+                    let (l, r) = test_tone_sample(test_tone_pos, sample_rate, &test_tone_bounds);
+                    frame[0] = l;
+                    frame[1] = r;
+                    test_tone_pos = (test_tone_pos + 1) % test_tone_total_samples;
+                }
+            } else {
+                test_tone_pos = 0;
+                let gain = volume_handle.volume();
+                let filled = consumer.pop_slice(data);
+                // A partial fill means the ring ran dry this callback — real
+                // audio, but not all of it; still an underrun, since some of
+                // `data` below gets zero-padded either way.
+                volume_handle
+                    .underrun
+                    .store(filled < data.len(), Ordering::Relaxed);
+                for s in &mut data[..filled] {
+                    *s *= gain;
+                }
+                for s in &mut data[filled..] {
+                    *s = 0.0;
+                }
             }
 
             // Feed the whole post-gain buffer, including any zero-padded
@@ -443,6 +535,24 @@ fn run_engine(
                 handle
                     .volume_millis
                     .store((gain.max(0.0) * 1000.0) as u32, Ordering::Relaxed);
+            }
+            Ok(EngineCommand::SetTestTone { enabled }) => {
+                handle.test_tone.store(enabled, Ordering::Relaxed);
+                if enabled {
+                    // The stream may not be playing at all yet (nothing ever
+                    // `Start`ed) — the test tone works independent of normal
+                    // playout, so it must (re)start the stream itself.
+                    let _ = stream.play();
+                } else if !handle.running.load(Ordering::Relaxed) {
+                    // Only pause if normal playout isn't also active; don't
+                    // stop real audio just because the tone was turned off.
+                    let _ = stream.pause();
+                }
+                handle.push_log(
+                    LogLevel::Info,
+                    format!("test tone {}", if enabled { "enabled" } else { "disabled" }),
+                );
+                tracing::info!(enabled, "playout test tone toggled");
             }
             Err(mpsc::error::TryRecvError::Disconnected) => return,
             Err(mpsc::error::TryRecvError::Empty) => {}
@@ -601,4 +711,91 @@ fn decode_to_pcm(path: &std::path::Path, sample_rate: u32) -> std::io::Result<Ve
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
+}
+
+#[cfg(test)]
+mod test_tone_tests {
+    use super::*;
+
+    const SR: u32 = 48_000;
+
+    #[test]
+    fn pattern_totals_four_point_five_seconds() {
+        let (_, total) = build_test_tone_pattern(SR);
+        assert_eq!(total, (4.5 * SR as f64) as u64);
+    }
+
+    #[test]
+    fn sections_land_on_the_documented_boundaries() {
+        let (bounds, _) = build_test_tone_pattern(SR);
+        let both_end = (2.0 * SR as f64) as u64;
+        let pause1_end = both_end + (0.5 * SR as f64) as u64;
+        let left_end = pause1_end + (0.5 * SR as f64) as u64;
+        let pause2_end = left_end + (0.5 * SR as f64) as u64;
+        let right_end = pause2_end + (0.5 * SR as f64) as u64;
+        let pause3_end = right_end + (0.5 * SR as f64) as u64;
+
+        assert!(matches!(
+            test_tone_channels_at(0, &bounds),
+            ToneChannels::Both
+        ));
+        assert!(matches!(
+            test_tone_channels_at(both_end - 1, &bounds),
+            ToneChannels::Both
+        ));
+        assert!(matches!(
+            test_tone_channels_at(both_end, &bounds),
+            ToneChannels::Silent
+        ));
+        assert!(matches!(
+            test_tone_channels_at(pause1_end, &bounds),
+            ToneChannels::Left
+        ));
+        assert!(matches!(
+            test_tone_channels_at(left_end, &bounds),
+            ToneChannels::Silent
+        ));
+        assert!(matches!(
+            test_tone_channels_at(pause2_end, &bounds),
+            ToneChannels::Right
+        ));
+        assert!(matches!(
+            test_tone_channels_at(right_end, &bounds),
+            ToneChannels::Silent
+        ));
+        assert_eq!(pause3_end, (4.5 * SR as f64) as u64);
+    }
+
+    #[test]
+    fn left_and_right_sections_zero_the_other_channel() {
+        let (bounds, _) = build_test_tone_pattern(SR);
+        // A quarter-period offset into the "left" section so the sample
+        // itself is non-zero (not just correctly gated at a zero crossing).
+        let left_start = (2.5 * SR as f64) as u64;
+        let quarter_period = (SR as f64 / TEST_TONE_HZ / 4.0) as u64;
+        let (l, r) = test_tone_sample(left_start + quarter_period, SR, &bounds);
+        assert!(l.abs() > 0.01);
+        assert_eq!(r, 0.0);
+
+        let right_start = (3.5 * SR as f64) as u64;
+        let (l, r) = test_tone_sample(right_start + quarter_period, SR, &bounds);
+        assert_eq!(l, 0.0);
+        assert!(r.abs() > 0.01);
+    }
+
+    #[test]
+    fn both_section_is_identical_on_both_channels_and_at_amplitude() {
+        let (bounds, _) = build_test_tone_pattern(SR);
+        let quarter_period = (SR as f64 / TEST_TONE_HZ / 4.0) as u64;
+        let (l, r) = test_tone_sample(quarter_period, SR, &bounds);
+        assert_eq!(l, r);
+        assert!((l - TEST_TONE_AMPLITUDE).abs() < 1e-4);
+    }
+
+    #[test]
+    fn silence_sections_are_exactly_zero() {
+        let (bounds, _) = build_test_tone_pattern(SR);
+        let pause_mid = (2.25 * SR as f64) as u64;
+        assert_eq!(test_tone_sample(pause_mid, SR, &bounds), (0.0, 0.0));
+    }
 }

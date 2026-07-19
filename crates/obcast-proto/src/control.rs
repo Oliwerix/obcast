@@ -41,6 +41,14 @@ pub enum PlayoutCommand {
     SetVolume {
         gain: f32,
     },
+    /// Toggle a 1kHz sine test tone on the hardware output, for checking
+    /// wiring/routing independent of the encoder link: 2s both channels,
+    /// 0.5s silence, 0.5s left, 0.5s silence, 0.5s right, 0.5s silence,
+    /// looping. Overrides normal playout audio while enabled; does not
+    /// change `start`/`stop`/`seek` state.
+    SetTestTone {
+        enabled: bool,
+    },
 }
 
 /// A selectable hardware audio output on the server.

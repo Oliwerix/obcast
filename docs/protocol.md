@@ -113,6 +113,11 @@ segment it's waiting on / what happened to it); `None` otherwise. This is
 what lets the web remote answer "stalled — why?" / "errored — why?" instead
 of just showing a color.
 
+`playout.test_tone` (`bool`, `#[serde(default)]`) reflects whether the 1kHz
+test-tone pattern (`set_test_tone`, above) is currently overriding the
+hardware output. It's orthogonal to `playout.state` — a pure
+wiring/routing check, never part of scheduler input.
+
 ### `ServerState` fields that drive the scheduler
 - `playout.state` + `playout.position_seq` — the anchor for all urgency.
 - `frontier_seq` — highest seq contiguously playable from the anchor.
@@ -170,6 +175,14 @@ A missing/incorrect header is rejected with `401 Unauthorized`.
 | `go_live`    | —                                | snap to the live edge               |
 | `set_device` | `{ device_id }`                  | not implemented — returns 501       |
 | `set_volume` | `{ gain }`                       | linear gain                         |
+| `set_test_tone` | `{ enabled }`                 | toggle the 1kHz test-tone pattern   |
+
+`set_test_tone` overrides the hardware output with a 1kHz sine test tone —
+2s both channels, 0.5s silence, 0.5s left, 0.5s silence, 0.5s right, 0.5s
+silence, looping — for checking output wiring/routing independent of the
+encoder link. It does not change `start`/`stop`/`seek` state; `PlayoutStatus`
+carries the current state as `test_tone: bool`, separate from `state`, so a
+stream can be `stopped` (or `playing`) with the tone on or off.
 
 `position` is a `PlayoutPosition`: `{"kind":"live"}`,
 `{"kind":"seq","value":123}`, or `{"kind":"seconds_behind_live","value":30}`.

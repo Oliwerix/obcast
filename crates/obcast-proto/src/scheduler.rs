@@ -334,6 +334,7 @@ mod tests {
                 device: None,
                 volume: 1.0,
                 detail: None,
+                test_tone: false,
             },
             frontier_seq: pos,
             lead_ms: 0,
