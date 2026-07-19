@@ -44,9 +44,12 @@
   .pill.down { background: #3a1e1e; color: #f87171; }
   table.status td { padding: 3px 10px 3px 0; font-size: 13px; color: #b8bcc4; }
   table.status td.v { color: #e6e6e6; font-variant-numeric: tabular-nums; }
+  .meter-ch { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+  .meter-ch:first-child { margin-top: 0; }
+  .meter-ch-label { width: 12px; font-size: 10px; color: #8a8f98; font-weight: 600; }
   .meter-wrap { position: relative; background: #14161a; border-radius: 4px; height: 10px; width: 220px; overflow: hidden; }
-  .meter-bar { height: 100%; background: linear-gradient(90deg, #4ade80, #facc15 80%, #f87171 95%); width: 0%; transition: width 60ms linear; }
-  .meter-ppm { position: absolute; top: 0; height: 100%; width: 2px; left: 0%; background: #ffffff; transition: left 40ms linear; }
+  .meter-bar { height: 100%; background: linear-gradient(90deg, #4ade80, #facc15 80%, #f87171 95%); width: 0%; }
+  .meter-ppm { position: absolute; top: 0; height: 100%; width: 2px; left: 0%; background: #ffffff; }
   .note { font-size: 12px; color: #8a8f98; margin-top: 6px; }
   audio, video { width: 100%; border-radius: 6px; margin-top: 8px; background: #000; }
   #zoomview-container { width: 100%; height: 100px; background: #0e0f12; border-radius: 6px; margin-top: 4px; cursor: pointer; overflow: hidden; }
@@ -96,9 +99,19 @@
   <div class="row" style="margin-top:14px;">
     <div>
       <div style="font-size:11px; color:#8a8f98; margin-bottom:3px;">LEVEL (VU / PPM)</div>
-      <div class="meter-wrap">
-        <div id="meter-vu" class="meter-bar"></div>
-        <div id="meter-ppm" class="meter-ppm"></div>
+      <div class="meter-ch">
+        <span class="meter-ch-label">L</span>
+        <div class="meter-wrap">
+          <div id="meter-vu-l" class="meter-bar"></div>
+          <div id="meter-ppm-l" class="meter-ppm"></div>
+        </div>
+      </div>
+      <div class="meter-ch">
+        <span class="meter-ch-label">R</span>
+        <div class="meter-wrap">
+          <div id="meter-vu-r" class="meter-bar"></div>
+          <div id="meter-ppm-r" class="meter-ppm"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -232,10 +245,12 @@ function applyStatus(status) {
   }
 }
 
-function applyMeters(vuDb, ppmDb) {
+function applyMeters(vuDbL, vuDbR, ppmDbL, ppmDbR) {
   const toPct = db => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
-  document.getElementById('meter-vu').style.width = toPct(vuDb) + '%';
-  document.getElementById('meter-ppm').style.left = toPct(ppmDb) + '%';
+  document.getElementById('meter-vu-l').style.width = toPct(vuDbL) + '%';
+  document.getElementById('meter-ppm-l').style.left = toPct(ppmDbL) + '%';
+  document.getElementById('meter-vu-r').style.width = toPct(vuDbR) + '%';
+  document.getElementById('meter-ppm-r').style.left = toPct(ppmDbR) + '%';
 }
 
 // --- Waveform: BBC peaks.js, driven by the server's real playhead ---
@@ -393,7 +408,7 @@ function connectWs() {
       applyStatus(msg);
       serverPlayer.updateFromStatus(msg.server);
     } else if (msg.type === 'meters') {
-      applyMeters(msg.vu_db, msg.ppm_db);
+      applyMeters(msg.vu_db_l, msg.vu_db_r, msg.ppm_db_l, msg.ppm_db_r);
     }
   };
   ws.onclose = () => setTimeout(connectWs, 1000);

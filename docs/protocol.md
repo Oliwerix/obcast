@@ -159,23 +159,23 @@ under a `value` key) — e.g. `{"type":"status","stream":"obshow","server":{...}
 
 Sent: a full `status` on connect and on every `ServerState` change (piggybacking
 the same broadcast the SSE link-plane feed uses), `position` when the playout
-head moves, and `meters` (`{vu_db, ppm_db}`, dBFS, on a fixed ~200ms tick).
-`ack` is defined in the schema for future use but not yet sent — commands go
-through the plain HTTP response of `POST /api/{stream}/playout` instead. The
-socket does not accept inbound commands; it is read-only from the client's
-perspective.
+head moves, and `meters` (`{vu_db_l, vu_db_r, ppm_db_l, ppm_db_r}`, dBFS, on a
+fixed ~50ms tick). `ack` is defined in the schema for future use but not yet
+sent — commands go through the plain HTTP response of `POST /api/{stream}/playout`
+instead. The socket does not accept inbound commands; it is read-only from the
+client's perspective.
 
-`meters` carries two independently-computed ballistics, both fed from the
-actual post-gain playout audio callback (`obcast_proto::meter`), meant to be
-superimposed on one meter widget: `vu_db` is IEC 60268-17 "standard volume
-indicator" (VU) — symmetric attack/release, 300 ms integration time, the slow
-"loudness" bar — and `ppm_db` is IEC 60268-10 Type I (DIN) peak programme
-meter — fast attack (5 ms burst reads 2 dB down, per the standard's
-integration-time definition), slow decay (-20 dB in 1.5 s) — a "flying PPM"
-peak needle that stays visible well after a transient has passed. This
-reflects what the server is *actually playing out* right now; the encoder
-client computes its own independent VU/PPM pair from the captured soundcard
-input for its own meters.
+`meters` carries two independently-computed ballistics per channel (L/R), both
+fed from the actual post-gain playout audio callback (`obcast_proto::meter`),
+meant to be superimposed on one meter widget per channel: `vu_db_{l,r}` is IEC
+60268-17 "standard volume indicator" (VU) — symmetric attack/release, 300 ms
+integration time, the slow "loudness" bar — and `ppm_db_{l,r}` is IEC 60268-10
+Type I (DIN) peak programme meter — fast attack (5 ms burst reads 2 dB down,
+per the standard's integration-time definition), slow decay (-20 dB in 1.5 s)
+— a "flying PPM" peak needle that stays visible well after a transient has
+passed. This reflects what the server is *actually playing out* right now;
+the encoder client computes its own independent per-channel VU/PPM pairs from
+the captured soundcard input for its own meters.
 
 ### Waveform
 ```

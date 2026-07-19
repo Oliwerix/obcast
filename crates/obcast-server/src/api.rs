@@ -27,7 +27,10 @@ use crate::{AppState, StreamHandle};
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(5);
 
 /// How often the WS pushes `Meters`, independent of state-change events.
-const METERS_INTERVAL: Duration = Duration::from_millis(200);
+/// 50ms (20Hz) keeps the web remote's meters feeling live rather than
+/// visibly stepping — the ballistics themselves (`obcast_proto::meter`)
+/// already do the smoothing, so there's no need for a slower tick.
+const METERS_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Gate on the control-plane token, same `X-Auth` convention and
 /// "no token configured = auth disabled" semantics as ingest's
@@ -230,8 +233,8 @@ async fn ws_session(stream: String, handle: Arc<StreamHandle>, mut socket: WebSo
                         }
                     }
                 }
-                let (vu_db, ppm_db) = handle.playout.meters();
-                let event = ControlEvent::Meters { vu_db, ppm_db };
+                let (vu_db_l, vu_db_r, ppm_db_l, ppm_db_r) = handle.playout.meters();
+                let event = ControlEvent::Meters { vu_db_l, vu_db_r, ppm_db_l, ppm_db_r };
                 if send_event(&mut socket, &event).await.is_err() {
                     return;
                 }

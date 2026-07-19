@@ -75,10 +75,12 @@ pub struct PlayoutHandle {
     paused: AtomicBool,
     position_seq: AtomicI64,  // -1 = none
     volume_millis: AtomicU32, // gain * 1000, fixed-point for atomic access
-    // dBFS VU/PPM ballistics of the playout output (post-gain), stored as raw
-    // f32 bits since there's no stable AtomicF32.
-    vu_bits: AtomicU32,
-    ppm_bits: AtomicU32,
+    // Per-channel dBFS VU/PPM ballistics of the playout output (post-gain),
+    // stored as raw f32 bits since there's no stable AtomicF32.
+    vu_l_bits: AtomicU32,
+    vu_r_bits: AtomicU32,
+    ppm_l_bits: AtomicU32,
+    ppm_r_bits: AtomicU32,
     /// Set by the output audio callback whenever it has to zero-pad because
     /// the ring buffer ran dry (decode/segment availability can't keep pace,
     /// or the stall-skip backstop is bridging a missing segment) — the
@@ -118,12 +120,14 @@ impl PlayoutHandle {
         self.volume_millis.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
-    /// `(vu_db, ppm_db)` of the playout output — IEC ballistics in dBFS,
-    /// ready to display without further conversion.
-    pub fn meters(&self) -> (f32, f32) {
+    /// `(vu_db_l, vu_db_r, ppm_db_l, ppm_db_r)` of the playout output — IEC
+    /// ballistics in dBFS, ready to display without further conversion.
+    pub fn meters(&self) -> (f32, f32, f32, f32) {
         (
-            f32::from_bits(self.vu_bits.load(Ordering::Relaxed)),
-            f32::from_bits(self.ppm_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.vu_l_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.vu_r_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.ppm_l_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.ppm_r_bits.load(Ordering::Relaxed)),
         )
     }
 
@@ -158,8 +162,10 @@ pub fn spawn(
         paused: AtomicBool::new(false),
         position_seq: AtomicI64::new(-1),
         volume_millis: AtomicU32::new(1000),
-        vu_bits: AtomicU32::new(0),
-        ppm_bits: AtomicU32::new(0),
+        vu_l_bits: AtomicU32::new(0),
+        vu_r_bits: AtomicU32::new(0),
+        ppm_l_bits: AtomicU32::new(0),
+        ppm_r_bits: AtomicU32::new(0),
         underrun: AtomicBool::new(false),
         device_name: RwLock::new(String::new()),
         cmd_tx,
@@ -223,8 +229,14 @@ fn run_engine(
     let volume_handle = handle.clone();
     // Persistent across callbacks: the 300 ms VU and 650 ms PPM time
     // constants span many callbacks, so these must not reset each call.
-    let mut vu = obcast_proto::meter::Vu::new();
-    let mut ppm = obcast_proto::meter::Ppm::new();
+    let mut vu_l = obcast_proto::meter::Vu::new();
+    let mut vu_r = obcast_proto::meter::Vu::new();
+    let mut ppm_l = obcast_proto::meter::Ppm::new();
+    let mut ppm_r = obcast_proto::meter::Ppm::new();
+    // Reused each callback to hand the ballistics a contiguous per-channel
+    // slice without allocating on the real-time audio thread.
+    let mut scratch_l: Vec<f32> = Vec::new();
+    let mut scratch_r: Vec<f32> = Vec::new();
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
@@ -245,14 +257,30 @@ fn run_engine(
 
             // Feed the whole post-gain buffer, including any zero-padded
             // underrun tail — that silence is genuinely being output.
-            vu.process(data, sample_rate);
-            ppm.process(data, sample_rate);
+            // `data` is interleaved L/R (CHANNELS == 2); deinterleave into
+            // scratch buffers so each channel gets its own ballistic.
+            scratch_l.clear();
+            scratch_r.clear();
+            for frame in data.chunks_exact(CHANNELS) {
+                scratch_l.push(frame[0]);
+                scratch_r.push(frame[1]);
+            }
+            vu_l.process(&scratch_l, sample_rate);
+            ppm_l.process(&scratch_l, sample_rate);
+            vu_r.process(&scratch_r, sample_rate);
+            ppm_r.process(&scratch_r, sample_rate);
             volume_handle
-                .vu_bits
-                .store(vu.value_db().to_bits(), Ordering::Relaxed);
+                .vu_l_bits
+                .store(vu_l.value_db().to_bits(), Ordering::Relaxed);
             volume_handle
-                .ppm_bits
-                .store(ppm.value_db().to_bits(), Ordering::Relaxed);
+                .vu_r_bits
+                .store(vu_r.value_db().to_bits(), Ordering::Relaxed);
+            volume_handle
+                .ppm_l_bits
+                .store(ppm_l.value_db().to_bits(), Ordering::Relaxed);
+            volume_handle
+                .ppm_r_bits
+                .store(ppm_r.value_db().to_bits(), Ordering::Relaxed);
         },
         |err| tracing::error!(error = %err, "playout stream error"),
         None,
