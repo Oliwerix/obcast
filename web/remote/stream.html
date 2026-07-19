@@ -268,7 +268,7 @@ function makeServerPlayer() {
     play() { post(`/api/${stream}/playout`, { cmd: 'resume' }); return Promise.resolve(); },
     pause() { post(`/api/${stream}/playout`, { cmd: 'pause' }); },
     seek(time) {
-      const secsBehindLive = Math.max(0, durationSecs - time);
+      const secsBehindLive = Math.max(0, Math.round(durationSecs - time));
       post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: secsBehindLive } });
     },
     isPlaying() { return playing; },
@@ -305,7 +305,7 @@ function initWaveform(json) {
       container: document.getElementById('zoomview-container'),
       waveformColor: GAP_COLOR,
       playheadColor: '#e6e6e6',
-      autoScroll: false,
+      autoScroll: true,
     },
     player: serverPlayer,
     waveformData: { json },

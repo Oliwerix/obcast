@@ -232,6 +232,16 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   just dropped the feed with no error); it now surfaces the failure and drops itself out of "live".
   Together this was the root cause of "start a stream, it says live, but nothing plays and the
   waveform never generates."
+- **Follow-up fix (web remote waveform).** Two more `stream.html` bugs, found watching a live show:
+  (1) `initWaveform()`'s zoomview was configured with `autoScroll: false`, so the visible waveform
+  window never followed the server's real playhead — a normal listen session outlasts the initial
+  visible slice (tens of seconds at the fixed 40ms/point scale) and the view then sits frozen
+  regardless of how far playout advances, reading as "the waveform always shows the same." Now
+  `autoScroll: true` (peaks.js's own default, which this had overridden). (2) The waveform's
+  click-to-seek adapter (`serverPlayer.seek(time)`) sent a raw fractional-second `time` value as
+  `PlayoutPosition::SecondsBehindLive`, which is a `u32` — any non-integer click position (e.g.
+  `4.192`) got rejected with a 422 `invalid type: floating point, expected u32`. Now rounded with
+  `Math.round()` before sending, matching the seconds-granularity the server type expects.
 - **M7 — PARTIAL.** Done: optional single-token ingest auth (`X-Auth`); SSE + uploader reconnect on
   drop; client-side abandon + a bounded stall timeout in `playout.rs` (a permanent segment gap no
   longer stalls the playout head indefinitely — verified live: an unfilled gap gets skipped after
