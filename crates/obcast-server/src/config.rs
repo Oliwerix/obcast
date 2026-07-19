@@ -11,7 +11,7 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
-    /// e.g. "ALSA", "JACK", "PulseAudio", "WASAPI", "CoreAudio".
+    /// e.g. "ALSA", "JACK", "PulseAudio", "PipeWire", "WASAPI", "CoreAudio".
     pub host: String,
     pub device: String,
 }

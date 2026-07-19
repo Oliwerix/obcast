@@ -43,20 +43,48 @@ setting rather than a per-run one:
 ```toml
 # obcast-server.toml
 [audio]
-host = "PulseAudio"   # cpal host / "audio subsystem": e.g. ALSA, JACK,
-                       # PulseAudio, WASAPI, CoreAudio. Empty = platform default.
+host = "PipeWire"      # cpal host / "audio subsystem": e.g. ALSA, JACK,
+                       # PulseAudio, PipeWire, WASAPI, CoreAudio. Empty =
+                       # platform default.
 device = ""            # output device name within that host. Empty = its default.
 ```
 
 The file (and each field) is optional — a missing file, or one that only sets
 `host`, just leaves the rest at the platform default. `ALSA`/`WASAPI`/
-`CoreAudio` are always available; `JACK` and `PulseAudio` are opt-in cargo
-features (off by default so a plain `cargo build` never needs `libjack`/
-`libpulse` dev headers):
+`CoreAudio` are always available; `JACK`, `PulseAudio` and `PipeWire` are
+opt-in cargo features (off by default so a plain `cargo build` never needs
+`libjack`/`libpulse`/`libpipewire` dev headers):
 
 ```
-cargo build -p obcast-server --features jack,pulseaudio
+cargo build -p obcast-server --features jack,pulseaudio,pipewire
 ```
+
+**Which of the three to enable** depends on what's actually running on the OB
+machine:
+
+- **PipeWire** is the sound server on most current Linux distros (Fedora,
+  current Ubuntu/Debian, Arch). Enable the `pipewire` feature — cpal talks to
+  `libpipewire` directly rather than through a compatibility shim, and when
+  it's compiled in, cpal's own platform-default host already prefers it over
+  PulseAudio/ALSA, so leaving `host` empty does the right thing.
+- Enable **`jack`** *in addition* if the operator wants JACK's port-graph
+  semantics — patching OBCast into other pro-audio JACK clients by name —
+  rather than a plain sink/source. On a PipeWire machine this talks to
+  PipeWire's own JACK-compatible interface (`pipewire-jack`); on a machine
+  running real `jackd` it talks to that instead. The native `pipewire`
+  feature above doesn't expose graph routing, so `jack` is the one to reach
+  for when that matters, not a replacement for it.
+- Enable **`pulseaudio`** for a machine that's genuinely PulseAudio without
+  PipeWire (older distros, minimal installs). It's redundant on a modern
+  PipeWire desktop, since `pipewire-pulse` is just a compatibility shim in
+  front of the same server the native `pipewire` feature already reaches
+  directly.
+- They're independent cpal hosts and can all be compiled in at once — the
+  only cost is needing the matching dev headers (`libpipewire-0.3-dev`,
+  `libjack-dev`/`libjack-jackd2-dev`, `libpulse-dev`) at build time on that
+  machine, not at runtime. When in doubt, build with all three
+  (`--features jack,pulseaudio,pipewire`) and pick per-machine via
+  `obcast-server.toml`'s `host`.
 
 If `host`/`device` don't match anything available at startup, playout logs an
 error and disables itself — same as the old "no default output device"
@@ -84,10 +112,12 @@ to exercise the whole pipeline without any audio hardware.
 
 The GUI (the default, non-`--headless` path) has an **Audio Subsystem**
 picker above the device list — pick a cpal host (ALSA/JACK/PulseAudio/
-WASAPI/CoreAudio, whatever's available) before picking a device from it. Like
-the device and channel map, the choice is persisted to the client's TOML
-config across restarts. `JACK`/`PulseAudio` need the same opt-in cargo
-features as the server: `cargo build -p obcast-client --features jack,pulseaudio`.
+PipeWire/WASAPI/CoreAudio, whatever's available) before picking a device from
+it. Like the device and channel map, the choice is persisted to the client's
+TOML config across restarts. `JACK`/`PulseAudio`/`PipeWire` need the same
+opt-in cargo features as the server:
+`cargo build -p obcast-client --features jack,pulseaudio,pipewire` (see the
+server section above for which to pick).
 
 ## Listen
 
@@ -143,8 +173,9 @@ explains why.
 - **No sound from playout, no errors**: check the server logs for "no matching
   audio output device" — playout silently no-ops without one. If you set
   `[audio]` in `obcast-server.toml`, double check `host`/`device` actually
-  match something `cargo run -p obcast-server --features jack,pulseaudio`
-  (if used) has compiled in on this machine.
+  match something
+  `cargo run -p obcast-server --features jack,pulseaudio,pipewire` (if used)
+  has compiled in on this machine.
 - **`ffmpeg: command not found`**: both crates shell out to it; it must be on
   the server's and the client's `PATH`.
 - **Web remote shows "link: down"**: the server marks a stream's link down

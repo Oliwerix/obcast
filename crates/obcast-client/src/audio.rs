@@ -47,8 +47,8 @@ fn device_name(d: &cpal::Device) -> String {
 }
 
 /// Names of the audio subsystems (cpal hosts) available on this platform —
-/// e.g. `["ALSA", "JACK", "PulseAudio"]` on Linux, `["WASAPI"]` (or
-/// `["WASAPI", "ASIO"]`) on Windows, `["CoreAudio"]` on macOS. Always
+/// e.g. `["ALSA", "JACK", "PulseAudio", "PipeWire"]` on Linux, `["WASAPI"]`
+/// (or `["WASAPI", "ASIO"]`) on Windows, `["CoreAudio"]` on macOS. Always
 /// non-empty: cpal guarantees at least one host per platform.
 pub fn list_hosts() -> Vec<String> {
     cpal::available_hosts()
@@ -73,8 +73,9 @@ fn resolve_host(name: &str) -> cpal::Host {
 
 /// Enumerate input devices on the given audio subsystem (cpal host); an
 /// empty `host_name` means the platform default. Works the same way on
-/// Windows (WASAPI), macOS (CoreAudio) and Linux (ALSA/JACK/PulseAudio) — no
-/// platform branching here, just which host the operator picked.
+/// Windows (WASAPI), macOS (CoreAudio) and Linux (ALSA/JACK/PulseAudio/
+/// PipeWire) — no platform branching here, just which host the operator
+/// picked.
 pub fn list_input_devices(host_name: &str) -> Vec<DeviceInfo> {
     let host = resolve_host(host_name);
     let Ok(devices) = host.input_devices() else {

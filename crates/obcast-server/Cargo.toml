@@ -18,9 +18,19 @@ cpal = "0.18"
 ringbuf = "0.5"
 toml = "1.1.3"
 
-# Off by default so a plain `cargo build` never needs libjack/libpulse dev
-# headers. Enable per-machine to pick more audio subsystems for playout in
-# `obcast-server.toml`, e.g. `cargo build -p obcast-server --features jack,pulseaudio`.
+# Off by default so a plain `cargo build` never needs libjack/libpulse/
+# libpipewire dev headers. Enable per-machine to pick more audio subsystems
+# for playout in `obcast-server.toml`, e.g.
+# `cargo build -p obcast-server --features jack,pulseaudio,pipewire`.
+# `pipewire` talks to libpipewire directly (cpal's native PipeWire host,
+# not a compatibility shim) — on a PipeWire host it's the one to prefer,
+# since cpal's own platform default already picks it over PulseAudio/ALSA
+# when compiled in. Still worth adding `jack` alongside it if the operator
+# wants JACK's port-graph semantics (patching into other pro-audio JACK
+# clients via `pipewire-jack`) rather than a plain sink/source — PipeWire's
+# native cpal host doesn't expose that graph. `pulseaudio` is mainly for
+# hosts that are actually PulseAudio (no PipeWire installed).
 [features]
 jack = ["cpal/jack"]
 pulseaudio = ["cpal/pulseaudio"]
+pipewire = ["cpal/pipewire"]
