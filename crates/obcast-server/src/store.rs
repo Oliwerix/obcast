@@ -94,15 +94,18 @@ impl DvrStore {
     /// the same pair is a no-op on the index (the caller may still overwrite
     /// the file, which is also safe).
     ///
+    /// `playout_pos` is the playout engine's current head, if any — eviction
+    /// must never drop a segment at or after it (see `evict_old`).
+    ///
     /// Returns the on-disk paths of any segments this record just evicted
     /// from the DVR window index — this type stays I/O-free (see module
     /// docs), so it's on the caller to actually delete them.
-    pub fn record(&mut self, rung: RungId, seq: Seq) -> Vec<PathBuf> {
+    pub fn record(&mut self, rung: RungId, seq: Seq, playout_pos: Option<Seq>) -> Vec<PathBuf> {
         let is_new = self.index.entry(seq).or_default().insert(rung);
         if is_new {
             self.rev += 1;
             return self
-                .evict_old()
+                .evict_old(playout_pos)
                 .into_iter()
                 .flat_map(|(seq, rungs)| rungs.into_iter().map(move |r| (seq, r)))
                 .map(|(seq, r)| self.segment_path(r, seq))
@@ -168,11 +171,28 @@ impl DvrStore {
     /// return the `(seq, rungs)` pairs removed, so `record()` can hand the
     /// caller the on-disk paths to reap. Stays pure/I/O-free itself — no
     /// files are touched here (see module docs).
-    fn evict_old(&mut self) -> Vec<(Seq, BTreeSet<RungId>)> {
+    ///
+    /// The window floor is also clamped to never pass `playout_pos`: the
+    /// time-based window alone assumes playout tracks close behind the live
+    /// edge, but a DVR seek/scrub (or a long pause) can leave the playout
+    /// head sitting near the trailing edge of the window. Without this
+    /// clamp, eviction and the playout head both advance in lockstep with
+    /// the live edge and can converge — deleting the very segment (or ones
+    /// just ahead of it) that playout is about to read, which then reads as
+    /// spurious mid-show dropouts once a session runs long enough to reach
+    /// that edge, not an actual network gap. Never evicting at/after the
+    /// head keeps the "no audio lost" invariant (CLAUDE.md §5) regardless of
+    /// how far behind live the head is; the DVR may temporarily hold more
+    /// than `dvr_window_ms` of audio as a result, which is the safe
+    /// direction to err in.
+    fn evict_old(&mut self, playout_pos: Option<Seq>) -> Vec<(Seq, BTreeSet<RungId>)> {
         let Some(live) = self.live_seq() else {
             return Vec::new();
         };
-        let floor = live.saturating_sub(self.dvr_window_segs);
+        let mut floor = live.saturating_sub(self.dvr_window_segs);
+        if let Some(pos) = playout_pos {
+            floor = floor.min(pos);
+        }
         let stale: Vec<Seq> = self.index.range(..floor).map(|(s, _)| *s).collect();
         let mut evicted = Vec::with_capacity(stale.len());
         for s in stale {
@@ -312,7 +332,7 @@ mod tests {
     fn stopped_anchors_on_live_edge_and_reports_contiguous_frontier() {
         let mut s = store(60_000);
         for seq in 0..=5 {
-            s.record(0, seq);
+            s.record(0, seq, None);
         }
         let state = s.build_server_state(stopped());
         assert_eq!(state.live_seq, Some(5));
@@ -326,7 +346,7 @@ mod tests {
     fn playing_anchor_walks_frontier_from_head() {
         let mut s = store(60_000);
         for seq in 0..=10 {
-            s.record(0, seq);
+            s.record(0, seq, None);
         }
         let playing = PlayoutStatus {
             state: PlayoutState::Playing,
@@ -344,7 +364,7 @@ mod tests {
     fn errored_anchors_on_live_edge_like_stopped() {
         let mut s = store(60_000);
         for seq in 0..=5 {
-            s.record(0, seq);
+            s.record(0, seq, None);
         }
         let state = s.build_server_state(errored("no matching audio output device"));
         assert_eq!(state.frontier_seq, Some(5));
@@ -355,7 +375,7 @@ mod tests {
     fn hole_breaks_frontier_but_abandon_heals_it() {
         let mut s = store(60_000);
         for seq in [0, 1, 3, 4] {
-            s.record(0, seq);
+            s.record(0, seq, None);
         }
         let playing = PlayoutStatus {
             state: PlayoutState::Playing,
@@ -375,9 +395,9 @@ mod tests {
     #[test]
     fn record_is_idempotent_and_bumps_rev_once() {
         let mut s = store(60_000);
-        s.record(0, 1);
+        s.record(0, 1, None);
         let rev_after_first = s.rev;
-        s.record(0, 1);
+        s.record(0, 1, None);
         assert_eq!(s.rev, rev_after_first);
     }
 
@@ -407,10 +427,32 @@ mod tests {
         // 4 segments * 2000ms window -> keep only the newest 4 seqs (plus fencepost).
         let mut s = store(8_000);
         for seq in 0..=20 {
-            s.record(0, seq);
+            s.record(0, seq, None);
         }
         assert!(s.dvr_start_seq().unwrap() > 0);
         assert_eq!(s.live_seq(), Some(20));
+    }
+
+    #[test]
+    fn eviction_never_drops_a_segment_at_or_after_the_playout_head() {
+        // Same 4-segment window as above, but playout has fallen behind (a
+        // DVR seek, or resuming after a pause) and sits right at the
+        // trailing edge. Without the clamp, eviction and the playout head
+        // both track the live edge and converge — deleting exactly what
+        // playout is about to read next.
+        let mut s = store(8_000);
+        for seq in 0..=20 {
+            s.record(0, seq, Some(2));
+        }
+        assert!(
+            s.dvr_start_seq().unwrap() <= 2,
+            "eviction must not pass the playout head (2), got {:?}",
+            s.dvr_start_seq()
+        );
+        assert!(
+            s.has_rung(2, 0),
+            "the segment playout is sitting on must survive eviction"
+        );
     }
 
     #[test]
@@ -422,7 +464,7 @@ mod tests {
         let mut s = store(8_000);
         let mut all_evicted = Vec::new();
         for seq in 0..=20 {
-            all_evicted.extend(s.record(0, seq));
+            all_evicted.extend(s.record(0, seq, None));
         }
         assert!(
             !all_evicted.is_empty(),
@@ -434,7 +476,7 @@ mod tests {
         }
         // A still-open write (no eviction yet) returns nothing to reap.
         let mut fresh = store(8_000);
-        assert!(fresh.record(0, 0).is_empty());
+        assert!(fresh.record(0, 0, None).is_empty());
     }
 
     #[test]
@@ -442,8 +484,8 @@ mod tests {
         // Re-recording an already-indexed (rung, seq) must not report it as
         // newly evicted — it never left the index in the first place.
         let mut s = store(60_000);
-        assert!(s.record(0, 1).is_empty());
-        assert!(s.record(0, 1).is_empty());
+        assert!(s.record(0, 1, None).is_empty());
+        assert!(s.record(0, 1, None).is_empty());
     }
 
     #[test]

@@ -96,7 +96,8 @@ pub async fn upload_segment(
 
     let (state, evicted) = {
         let mut store = handle.store.lock().await;
-        let evicted = store.record(rung, seq);
+        // Never let eviction outrun the playout head — see `DvrStore::evict_old`.
+        let evicted = store.record(rung, seq, handle.playout.position());
         (store.build_server_state(handle.playout_status()), evicted)
     };
     *handle.last_ingest.lock().await = Some(std::time::Instant::now());
