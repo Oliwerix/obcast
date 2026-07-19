@@ -111,14 +111,20 @@ pub enum ControlEvent {
     Status(Box<ControlStatus>),
     /// Playout head advanced (frequent, lightweight).
     Position { seq: Seq },
-    /// Per-channel VU/PPM meters for the playout bus, dBFS — see
-    /// `obcast_proto::meter` for the IEC 60268-17 (VU) / IEC 60268-10 Type I
-    /// (PPM) ballistics these are computed with.
+    /// Per-channel VU/PPM/Peak meters for the playout bus, dBFS — see
+    /// `obcast_proto::meter` for the IEC 60268-17 (VU), IEC 60268-10 Type I
+    /// (PPM), and true digital sample `Peak` ballistics these are computed
+    /// with. `peak_db_{l,r}` is the alternate flying-peak reading a client
+    /// can show instead of `ppm_db_{l,r}`.
     Meters {
         vu_db_l: f32,
         vu_db_r: f32,
         ppm_db_l: f32,
         ppm_db_r: f32,
+        #[serde(default)]
+        peak_db_l: f32,
+        #[serde(default)]
+        peak_db_r: f32,
     },
     /// A command was accepted/rejected.
     Ack {
