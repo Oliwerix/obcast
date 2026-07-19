@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use obcast_proto::state::{
     PlayoutStatus, RungId, SegCoverage, Seq, ServerState, StreamProfile, WaterLevels,
@@ -11,6 +12,13 @@ use obcast_proto::state::{
 
 /// How many segments ahead of the anchor `coverage` reports.
 const COVERAGE_WINDOW_SEGS: u64 = 64;
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 pub struct DvrStore {
     profile: StreamProfile,
@@ -37,7 +45,16 @@ impl DvrStore {
             water,
             dvr_window_segs,
             data_dir,
-            rev: 0,
+            // Seeded from wall-clock epoch millis rather than 0: a client that
+            // held a high `rev` from before a server restart must never see a
+            // *lower* rev from the fresh process, or `SharedState::update`
+            // (client-side) permanently rejects every post-restart state as
+            // "stale," pinning the encoder on data the restart already wiped
+            // (see CLAUDE.md §5/§8, the "rev-reset" gap). Epoch millis grows
+            // far faster than `record()`'s per-segment +1 could ever catch up
+            // to across a real restart, so a fresh process's rev is always
+            // ahead of whatever a client held from a prior one.
+            rev: epoch_millis(),
             index: BTreeMap::new(),
             abandoned: BTreeSet::new(),
         }
@@ -99,6 +116,13 @@ impl DvrStore {
 
     fn has_any(&self, seq: Seq) -> bool {
         self.index.get(&seq).is_some_and(|r| !r.is_empty()) || self.abandoned.contains(&seq)
+    }
+
+    /// Whether the encoder has explicitly given up on `seq` via `/abandon`.
+    /// Playout uses this to skip a permanently missing segment instead of
+    /// freezing the head on it forever (see `playout.rs::best_available_path`).
+    pub fn is_abandoned(&self, seq: Seq) -> bool {
+        self.abandoned.contains(&seq)
     }
 
     pub fn best_rung(&self, seq: Seq) -> Option<RungId> {
@@ -283,6 +307,27 @@ mod tests {
         let rev_after_first = s.rev;
         s.record(0, 1);
         assert_eq!(s.rev, rev_after_first);
+    }
+
+    #[test]
+    fn fresh_store_seeds_rev_from_wall_clock_not_zero() {
+        // A client holding a `rev` from a prior server incarnation must never
+        // see a fresh store's rev come in lower — otherwise it rejects every
+        // post-restart state as stale forever (the rev-reset deadlock).
+        let s = store(60_000);
+        assert!(
+            s.rev > 1_000_000_000_000,
+            "rev should look like epoch millis, not a small counter"
+        );
+    }
+
+    #[test]
+    fn is_abandoned_reflects_abandon_calls() {
+        let mut s = store(60_000);
+        assert!(!s.is_abandoned(3));
+        s.abandon(&[3]);
+        assert!(s.is_abandoned(3));
+        assert!(!s.is_abandoned(4));
     }
 
     #[test]

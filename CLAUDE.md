@@ -138,9 +138,13 @@ and `peaks.js` from CDNs.
   therefore trivial — never add stateful upload handshakes that break this.
 - **Never block the live edge / playout head.** Keep the segments about to be played flowing. If a
   segment can't be sent within its retry budget, abandon it (tell the server) rather than stall.
-  **Not yet enforced end-to-end** (verified by design review): the client never calls `/abandon`,
-  and `playout.rs` has no timeout/skip on a missing segment — a permanent gap freezes the playout
-  head indefinitely instead of skipping past it. See §8 M7.
+  **Enforced end-to-end** as of the M7 abandon/stall work: the uploader (`uploader.rs`) detects a
+  permanent continuity gap via `scheduler::stalled_continuity_seq` and calls `/abandon` after a
+  generous (20 s) grace period; `playout.rs` skips an abandoned segment immediately and, as a
+  backstop for an encoder that never calls `/abandon` at all (crashed/disconnected), skips anyway
+  after `3 * segment_ms` of a segment being neither playable nor abandoned. Verified live: a
+  deliberately-missing segment gets skipped by the timeout, and an explicit `/abandon` unsticks
+  playout immediately rather than waiting out the timeout.
 - **No audio lost to a short outage.** Segments persist on disk until acked and within the DVR
   window; on reconnect, resume from the oldest un-acked segment.
 - **Rungs are ordered low→high; rung 0 is the survival rung.** The scheduler always has a cheap
@@ -148,9 +152,10 @@ and `peaks.js` from CDNs.
 - **The server owns the published playlist** and rebuilds it from what it actually received.
 - **The feedback loop degrades safely.** If `ServerState` goes stale, the encoder assumes
   `ServerState::unknown()` (stopped, empty buffer) and plays it safe: low rung, protect the live edge.
-  **Not yet implemented** (verified by design review): there is no staleness timeout on the client's
-  held `ServerState` today, and a server restart resets `rev` to 0, which makes the client's rev-gate
-  reject the fresh post-restart state and pin the stale one. See §8 M7.
+  **Enforced** as of the M7 work: the client (`shared.rs`) now falls back to `ServerState::unknown()`
+  once its held state is more than 5 s old, and the server (`store.rs`) seeds a fresh `DvrStore`'s
+  `rev` from wall-clock epoch millis instead of 0, so a post-restart state can never look "older"
+  than a rev the client held from before the restart and get permanently rejected.
 
 ---
 
@@ -210,19 +215,40 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
 - **M5 — DONE.** Playout to hardware out via `cpal` (dedicated thread, ffmpeg decode, ring buffer,
   atomics for pos/state/vol/meters), start/stop + seek; head flows into `ServerState` (holds rather
   than skips on a not-yet-on-disk segment).
-- **M6 — DONE.** Control API (REST `status`/`playout` + WS status/position/meters) + web remote UI
-  (start/stop/seek, health panel, VU meters, waveform seek).
-- **M7 — PARTIAL / mostly OPEN.** Done: optional single-token ingest auth (`X-Auth`); SSE + uploader
-  reconnect on drop. Open: auth split (separate ingest/control/listen tokens); client-side
-  abandon + retry budget (**correctness risk, not just a missing feature** — a permanent segment gap
-  currently stalls the playout head indefinitely, see §5); stale-`ServerState` fallback (no staleness
-  timeout, plus a server-restart `rev`-reset bug that pins the client on stale state, see §5); server-side
-  DVR file reaping (`evict_old()` drops index entries but the underlying `.ts` files are never deleted —
-  unbounded disk growth on a long OB, verified by Rust review); reverse telemetry path (client sends
-  `EncoderState`; server populates `ControlStatus.encoder` + real `throughput_kbps`, incl. the
+- **M6 — DONE**, plus a correctness fix. Control API (REST `status`/`playout` + WS
+  status/position/meters) + web remote UI (start/stop/seek, health panel, VU meters, waveform seek).
+  Fixed: the shows overview's `live` flag used to mean only "an in-memory `StreamHandle` exists" —
+  which is auto-created by any read-only GET (`status`/`waveform`/`ws`) and never torn down, so a
+  stream whose encoder died (or was never fed at all, e.g. a typo'd name) still showed a green "live"
+  pill indefinitely. `live` now requires a segment within the last 5 s (`shows.rs`, matching
+  `api.rs`'s existing link-health window). The web remote's control buttons (`index.html`) were also
+  fire-and-forget — a rejected command (e.g. 409 "no segments buffered yet") failed with zero
+  feedback; they now surface the server's rejection reason in a visible banner. The client GUI
+  similarly used to go silently dead if its ffmpeg pipeline crashed mid-session (stdin write failure
+  just dropped the feed with no error); it now surfaces the failure and drops itself out of "live".
+  Together this was the root cause of "start a stream, it says live, but nothing plays and the
+  waveform never generates."
+- **M7 — PARTIAL.** Done: optional single-token ingest auth (`X-Auth`); SSE + uploader reconnect on
+  drop; client-side abandon + a bounded stall timeout in `playout.rs` (a permanent segment gap no
+  longer stalls the playout head indefinitely — verified live: an unfilled gap gets skipped after
+  `3 * segment_ms`, and an explicit `/abandon` unsticks it immediately); stale-`ServerState` fallback
+  (client now discards state older than 5 s, and the server seeds a fresh store's `rev` from
+  wall-clock epoch millis so a restart can no longer look "older" than what a client already held —
+  see §5 for both). Open: auth split (separate ingest/control/listen tokens) — note the control-plane
+  POST (`/api/{stream}/playout`) has **no auth check at all** today, unlike ingest's `X-Auth`, so
+  anyone reachable can stop/seek/volume any stream's hardware output; server-side DVR file reaping
+  (`evict_old()` drops index entries but the underlying `.ts` files are never deleted — unbounded disk
+  growth on a long OB, verified by Rust review); reverse telemetry path (client sends `EncoderState`;
+  server populates `ControlStatus.encoder` + real `throughput_kbps`, incl. the
   `POST /ingest/{stream}/heartbeat` route `docs/protocol.md` already documents — confirmed purely
   cosmetic/dashboard-visibility, not load-bearing for scheduling); packaging (server Docker, static
-  client binaries).
+  client binaries); an unbounded resource leak where any GET against a new/typo'd stream name spawns
+  a permanent OS thread + `DvrStore` with no idle reaping (only explicit `DELETE /api/shows/{name}`
+  tears one down — verified by adversarial review); `playout_state()` reports `Playing` from the
+  `running` flag alone, so it (and the web pill) can say "playing" while the output is genuinely
+  silent (cpal zero-fills underruns) — the new stall-skip logging at least surfaces *why*, but the
+  state itself is still not a lie-proof signal; `waveform.rs` silently swallows any per-segment decode
+  failure as a flat `(0,0)` line, indistinguishable from real silence.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
@@ -230,20 +256,26 @@ live channel-mapping capture (pick 2 of N device channels as L/R); K-14 + per-ch
 persisted TOML operator config; a `--headless` client path (ffmpeg captures a device or sine tone
 directly, no GUI); `README.md` + `docs/getting-started.md`.
 
-**What's next (priority order, re-ranked after Rust/design review — correctness risks before
-features):** (1) Client-side abandon + a timeout/skip in `playout.rs` for a missing segment, so a
-permanent gap can no longer stall the playout head indefinitely — this is the highest-priority item,
-it violates the §5 "never block the playout head" invariant today. (2) Stale-`ServerState` fallback:
-add a staleness timeout on the client's held state, and fix the server-restart `rev`-reset bug that
-pins the client on stale state — implements the §5 "degrades safely" invariant, which currently isn't
-enforced. (3) Server-side DVR file reaping so `.ts` files are actually deleted when evicted from the
-index (currently unbounded disk growth on a long OB). (4) Close the reverse telemetry path — client
+**What's next (priority order, re-ranked after Rust/design review and a follow-up adversarial
+review — correctness/security risks before features):** (1) Auth split, and in particular give
+`/api/{stream}/playout` *some* auth check — right now it has none at all, unlike ingest, so any
+reachable client can stop/seek/volume a live hardware output. (2) Fix the per-stream resource leak:
+any GET against a new stream name spawns a permanent OS thread + `DvrStore` with no idle timeout, so
+unauthenticated probing/typos leak threads forever — pair naturally with (1) since gating the routes
+that auto-vivify a stream also bounds this. (3) Server-side DVR file reaping so `.ts` files are
+actually deleted when evicted from the index (currently unbounded disk growth on a long OB). (4) Make
+`playout_state()`/`ServerState` distinguish "playing" from "playing but the head is stalled/skipping"
+— today a stalled or silently-underrunning playout still reports plain `Playing`. (5) Stop
+`waveform.rs` from swallowing per-segment decode failures as a flat `(0,0)` line; surface the failure
+instead so it isn't indistinguishable from real silence. (6) Close the reverse telemetry path — client
 sends `EncoderState` periodically, server fills `ControlStatus.encoder` + real `throughput_kbps`,
 wiring the documented `/ingest/{stream}/heartbeat` route (confirmed cosmetic/dashboard-only; the core
-server→encoder loop of §1 is intact and must stay that way). (5) Auth split. (6) Packaging (Docker +
-cargo-dist). (7) De-duplicate `StreamProfile` (currently copied in `server/main.rs`, `client/main.rs`,
-`client/gui/app.rs`) into one shared/config-driven source. (8) Lower priority: browser-side DVR scrub
-for listen-along; a true HE-AAC survival rung via `libfdk_aac` (native `aac` emits LC for all rungs).
+server→encoder loop of §1 is intact and must stay that way). (7) Packaging (Docker + cargo-dist).
+(8) De-duplicate `StreamProfile` (currently copied in `server/main.rs`, `client/main.rs`,
+`client/gui/app.rs`) into one shared/config-driven source. (9) Lower priority: browser-side DVR scrub
+for listen-along; a true HE-AAC survival rung via `libfdk_aac` (native `aac` emits LC for all rungs);
+add scheduler test coverage for the coverage-window-vs-far-behind-head case and misconfigured water
+levels, both identified as untested edge cases by adversarial review.
 
 ---
 

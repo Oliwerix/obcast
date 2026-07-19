@@ -247,6 +247,41 @@ fn already(out: &[UploadAction], seq: Seq) -> bool {
     out.iter().any(|a| a.seq == seq)
 }
 
+/// The first seq (if any) currently blocking continuity extension because the
+/// encoder has already moved past it (it's older than `encoded_seq`, the
+/// newest locally-produced segment) yet it exists at the low rung on neither
+/// the encoder's disk nor the server. Such a gap can never simply "arrive" —
+/// the encoder already produced everything up to `encoded_seq` and this seq
+/// isn't among it — so it needs an explicit `/abandon` rather than an
+/// indefinite retry (CLAUDE.md §5, "never block the playout head").
+///
+/// `encoded_seq` itself is deliberately excluded: it's still mid-write (see
+/// `inventory::scan`, which withholds the newest file per rung as
+/// not-yet-finalized), not missing.
+///
+/// Pure and side-effect free, like `plan_uploads` — this only identifies
+/// *where* a permanent gap is; the uploader decides *when* (after how long
+/// persisting) to actually call `/abandon`, and is the only place with I/O.
+pub fn stalled_continuity_seq(
+    server: &ServerState,
+    inv: &LocalInventory,
+    profile: &StreamProfile,
+) -> Option<Seq> {
+    let low = profile.low_rung();
+    let mut seq = anchor(server, inv);
+    while seq < inv.encoded_seq {
+        if inv.server_has_any(seq) {
+            seq += 1;
+            continue;
+        }
+        if inv.has_rung(seq, low) {
+            return None; // still on local disk — uploadable, not a permanent gap
+        }
+        return Some(seq);
+    }
+    None
+}
+
 fn finish(mut out: Vec<UploadAction>, max_actions: usize) -> Vec<UploadAction> {
     out.sort_by_key(|a| a.priority);
     out.truncate(max_actions);
@@ -402,6 +437,46 @@ mod tests {
         assert!(plan
             .iter()
             .all(|a| a.seq > 40 || a.reason != UploadReason::Upgrade));
+    }
+
+    #[test]
+    fn stalled_continuity_seq_is_none_when_frontier_is_healthy() {
+        let water = WaterLevels::default();
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let inv = inv_full(0, 50, &[]); // encoder holds everything locally
+        assert_eq!(stalled_continuity_seq(&srv, &inv, &profile()), None);
+    }
+
+    #[test]
+    fn stalled_continuity_seq_is_none_when_gap_is_still_uploadable() {
+        // Missing on the server but present locally — plain upload will fill
+        // it eventually, this is not a permanent gap.
+        let water = WaterLevels::default();
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let inv = inv_full(0, 50, &[]);
+        assert_eq!(stalled_continuity_seq(&srv, &inv, &profile()), None);
+    }
+
+    #[test]
+    fn stalled_continuity_seq_finds_a_genuine_permanent_gap() {
+        // Seq 20 exists on neither side, and the encoder has already moved on
+        // to seq 50 — it will never appear.
+        let water = WaterLevels::default();
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let mut inv = inv_full(0, 50, &[]);
+        inv.available.remove(&20);
+        assert_eq!(stalled_continuity_seq(&srv, &inv, &profile()), Some(20));
+    }
+
+    #[test]
+    fn stalled_continuity_seq_excludes_the_still_writing_newest_seq() {
+        // The gap is exactly at `encoded_seq` — that's the segment ffmpeg is
+        // still writing, not a permanent gap, so it must not be flagged.
+        let water = WaterLevels::default();
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let mut inv = inv_full(0, 20, &[]);
+        inv.available.remove(&20);
+        assert_eq!(stalled_continuity_seq(&srv, &inv, &profile()), None);
     }
 
     #[test]

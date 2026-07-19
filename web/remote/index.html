@@ -86,6 +86,8 @@
     <input id="seek-secs" type="number" min="0" value="30" style="width:70px;" />
     <button id="btn-seek">Seek</button>
   </div>
+  <div id="action-error" style="display:none; margin-top:12px; padding:8px 12px; border-radius:6px;
+       background:#3a1e1e; color:#f87171; font-size:13px;"></div>
   <div class="row" style="margin-top:12px;">
     <label style="font-size:13px; color:#b8bcc4;">Volume</label>
     <input id="volume" type="range" min="0" max="150" value="100" />
@@ -149,9 +151,41 @@ const stream = params.get('stream') || 'obshow';
 document.getElementById('stream-name').textContent = stream;
 
 const apiBase = '';
-const post = (path, body) => fetch(apiBase + path, {
-  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-});
+
+const actionError = document.getElementById('action-error');
+let actionErrorTimer = null;
+function showActionError(msg) {
+  actionError.textContent = msg;
+  actionError.style.display = 'block';
+  clearTimeout(actionErrorTimer);
+  actionErrorTimer = setTimeout(clearActionError, 8000);
+}
+function clearActionError() {
+  actionError.style.display = 'none';
+  actionError.textContent = '';
+}
+
+// Control commands are no longer fire-and-forget: a rejected command (e.g. 409
+// "no segments buffered yet" when nothing has been ingested for this stream)
+// surfaces its reason instead of silently doing nothing. Returns whether the
+// command was accepted so callers can react if they need to.
+const post = async (path, body) => {
+  try {
+    const resp = await fetch(apiBase + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const text = (await resp.text().catch(() => '')).trim();
+      showActionError(`Command failed (${resp.status}): ${text || resp.statusText}`);
+      return false;
+    }
+    clearActionError();
+    return true;
+  } catch (e) {
+    showActionError(`Command failed: ${e.message || e}`);
+    return false;
+  }
+};
 
 document.getElementById('btn-start').onclick = () => post(`/api/${stream}/playout`, { cmd: 'start', position: { kind: 'live' } });
 document.getElementById('btn-stop').onclick = () => post(`/api/${stream}/playout`, { cmd: 'stop' });
