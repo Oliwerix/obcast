@@ -6,7 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -39,12 +39,23 @@ struct ShowDiskStats {
 /// `modified_unix_ms` descending. Never touches `AppState::stream()` — a show
 /// with no in-memory `StreamHandle` must not get one just from being listed.
 pub async fn list_shows(State(app): State<Arc<AppState>>) -> Json<Vec<ShowInfo>> {
-    let live_names: std::collections::HashSet<String> = app
-        .stream_snapshot()
-        .await
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
+    // "live" means a segment actually arrived recently — not merely that an
+    // in-memory `StreamHandle` exists. A handle lingers after the encoder dies
+    // (and is auto-created just by opening the remote), so keying `live` on its
+    // existence reports dead/never-fed streams as live. Match the link-health
+    // staleness window used by `/api/{stream}/status`.
+    let now = Instant::now();
+    let mut live_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (name, handle) in app.stream_snapshot().await {
+        let recent = handle
+            .last_ingest
+            .lock()
+            .await
+            .is_some_and(|t| now.saturating_duration_since(t) < crate::api::STALE_AFTER);
+        if recent {
+            live_names.insert(name);
+        }
+    }
 
     let mut entries = match tokio::fs::read_dir(app.data_dir()).await {
         Ok(entries) => entries,
@@ -189,7 +200,10 @@ pub async fn delete_show(
                 // gone (e.g. never ingested a segment) — still success.
                 Ok(StatusCode::NO_CONTENT)
             } else {
-                Err(ApiError(StatusCode::NOT_FOUND, format!("no such show: {name}")))
+                Err(ApiError(
+                    StatusCode::NOT_FOUND,
+                    format!("no such show: {name}"),
+                ))
             }
         }
         Err(e) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
@@ -207,7 +221,10 @@ fn validate_show_name(name: &str) -> Result<(), ApiError> {
     if valid {
         Ok(())
     } else {
-        Err(ApiError(StatusCode::BAD_REQUEST, "invalid show name".into()))
+        Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid show name".into(),
+        ))
     }
 }
 
@@ -253,7 +270,10 @@ mod tests {
     #[test]
     fn duration_ms_from_seqs_spans_min_max_regardless_of_order_or_duplicates() {
         // Duplicates come from the same seq existing at multiple rungs.
-        assert_eq!(duration_ms_from_seqs(&[5, 2, 5, 9, 2], 2000), Some(8 * 2000));
+        assert_eq!(
+            duration_ms_from_seqs(&[5, 2, 5, 9, 2], 2000),
+            Some(8 * 2000)
+        );
     }
 
     #[test]

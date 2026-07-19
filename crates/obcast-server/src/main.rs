@@ -75,7 +75,12 @@ impl AppState {
             self.data_dir.join(name),
         )));
         let rungs = self.profile.rungs.iter().map(|r| r.id).collect();
-        let playout = playout::spawn(store.clone(), rungs, self.audio.clone());
+        let playout = playout::spawn(
+            store.clone(),
+            rungs,
+            self.audio.clone(),
+            self.profile.segment_ms,
+        );
 
         let (tx, _rx) = broadcast::channel(64);
         let handle = Arc::new(StreamHandle {

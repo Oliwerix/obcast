@@ -2,13 +2,17 @@
 //! priority order, fold feedback back into the shared `ServerState` model.
 //! All policy lives in the scheduler — this loop is mechanical.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use obcast_proto::scheduler::{plan_uploads, LocalInventory, SchedulerInput};
-use obcast_proto::state::{RungId, ServerState, StreamProfile};
+use serde::Serialize;
+
+use obcast_proto::scheduler::{
+    plan_uploads, stalled_continuity_seq, LocalInventory, SchedulerInput,
+};
+use obcast_proto::state::{RungId, Seq, ServerState, StreamProfile};
 
 use crate::inventory;
 use crate::shared::SharedState;
@@ -21,29 +25,91 @@ pub struct Config {
     pub profile: StreamProfile,
 }
 
+/// How long a permanent-looking continuity gap (missing on both the local
+/// disk and the server, with the encoder already past it) must persist
+/// before the uploader gives up and calls `/abandon`. Generous relative to a
+/// normal short outage — CLAUDE.md §5 promises "no audio lost to a short
+/// outage" — but bounded, so a gap that will truly never fill doesn't
+/// freeze the playout head forever (see `playout.rs`'s matching backstop).
+const ABANDON_AFTER: Duration = Duration::from_secs(20);
+
+#[derive(Serialize)]
+struct AbandonBody<'a> {
+    seqs: &'a [Seq],
+}
+
 pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>) {
     let rungs: Vec<RungId> = cfg.profile.rungs.iter().map(|r| r.id).collect();
+    let low = cfg.profile.low_rung();
     // Seed conservatively; corrected from real upload timing after the first send.
-    let mut throughput_kbps: u32 = cfg.profile.bitrate_of(cfg.profile.low_rung()) * 4;
+    let mut throughput_kbps: u32 = cfg.profile.bitrate_of(low) * 4;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
+
+    // Tracks the one continuity gap currently under an abandon countdown, and
+    // every seq this client has already told the server to give up on (so we
+    // don't re-POST `/abandon` for it every tick forever).
+    let mut stalled: Option<(Seq, tokio::time::Instant)> = None;
+    let mut abandoned_locally: BTreeSet<Seq> = BTreeSet::new();
 
     loop {
         tick.tick().await;
 
         let scan = inventory::scan(&cfg.out_dir, &rungs);
-        let server = shared.server.lock().await.clone();
-        let server_best: BTreeMap<_, _> = server
+        let server = shared.server_state_or_unknown().await;
+        let mut server_best: BTreeMap<_, _> = server
             .coverage
             .iter()
             .map(|c| (c.seq, c.best_rung))
             .collect();
+        // Overlay our own abandon decisions: the server's coverage reports
+        // these as missing (it has no media for them either), but as far as
+        // the scheduler is concerned they're now "satisfied" — nothing will
+        // ever fill them, so continuity should extend past them rather than
+        // staying stuck at the gap forever.
+        for &seq in &abandoned_locally {
+            server_best.insert(seq, Some(low));
+        }
 
-        let inv = LocalInventory {
+        let mut inv = LocalInventory {
             encoded_seq: scan.encoded_seq,
             oldest_seq: scan.oldest_seq,
             available: scan.available,
             server_best,
         };
+
+        if let Some(seq) = stalled_continuity_seq(&server, &inv, &cfg.profile) {
+            let fire = match stalled {
+                Some((s, since)) if s == seq => since.elapsed() >= ABANDON_AFTER,
+                _ => {
+                    stalled = Some((seq, tokio::time::Instant::now()));
+                    false
+                }
+            };
+            if fire {
+                let mut req = client
+                    .post(format!("{}/ingest/{}/abandon", cfg.base_url, cfg.stream))
+                    .json(&AbandonBody { seqs: &[seq] });
+                if let Some(token) = &cfg.ingest_token {
+                    req = req.header("X-Auth", token.clone());
+                }
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::warn!(seq, "gave up on permanently missing segment, abandoned");
+                        abandoned_locally.insert(seq);
+                        inv.server_best.insert(seq, Some(low));
+                        stalled = None;
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(seq, status = %resp.status(), "abandon request rejected, will retry");
+                    }
+                    Err(err) => {
+                        tracing::warn!(seq, error = %err, "abandon request failed, will retry");
+                    }
+                }
+            }
+        } else {
+            stalled = None;
+        }
 
         let actions = plan_uploads(&SchedulerInput {
             profile: &cfg.profile,

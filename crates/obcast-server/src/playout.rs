@@ -14,7 +14,7 @@
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
@@ -124,13 +124,25 @@ impl PlayoutHandle {
     }
 }
 
+/// Once a segment has been neither playable nor confirmed-abandoned for this
+/// long, playout skips it anyway rather than freezing the head forever — a
+/// backstop for when the encoder never calls `/abandon` at all (crashed,
+/// disconnected). Generous relative to a normal short outage (CLAUDE.md §5),
+/// but bounded: `3 * segment_ms` gives the encoder several retry ticks first.
+fn stall_timeout(segment_ms: u32) -> Duration {
+    Duration::from_millis(segment_ms.max(1) as u64 * 3)
+}
+
 /// Spawns the playout engine on its own OS thread and returns a handle for
 /// issuing commands and reading live status. `audio_cfg` picks the audio
-/// subsystem (cpal host) and output device from `obcast-server.toml`.
+/// subsystem (cpal host) and output device from `obcast-server.toml`;
+/// `segment_ms` sizes the stall timeout that skips a permanently missing
+/// segment instead of freezing the playout head.
 pub fn spawn(
     store: Arc<Mutex<DvrStore>>,
     rungs: Vec<RungId>,
     audio_cfg: AudioConfig,
+    segment_ms: u32,
 ) -> Arc<PlayoutHandle> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let handle = Arc::new(PlayoutHandle {
@@ -149,7 +161,17 @@ pub fn spawn(
     // `Handle::current()` on.
     let rt = tokio::runtime::Handle::current();
     let worker_handle = handle.clone();
-    std::thread::spawn(move || run_engine(rt, store, rungs, audio_cfg, worker_handle, cmd_rx));
+    std::thread::spawn(move || {
+        run_engine(
+            rt,
+            store,
+            rungs,
+            audio_cfg,
+            segment_ms,
+            worker_handle,
+            cmd_rx,
+        )
+    });
 
     handle
 }
@@ -159,6 +181,7 @@ fn run_engine(
     store: Arc<Mutex<DvrStore>>,
     rungs: Vec<RungId>,
     audio_cfg: AudioConfig,
+    segment_ms: u32,
     handle: Arc<PlayoutHandle>,
     mut cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
 ) {
@@ -229,11 +252,17 @@ fn run_engine(
     };
 
     let mut current: Option<Seq> = None;
+    // When the current seq first became neither playable nor abandoned; reset
+    // whenever the head moves (advance, seek, or a fresh start) so the clock
+    // always measures how long *this* seq has been stuck, not a stale one.
+    let mut stall_since: Option<Instant> = None;
+    let timeout = stall_timeout(segment_ms);
 
     loop {
         match cmd_rx.try_recv() {
             Ok(EngineCommand::Start { position }) => {
                 current = Some(position);
+                stall_since = None;
                 handle
                     .position_seq
                     .store(position as i64, Ordering::Relaxed);
@@ -244,6 +273,7 @@ fn run_engine(
             }
             Ok(EngineCommand::Stop) => {
                 current = None;
+                stall_since = None;
                 handle.running.store(false, Ordering::Relaxed);
                 handle.position_seq.store(-1, Ordering::Relaxed);
                 let _ = stream.pause();
@@ -259,6 +289,7 @@ fn run_engine(
             }
             Ok(EngineCommand::Seek { position }) => {
                 current = Some(position);
+                stall_since = None;
                 handle
                     .position_seq
                     .store(position as i64, Ordering::Relaxed);
@@ -281,22 +312,57 @@ fn run_engine(
                 // full second, so decode paces itself to playback instead of
                 // racing ahead of it unbounded.
                 if producer.vacant_len() > sample_rate as usize {
-                    let path = rt.block_on(async {
+                    let (path, abandoned) = rt.block_on(async {
                         let store = store.lock().await;
-                        best_available_path(&store, &rungs, seq)
+                        (
+                            best_available_path(&store, &rungs, seq),
+                            store.is_abandoned(seq),
+                        )
                     });
-                    // A segment not yet on disk holds the head in place —
-                    // advancing past it would silently skip audio instead of
-                    // waiting for the encoder, breaking the "no audio lost to
-                    // a short outage" invariant.
+
+                    let mut advance = false;
                     if let Some(path) = path {
+                        // Playable — the common case. A segment not yet on
+                        // disk holds the head in place rather than advancing
+                        // past it (see the `abandoned`/timeout branches
+                        // below for when it stops waiting), protecting "no
+                        // audio lost to a short outage" per CLAUDE.md §5.
                         match decode_to_pcm(&path, sample_rate) {
                             Ok(pcm) => push_all(&mut producer, &pcm),
                             Err(err) => {
                                 tracing::warn!(seq, error = %err, "decode failed, skipping segment")
                             }
                         }
+                        advance = true;
+                    } else if abandoned {
+                        // The encoder explicitly gave up on this seq via
+                        // `/abandon` — nothing will ever fill it, so waiting
+                        // any longer would freeze the head on a gap that's
+                        // already known permanent.
+                        tracing::warn!(seq, "segment abandoned by encoder, skipping");
+                        advance = true;
+                    } else {
+                        // Missing, not (yet) abandoned. Wait up to `timeout`
+                        // in case the encoder is just late/retrying, then
+                        // skip anyway — a backstop for the case where the
+                        // encoder crashed or disconnected and will never call
+                        // `/abandon` at all. Without this bound a permanent
+                        // gap freezes `position_seq` forever, violating the
+                        // "never block the playout head" invariant.
+                        let since = stall_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= timeout {
+                            tracing::warn!(
+                                seq,
+                                timeout_ms = timeout.as_millis() as u64,
+                                "segment missing past stall timeout, skipping to avoid freezing the playout head"
+                            );
+                            advance = true;
+                        }
+                    }
+
+                    if advance {
                         current = Some(seq + 1);
+                        stall_since = None;
                         handle
                             .position_seq
                             .store((seq + 1) as i64, Ordering::Relaxed);

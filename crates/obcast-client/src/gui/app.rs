@@ -182,6 +182,13 @@ impl ObcastApp {
                     self.shared.throughput_kbps()
                 ));
             }
+            if let Some(err) = self.shared.encoder_error() {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xe2, 0x3d, 0x3d),
+                    format!("⚠ {err}"),
+                );
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (text, color) = if self.live {
@@ -493,6 +500,12 @@ impl eframe::App for ObcastApp {
         // Meters need to visibly move; repaint at ~30fps regardless of input.
         ui.ctx().request_repaint_after(Duration::from_millis(33));
 
+        // If the encoder pipeline died on its own, drop back out of "live" so
+        // the button and status reflect reality (the error text stays visible).
+        if self.live && self.shared.take_encoder_failed() {
+            self.live = false;
+        }
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             self.status_bar(ui);
@@ -541,9 +554,12 @@ async fn controller(
                 match cmd {
                     Some(ControllerCmd::GoLive { profile, base_url, stream, ingest_token, out_dir, sample_rate }) => {
                         stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
+                        shared.clear_encoder_error();
 
                         if let Err(err) = tokio::fs::create_dir_all(&out_dir).await {
                             tracing::error!(error = %err, "failed to create buffer dir");
+                            shared.set_encoder_error(format!("failed to create buffer dir: {err}"));
+                            audio.set_live(false);
                             continue;
                         }
 
@@ -569,6 +585,8 @@ async fn controller(
                             }
                             Err(err) => {
                                 tracing::error!(error = %err, "failed to spawn ffmpeg");
+                                shared.set_encoder_error(format!("failed to start ffmpeg: {err}"));
+                                audio.set_live(false);
                             }
                         }
                     }
@@ -584,15 +602,28 @@ async fn controller(
             }
             pcm = pcm_rx.recv() => {
                 let Some(block) = pcm else { return };
+                let mut write_err = None;
                 if let Some(s) = stdin.as_mut() {
                     let mut bytes = Vec::with_capacity(block.len() * 4);
                     for sample in &block {
                         bytes.extend_from_slice(&sample.to_le_bytes());
                     }
                     if let Err(err) = s.write_all(&bytes).await {
-                        tracing::warn!(error = %err, "pcm write to ffmpeg failed, dropping feed");
-                        stdin = None;
+                        write_err = Some(err);
                     }
+                }
+                // A failed stdin write almost always means ffmpeg already
+                // exited (broken pipe). Rather than silently dropping the feed
+                // and leaving the GUI showing a dead "live", tear the pipeline
+                // down and surface the reason so the operator can re-Go-Live.
+                if let Some(err) = write_err {
+                    let detail = match child.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+                        Some(status) => format!("ffmpeg exited ({status}); live stopped"),
+                        None => format!("ffmpeg stdin write failed: {err}; live stopped"),
+                    };
+                    tracing::error!(error = %detail, "encoder pipeline died");
+                    shared.set_encoder_error(detail);
+                    stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
                 }
             }
         }

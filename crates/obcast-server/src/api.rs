@@ -22,9 +22,9 @@ use crate::playout::EngineCommand;
 use crate::waveform::{self, WaveformJson};
 use crate::{AppState, StreamHandle};
 
-/// A stream is considered "link down" once this long has passed since the
-/// last successful ingest.
-const STALE_AFTER: Duration = Duration::from_secs(5);
+/// A stream is considered "link down" (and no longer "live" in the shows
+/// overview) once this long has passed since the last successful ingest.
+pub(crate) const STALE_AFTER: Duration = Duration::from_secs(5);
 
 /// How often the WS pushes `Meters`, independent of state-change events.
 const METERS_INTERVAL: Duration = Duration::from_millis(200);
