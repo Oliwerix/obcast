@@ -162,6 +162,7 @@ async fn build_status(stream: &str, handle: &StreamHandle) -> ControlStatus {
             throughput_kbps,
             gaps,
         },
+        recent_log: handle.recent_log(),
     }
 }
 
@@ -198,6 +199,7 @@ pub async fn ws_handler(
 
 async fn ws_session(stream: String, handle: Arc<StreamHandle>, mut socket: WebSocket) {
     let mut state_rx = handle.tx.subscribe();
+    let mut log_rx = handle.log.subscribe();
     let mut meters_tick = tokio::time::interval(METERS_INTERVAL);
     let mut last_position = handle.playout.position();
 
@@ -221,6 +223,17 @@ async fn ws_session(stream: String, handle: Arc<StreamHandle>, mut socket: WebSo
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            msg = log_rx.recv() => {
+                match msg {
+                    Ok(entry) => {
+                        if send_event(&mut socket, &ControlEvent::Log(entry)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {} // LogSink outlives the socket; never actually closes
                 }
             }
             _ = meters_tick.tick() => {
@@ -281,6 +294,7 @@ pub async fn waveform_handler(
     };
 
     let store = handle.store.clone();
+    let log = handle.log.clone();
     let result = tokio::task::spawn_blocking(move || {
         let store = store.blocking_lock();
         let start = q
@@ -290,7 +304,7 @@ pub async fn waveform_handler(
         if end < start {
             return Err("end_seq must be >= start_seq");
         }
-        Ok(waveform::build(&store, store.profile(), start, end))
+        Ok(waveform::build(&store, store.profile(), start, end, &log))
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

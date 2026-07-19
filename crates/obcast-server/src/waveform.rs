@@ -17,8 +17,10 @@ use std::process::Stdio;
 
 use serde::Serialize;
 
+use obcast_proto::control::LogLevel;
 use obcast_proto::state::{RungId, Seq, StreamProfile};
 
+use crate::logs::LogSink;
 use crate::store::DvrStore;
 
 /// One waveform point per this many milliseconds of audio. Coarse enough to
@@ -59,7 +61,13 @@ pub struct WaveformJson {
 /// every segment — present or missing — occupies the same visual width.
 /// Blocking (spawns `ffmpeg` per segment) — call from a blocking task, not
 /// directly on the async runtime.
-pub fn build(store: &DvrStore, profile: &StreamProfile, start: Seq, end: Seq) -> WaveformJson {
+pub fn build(
+    store: &DvrStore,
+    profile: &StreamProfile,
+    start: Seq,
+    end: Seq,
+    log: &LogSink,
+) -> WaveformJson {
     let points_per_segment = (profile.segment_ms / POINT_MS).max(1) as usize;
     let samples_per_point = (DECODE_SAMPLE_RATE * POINT_MS / 1000).max(1);
 
@@ -83,6 +91,12 @@ pub fn build(store: &DvrStore, profile: &StreamProfile, start: Seq, end: Seq) ->
                         path = %path.display(),
                         "waveform: segment recorded in the DVR index but missing on disk"
                     );
+                    log.push(
+                        LogLevel::Warn,
+                        format!(
+                            "waveform: segment {seq} (rung {r}) recorded in the DVR index but missing on disk"
+                        ),
+                    );
                     (vec![(0, 0); points_per_segment], true)
                 } else {
                     match decode_mono_i16(&path, DECODE_SAMPLE_RATE) {
@@ -96,6 +110,12 @@ pub fn build(store: &DvrStore, profile: &StreamProfile, start: Seq, end: Seq) ->
                                 rung = r,
                                 path = %path.display(),
                                 "waveform: failed to decode segment, rendering as a flagged flat line"
+                            );
+                            log.push(
+                                LogLevel::Warn,
+                                format!(
+                                    "waveform: failed to decode segment {seq} (rung {r}), rendering as a flagged flat line"
+                                ),
                             );
                             (vec![(0, 0); points_per_segment], true)
                         }
@@ -219,7 +239,7 @@ mod tests {
             60_000,
             PathBuf::from("/tmp/obcast-waveform-test-gap"),
         );
-        let json = build(&store, &profile(), 0, 0);
+        let json = build(&store, &profile(), 0, 0, &LogSink::new());
         assert!(json.rungs.iter().all(|r| r.is_none()));
         assert!(
             json.decode_failed.iter().all(|f| !f),
@@ -239,7 +259,7 @@ mod tests {
             PathBuf::from("/tmp/obcast-waveform-test-missing"),
         );
         store.record(0, 0);
-        let json = build(&store, &profile(), 0, 0);
+        let json = build(&store, &profile(), 0, 0, &LogSink::new());
         assert!(json.rungs.iter().all(|r| *r == Some(0)));
         assert!(
             json.decode_failed.iter().all(|f| *f),

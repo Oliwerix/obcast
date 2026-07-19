@@ -63,6 +63,22 @@
   .pill.stalled   { background: #4a3a12; color: #facc15; }
   .pill.error     { background: #3a1e1e; color: #f87171; }
   .pill.live      { background: #1e4530; color: #4ade80; }
+  .pill.log-info  { background: #1c2f45; color: #7dd3fc; }
+  .pill.log-warn  { background: #4a3a12; color: #facc15; }
+  .pill.log-error { background: #3a1e1e; color: #f87171; }
+  #log-list {
+    max-height: 220px; overflow-y: auto; font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  #log-list .log-empty { color: #8a8f98; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .log-entry {
+    display: flex; gap: 8px; align-items: baseline; padding: 4px 0;
+    border-bottom: 1px solid #22262c;
+  }
+  .log-entry:last-child { border-bottom: none; }
+  .log-entry .log-time { flex: 0 0 auto; color: #8a8f98; font-variant-numeric: tabular-nums; }
+  .log-entry .pill { flex: 0 0 auto; }
+  .log-entry .log-msg { color: #e6e6e6; word-break: break-word; }
 </style>
 </head>
 <body>
@@ -145,6 +161,16 @@
     <tr><td>Live seq</td><td class="v" id="live-seq">—</td></tr>
     <tr><td>Lead (buffer ahead of head)</td><td class="v" id="lead-ms">—</td></tr>
   </table>
+</div>
+
+<div class="card">
+  <h2>Server log</h2>
+  <div class="note" style="margin-top:0; margin-bottom:10px;">
+    Warn/error status messages from the server (segment abandons, decode failures, playout stalls
+    and device errors) — the same events logged server-side, kept here for at-a-glance triage
+    without tailing server logs.
+  </div>
+  <div id="log-list"><div class="log-empty">No log entries yet.</div></div>
 </div>
 
 <div class="card">
@@ -357,6 +383,61 @@ function setConnectionLost() {
     'lost connection to the control server — reconnecting…';
 }
 
+// --- Server log panel: recent_log backlog (once, from the first `status`
+// event) + live ControlEvent::Log pushes. Capped to LOG_CAP entries in the
+// DOM to match the server's own backlog cap (obcast-server/src/logs.rs), so
+// a long-running browser tab doesn't grow this unbounded.
+const LOG_CAP = 200;
+const logListEl = document.getElementById('log-list');
+let logInitialized = false;
+
+function fmtLogTime(atMs) {
+  const d = new Date(atMs);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+function appendLogEntry(entry) {
+  const empty = logListEl.querySelector('.log-empty');
+  if (empty) empty.remove();
+
+  const row = document.createElement('div');
+  row.className = 'log-entry';
+
+  const time = document.createElement('span');
+  time.className = 'log-time';
+  time.textContent = fmtLogTime(entry.at_ms);
+
+  const badge = document.createElement('span');
+  badge.className = 'pill log-' + entry.level;
+  badge.textContent = entry.level;
+
+  const msg = document.createElement('span');
+  msg.className = 'log-msg';
+  msg.textContent = entry.message;
+
+  row.appendChild(time);
+  row.appendChild(badge);
+  row.appendChild(msg);
+  logListEl.appendChild(row);
+
+  while (logListEl.children.length > LOG_CAP) {
+    logListEl.removeChild(logListEl.firstChild);
+  }
+  logListEl.scrollTop = logListEl.scrollHeight;
+}
+
+function populateInitialLog(entries) {
+  logListEl.innerHTML = '';
+  if (!entries || entries.length === 0) {
+    logListEl.innerHTML = '<div class="log-empty">No log entries yet.</div>';
+    return;
+  }
+  entries.forEach(appendLogEntry);
+}
+
 function applyMeters(vuDbL, vuDbR, ppmDbL, ppmDbR) {
   const toPct = db => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
   document.getElementById('meter-vu-l').style.width = toPct(vuDbL) + '%';
@@ -520,8 +601,16 @@ function connectWs() {
     if (msg.type === 'status') {
       applyStatus(msg);
       serverPlayer.updateFromStatus(msg.server);
+      // Only seed the panel from the backlog once; after that, live entries
+      // arrive one at a time via the 'log' event below.
+      if (!logInitialized) {
+        populateInitialLog(msg.recent_log);
+        logInitialized = true;
+      }
     } else if (msg.type === 'meters') {
       applyMeters(msg.vu_db_l, msg.vu_db_r, msg.ppm_db_l, msg.ppm_db_r);
+    } else if (msg.type === 'log') {
+      appendLogEntry(msg);
     }
   };
   ws.onclose = () => { setConnectionLost(); setTimeout(connectWs, 1000); };

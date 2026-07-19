@@ -21,9 +21,11 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
 use tokio::sync::{mpsc, Mutex};
 
+use obcast_proto::control::LogLevel;
 use obcast_proto::state::{PlayoutState, RungId, Seq};
 
 use crate::config::AudioConfig;
+use crate::logs::LogSink;
 use crate::store::DvrStore;
 
 /// `Device` only exposes its name via `description()` (or the `Display`
@@ -101,6 +103,11 @@ pub struct PlayoutHandle {
     /// effort — read alongside `underrun` by `detail()`, not perfectly
     /// synchronized with it since they're set from different code paths.
     stall_reason: RwLock<Option<String>>,
+    /// Same `Arc<LogSink>` the owning `StreamHandle` holds (see
+    /// `AppState::create_stream_handle`) — lets the engine thread push
+    /// warn/error status lines to the web remote's log panel without a
+    /// circular reference back to `StreamHandle`.
+    log: Arc<LogSink>,
     cmd_tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
@@ -161,6 +168,14 @@ impl PlayoutHandle {
     pub fn send(&self, cmd: EngineCommand) {
         let _ = self.cmd_tx.send(cmd);
     }
+
+    /// Records a warn/error-level status message to the shared log sink
+    /// (see `StreamHandle::push_log`, which pushes to the same underlying
+    /// `Arc<LogSink>`). Additive to `tracing`, called alongside the existing
+    /// `tracing::warn!`/`error!` at each call site, not instead of it.
+    fn push_log(&self, level: LogLevel, message: impl Into<String>) {
+        self.log.push(level, message);
+    }
 }
 
 /// Once a segment has been neither playable nor confirmed-abandoned for this
@@ -182,6 +197,7 @@ pub fn spawn(
     rungs: Vec<RungId>,
     audio_cfg: AudioConfig,
     segment_ms: u32,
+    log: Arc<LogSink>,
 ) -> Arc<PlayoutHandle> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let handle = Arc::new(PlayoutHandle {
@@ -197,6 +213,7 @@ pub fn spawn(
         device_name: RwLock::new(String::new()),
         device_error: RwLock::new(None),
         stall_reason: RwLock::new(None),
+        log,
         cmd_tx,
     });
 
@@ -236,6 +253,7 @@ fn run_engine(
             audio_cfg.host, audio_cfg.device
         );
         tracing::error!(host = %audio_cfg.host, device = %audio_cfg.device, "{msg}; playout disabled");
+        handle.push_log(LogLevel::Error, format!("{msg}; playout disabled"));
         *handle.device_error.write().unwrap() = Some(msg);
         drain_forever(&mut cmd_rx);
         return;
@@ -244,6 +262,7 @@ fn run_engine(
     let Ok(supported) = device.default_output_config() else {
         let msg = "output device has no default config".to_string();
         tracing::error!("{msg}; playout disabled");
+        handle.push_log(LogLevel::Error, format!("{msg}; playout disabled"));
         *handle.device_error.write().unwrap() = Some(msg);
         drain_forever(&mut cmd_rx);
         return;
@@ -318,6 +337,7 @@ fn run_engine(
             let err_handle = handle.clone();
             move |err| {
                 tracing::error!(error = %err, "playout stream error");
+                err_handle.push_log(LogLevel::Error, format!("playout stream error: {err}"));
                 *err_handle.device_error.write().unwrap() =
                     Some(format!("output stream error: {err}"));
             }
@@ -329,6 +349,7 @@ fn run_engine(
         Err(err) => {
             let msg = format!("failed to build output stream: {err}");
             tracing::error!("{msg}; playout disabled");
+            handle.push_log(LogLevel::Error, format!("{msg}; playout disabled"));
             *handle.device_error.write().unwrap() = Some(msg);
             drain_forever(&mut cmd_rx);
             return;
@@ -426,6 +447,10 @@ fn run_engine(
                             }
                             Err(err) => {
                                 tracing::warn!(seq, error = %err, "decode failed, skipping segment");
+                                handle.push_log(
+                                    LogLevel::Warn,
+                                    format!("segment {seq} failed to decode, skipping: {err}"),
+                                );
                                 *handle.stall_reason.write().unwrap() =
                                     Some(format!("segment {seq} failed to decode: {err}"));
                             }
@@ -437,6 +462,10 @@ fn run_engine(
                         // any longer would freeze the head on a gap that's
                         // already known permanent.
                         tracing::warn!(seq, "segment abandoned by encoder, skipping");
+                        handle.push_log(
+                            LogLevel::Warn,
+                            format!("segment {seq} was abandoned by the encoder, skipping"),
+                        );
                         *handle.stall_reason.write().unwrap() =
                             Some(format!("segment {seq} was abandoned by the encoder"));
                         advance = true;
@@ -456,6 +485,13 @@ fn run_engine(
                                 seq,
                                 timeout_ms = timeout.as_millis() as u64,
                                 "segment missing past stall timeout, skipping to avoid freezing the playout head"
+                            );
+                            handle.push_log(
+                                LogLevel::Warn,
+                                format!(
+                                    "segment {seq} missing for over {}ms, skipped to avoid freezing the playout head",
+                                    timeout.as_millis()
+                                ),
                             );
                             *handle.stall_reason.write().unwrap() = Some(format!(
                                 "segment {seq} missing for over {}ms, skipped",
