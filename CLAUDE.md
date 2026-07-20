@@ -69,7 +69,7 @@ Chosen for single-binary robustness in the field and one shared type crate acros
 | Server framework   | `axum` (ingest, HLS origin, control REST, WS) + `tower-http`      |
 | Server → encoder feed | SSE over `axum`; also piggybacked on upload responses          |
 | Client audio I/O   | `cpal` (capture + playout device access)                          |
-| Encode / decode    | `ffmpeg` via subprocess, one process → N rungs. The low rung is HE-AAC via `libfdk_aac` (native `aac` can only emit LC) — auto-detected once at startup; if the local ffmpeg build lacks it, that rung silently falls back to AAC-LC at the same bitrate with a logged warning rather than failing the pipeline (bundling our own ffmpeg build with `libfdk_aac` baked in is a separate, still-open packaging task). `symphonia` for decode-only paths |
+| Encode / decode    | `ffmpeg` via subprocess, one process → N rungs. The low rung is HE-AAC via `libfdk_aac` (native `aac` can only emit LC) — auto-detected once at startup; if the local ffmpeg build lacks it, that rung silently falls back to AAC-LC at the same bitrate with a logged warning rather than failing the pipeline. A `libfdk_aac`-enabled ffmpeg is built per-platform in CI (`scripts/build-libfdk-ffmpeg*`, see "packaging" in §8) as a downloadable build artifact; wiring it into the actual release archive so it ships by default is the one remaining piece (also §8). `symphonia` for decode-only paths |
 | Client GUI         | `egui`/`eframe` (chosen, done); also a `--headless` CLI path with no GUI |
 | DVR store          | Filesystem segments + in-memory index (optionally `rusqlite`)     |
 | Web listen / UI    | `hls.js` + `peaks.js`, loaded from CDN by static `web/remote/index.html` (shows overview) + `stream.html` (per-show remote) — no bundler/build step |
@@ -261,27 +261,35 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   `PlayoutPosition::SecondsBehindLive`, which is a `u32` — any non-integer click position (e.g.
   `4.192`) got rejected with a 422 `invalid type: floating point, expected u32`. Now rounded with
   `Math.round()` before sending, matching the seconds-granularity the server type expects.
-- **M7 — PARTIAL.** Done: optional single-token ingest auth (`X-Auth`); SSE + uploader reconnect on
-  drop; client-side abandon + a bounded stall timeout in `playout.rs` (a permanent segment gap no
-  longer stalls the playout head indefinitely — verified live: an unfilled gap gets skipped after
-  `3 * segment_ms`, and an explicit `/abandon` unsticks it immediately); stale-`ServerState` fallback
-  (client now discards state older than 5 s, and the server seeds a fresh store's `rev` from
-  wall-clock epoch millis so a restart can no longer look "older" than what a client already held —
-  see §5 for both). Open: auth split (separate ingest/control/listen tokens) — note the control-plane
-  POST (`/api/{stream}/playout`) has **no auth check at all** today, unlike ingest's `X-Auth`, so
-  anyone reachable can stop/seek/volume any stream's hardware output; server-side DVR file reaping
-  (`evict_old()` drops index entries but the underlying `.ts` files are never deleted — unbounded disk
-  growth on a long OB, verified by Rust review); reverse telemetry path (client sends `EncoderState`;
-  server populates `ControlStatus.encoder` + real `throughput_kbps`, incl. the
-  `POST /ingest/{stream}/heartbeat` route `docs/protocol.md` already documents — confirmed purely
-  cosmetic/dashboard-visibility, not load-bearing for scheduling); packaging (server Docker, static
-  client binaries); an unbounded resource leak where any GET against a new/typo'd stream name spawns
-  a permanent OS thread + `DvrStore` with no idle reaping (only explicit `DELETE /api/shows/{name}`
-  tears one down — verified by adversarial review); `playout_state()` reports `Playing` from the
-  `running` flag alone, so it (and the web pill) can say "playing" while the output is genuinely
-  silent (cpal zero-fills underruns) — the new stall-skip logging at least surfaces *why*, but the
-  state itself is still not a lie-proof signal; `waveform.rs` silently swallows any per-segment decode
-  failure as a flat `(0,0)` line, indistinguishable from real silence.
+- **M7 — DONE**, across this and later sessions (this entry originally shipped marked PARTIAL with a
+  long "Open:" list below it; that list is stale — every item on it has since been fixed, in sessions
+  whose commits predate this document being updated to say so, which is itself the kind of
+  doc/reality drift this session's own CLAUDE.md pass went back and corrected throughout). Done:
+  optional single-token ingest auth (`X-Auth`); SSE + uploader reconnect on drop; client-side abandon
+  + a bounded stall timeout in `playout.rs` (a permanent segment gap no longer stalls the playout head
+  indefinitely — verified live: an unfilled gap gets skipped after `3 * segment_ms`, and an explicit
+  `/abandon` unsticks it immediately); stale-`ServerState` fallback (client now discards state older
+  than 5 s, and the server seeds a fresh store's `rev` from wall-clock epoch millis so a restart can no
+  longer look "older" than what a client already held — see §5 for both). Also fixed since: **auth
+  split** — a separate `OBCAST_CONTROL_TOKEN`/`control_token` gates `POST /api/{stream}/playout` via
+  `check_control_auth` (`api.rs`), checked before any stream lookup so a bad/missing token can't be
+  used to spin up a stream's playout thread just to get rejected (`AppState::control_token`,
+  `main.rs`) — distinct from ingest's `X-Auth` by design, since an OB site's upload token shouldn't
+  also be able to stop/seek/volume the hardware output. **Per-stream resource leak** — read-only
+  control/HLS routes (`status`/`waveform`/`ws`, HLS origin) use `AppState::stream_if_known`, which
+  never auto-vivifies a permanent OS thread + `DvrStore` for a name nobody has ingested into (unlike
+  `AppState::stream`, reserved for the ingest/media-plane entry points where "doesn't exist yet"
+  legitimately means "a new stream is starting"). **DVR file reaping** — `DvrStore::record()` returns
+  the on-disk paths any given call evicted from the index; `ingest.rs`'s `reap()` actually deletes them
+  via `tokio::fs::remove_file` (best-effort, logged on failure) instead of leaking them forever.
+  **Reverse telemetry** — `POST /ingest/{stream}/heartbeat` is wired to `DvrStore::set_encoder_state`,
+  and `api.rs::build_status` populates `ControlStatus.encoder` + real `throughput_kbps` from it.
+  **Stalled-vs-playing distinction** — `playout.rs`'s `playout_state()` has a `PlayoutState::Stalled`
+  variant, distinct from `Playing`, surfaced through `ServerState`/the web pill/`computeReason()` in
+  `stream.html`. **Waveform decode-failure surfacing** — `WaveformJson` carries a `decode_failed`
+  array parallel to `rungs`/`data`, distinguishing a real gap (no rung ever recorded) from an
+  indexed-but-undecodable segment, covered by tests in `waveform.rs`. Packaging (the one remaining item
+  from the old "Open:" list) is covered by the "Packaging" entry further down.
 - **Two more fixes (found chasing an operator report of "web remote *and* GUI both say HD but the
   server is audibly outputting low quality, and playback sometimes jumps around").** (1) The quality
   mismatch was deeper than it first looked. A first pass made `LinkHealth.current_rung` look up
@@ -370,8 +378,10 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   `obcast-client`. This generated the real `.github/workflows/release.yml`; don't hand-edit that file,
   edit `dist-workspace.toml` and regenerate instead. Also bundles the `libfdk_aac`-enabled ffmpeg from
   the ABR ladder rework entry above: `scripts/build-libfdk-ffmpeg.sh` (Linux/macOS, from source against
-  each platform's `fdk-aac` package) and `.ps1` (Windows, via vcpkg's `ffmpeg[fdk-aac]` port — more
-  reliable than hand-rolling a MinGW/MSVC source build) are wired into
+  each platform's `fdk-aac` package) and `-windows.sh` (Windows, an MSYS2/MinGW source build of both
+  `fdk-aac` and ffmpeg — a first attempt used vcpkg's `ffmpeg[fdk-aac]` port instead, which builds fine
+  but passes `--disable-ffmpeg` internally and so never produces the `ffmpeg.exe` CLI binary this
+  actually needs, only the libav* libraries for linking into other software) are wired into
   `.github/workflows/build-libfdk-ffmpeg.yml`, a `workflow_call`-able job matrix covering all four
   `dist` targets. Kept as its own workflow rather than folded into the dist-generated one since `dist`
   has no hook for bundling an externally-built, non-Cargo binary artifact.
@@ -451,7 +461,8 @@ native mobile apps (web only); multi-tenant/multi-stream orchestration.
 ## 11. Glossary
 
 **OB** outside broadcast · **ABR ladder** set of bitrate rungs · **rung/rendition** one bitrate
-variant (rung 0 = survival) · **segment** one short media file, keyed `(rung, seq)` · **DVR window**
+variant (the lowest-bitrate *enabled* rung is the survival rung — not necessarily id `0`; see §5) ·
+**segment** one short media file, keyed `(rung, seq)` · **DVR window**
 rolling buffer of retained segments · **live edge** newest segment · **playout head** the segment
 being rendered to the server's HW output · **frontier** highest seq contiguously playable from the
 head · **lead** ms of contiguous audio ahead of the head · **water levels** low/target/high buffer
