@@ -65,7 +65,18 @@ pub struct LinkHealth {
     pub connected: bool,
     /// Age of the newest received segment.
     pub last_segment_age_ms: u32,
-    /// Rung the encoder is currently prioritizing, if known.
+    /// The rung actually reaching the playout head right now (looked up at
+    /// `ServerState.playout.position_seq` in `ServerState.coverage`), i.e.
+    /// on-air ground truth for the web remote's "Current rung" readout —
+    /// mirrors what the client GUI's own on-air quality estimate shows (see
+    /// `SharedState::playing_quality`). Deliberately *not* the newest/live
+    /// segment's rung: the playout head lags the live edge by design (DVR),
+    /// so during a bandwidth dip that recovers, the newest segment can be HD
+    /// while the head is still seconds behind, playing out low-rung audio
+    /// recorded during the dip — showing the live-edge rung here reads as a
+    /// straight quality lie to whoever is watching this to know what's on
+    /// air right now. `None` while stopped or if the head's seq has fallen
+    /// out of the bounded `coverage` window.
     pub current_rung: Option<RungId>,
     pub throughput_kbps: u32,
     /// Count of permanent gaps in the DVR window.
