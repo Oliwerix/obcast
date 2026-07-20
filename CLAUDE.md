@@ -411,30 +411,32 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   was deleted and inlined at its one call site. `client/gui/app.rs`'s `profile(&self)` method was left
   as-is — it's a genuine 5-call-site accessor now doing real work (`.filtered()` against the operator's
   enabled-rungs config, from the ABR ladder rework above), not redundant indirection.
-- **Fixed: waveform decode starving ingest/playout of the DVR store lock.** Reported as playout
-  stalling worse and worse a couple of minutes into a session, on a LAN (so not a real bandwidth
-  problem), with the server "kinda stopping responding." Root cause: `GET /api/{stream}/waveform`
-  (`api.rs::waveform_handler`) defaults to the full DVR window when the web remote's `applyWaveform()`
-  calls it unbounded every 5s (`web/remote/stream.html`), and `waveform::build` decoded every segment
-  in range via a **serial `ffmpeg` subprocess per segment** — dozens of spawns for a multi-minute
-  buffer, as the function's own doc comment already warned. The whole decode ran inside
-  `spawn_blocking` while holding `store.blocking_lock()` for its entire duration — the same
-  `Arc<Mutex<DvrStore>>` that segment ingest (`ingest.rs`) and the playout engine's own per-tick
-  segment-availability check (`playout.rs`, `rt.block_on(store.lock().await ...)` every 20ms) both
-  need. As the DVR buffer grew with session length, each poll's decode (and thus lock-hold) grew with
-  it, increasingly starving both ingest and playout of the lock — surfacing exactly as the playout
-  stall reason text `"waiting on segment N from the encoder"` even though the segment was already on
-  disk the whole time, just unreachable because the index lookup needed the same lock a five-second-old
-  waveform poll was still sitting on. Fixed by splitting the handler into `waveform::snapshot_index`
-  (cheap, index-only `(seq, rung, path)` lookups, done under the lock) and `waveform::build_from_index`
-  (the actual `ffmpeg` decode loop, taking an owned snapshot with no `DvrStore` reference at all) — the
-  `MutexGuard` in `api.rs::waveform_handler` now drops before any decode runs. The web remote still
-  polls the unbounded full-window range every 5s and the decode cost itself is unchanged (still one
-  `ffmpeg` spawn per segment, still grows with session length) — only the lock-holding is fixed. If the
-  waveform card's own responsiveness (not playout) becomes the next complaint on a long-running show,
-  the fix is on the client side: have `stream.html` pass `start_seq`/`end_seq` (already accepted by the
-  endpoint, just never used by the caller) to fetch only the newly-arrived tail instead of re-decoding
-  the whole buffer every poll.
+- **Fixed a still-live "server has HD, plays low quality" report — the upgrade tier was gated on the
+  wrong boundary.** The earlier "Two more fixes" entry above made `playing_rung` ground truth so
+  dashboards stopped *lying* about the rung on air, but didn't touch why the *wrong rung actually plays*
+  in the first place — that turned out to be a live, structural bug, not a fixed-but-still-reported one.
+  `scheduler.rs`'s Tier C (quality upgrades) only ever looked ahead of `anchor`/`position_seq` — the
+  *audible* head — when deciding which seqs were still worth upgrading. But `playout.rs`'s decode
+  pipeline feeds segments to ffmpeg many seconds ahead of real-time output (`RING_SEGMENTS = 8`, ~16s at
+  the 2s default) to survive slowdowns without an audible underrun, and a seq's rung is locked in the
+  moment it's fed — well before `position_seq` ever reaches it. Under the default water levels
+  (`high_ms = 20_000`), Tier C's own look-ahead window (`high_ms / seg_ms` = 10 segments/20s ahead of
+  `anchor`) overlaps almost entirely with what the engine has, in steady state, already fed — so an
+  upgrade upload routinely "succeeded" (HD really did land on the server) for a seq that could no longer
+  ever be played at that rung, because playout's feed loop had already grabbed the low rung Tier B
+  uploads first and locked it in. This is exactly the symptom reported: HD visibly present on the
+  server/DVR, low quality audibly on air, persistently rather than as a brief transient. Fixed by
+  threading the engine's actual feed-ahead boundary through the feedback loop: `PlayoutHandle::fed_seq`
+  (new atomic, set alongside `enqueue_pending` and reset on `Start`/`Stop`/`Seek` next to
+  `position_seq`/`playing_rung`) tracks the highest seq already fed; exposed as
+  `PlayoutStatus::fed_seq`/`ServerState.playout.fed_seq` (`#[serde(default)]`, so an older server talking
+  to a newer client — or vice versa — just falls back to the previous `anchor`-only gating rather than
+  breaking). Tier C's candidate range now starts strictly after `max(anchor, fed_seq)` instead of just
+  `anchor`, so it only ever spends upload budget on seqs an upgrade can actually still affect — covered
+  by two new `scheduler.rs` tests (`upgrades_never_target_a_seq_already_fed_to_the_decoder`,
+  `upgrades_yield_nothing_when_the_whole_comfortable_window_is_already_fed`) exercising both the partial-
+  overlap and fully-overlapping-window cases. `docs/protocol.md` updated in the same change (wire-compat
+  rule, §9).
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
