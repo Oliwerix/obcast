@@ -282,11 +282,22 @@ fn run_engine(
     // small `lo` segment, but not always enough for a `hd` one under any load
     // (competing disk/CPU from the encoder side, a slow spawn, etc.), which
     // surfaced as spurious "buffer underrun" stalls specifically on the high
-    // rung. Sizing off `segment_ms` instead gives decode a full segment's
-    // wall-clock time of slack (see the refill gate below) regardless of
-    // sample rate or segment length.
+    // rung. Sizing off `segment_ms` gives decode a full segment's wall-clock
+    // time of slack per refill (see the gate below) regardless of sample rate
+    // or segment length — but a `3`-segment ring (6s at the 2s default) still
+    // wasn't enough headroom: spawning a fresh ffmpeg process per segment on
+    // a machine where the encoder, its own ffmpeg, and playout's decode are
+    // all competing for the same CPU (the normal case for local dev, running
+    // client+server on one box) can occasionally push a single segment's
+    // decode past its 2s budget, draining the ring faster than a 3-segment
+    // margin can absorb — observed live as a stall that recovers on its own
+    // once decode catches back up, not a real data gap (confirmed both sides
+    // still had the segment on disk throughout). `RING_SEGMENTS` widens that
+    // margin so decode can work further ahead of playback when resources
+    // allow, banking more slack for the next contended patch.
+    const RING_SEGMENTS: usize = 8;
     let segment_samples = (segment_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
-    let ring = HeapRb::<f32>::new(segment_samples * 3);
+    let ring = HeapRb::<f32>::new(segment_samples * RING_SEGMENTS);
     let (mut producer, mut consumer) = ring.split();
 
     let volume_handle = handle.clone();
