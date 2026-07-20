@@ -5,19 +5,30 @@
 //! the next `ServerState` publish.
 //!
 //! `symphonia` has no MPEG-TS demuxer, so segments are decoded to raw PCM via
-//! an `ffmpeg` subprocess (already a hard runtime dependency for the
-//! encoder) and fed into cpal through a lock-free ring buffer, one segment
-//! at a time, in playout order. The `cpal::Stream` is `!Send`, so the whole
-//! engine — decode, ring buffer, and the stream itself — lives on one
-//! dedicated OS thread and is driven by commands over a channel.
+//! a single long-lived `ffmpeg` subprocess (already a hard runtime dependency
+//! for the encoder) and fed into cpal through a lock-free ring buffer, in
+//! playout order. Segment `.ts` bytes are written to that one process's
+//! stdin as each becomes needed and its PCM is read continuously off stdout
+//! by a dedicated reader thread — MPEG-TS is splice-friendly, so concatenating
+//! segments into one continuous stream keeps the AAC decoder's state alive
+//! across segment boundaries (previously each segment spawned and tore down
+//! its own ffmpeg process; besides the repeated spawn overhead, that reset
+//! the decoder every 2s, which is a well-known source of audible pops from
+//! AAC priming/padding samples reappearing at every segment edge). The
+//! session is only torn down and respawned on `Start`/`Seek`, where the
+//! discontinuity means the old process's buffered state is no longer wanted
+//! anyway. The `cpal::Stream` is `!Send`, so the whole engine — decode
+//! session, ring buffer, and the stream itself — lives on one dedicated OS
+//! thread (plus its reader thread) and is driven by commands over a channel.
 
-use std::process::Stdio;
+use std::io::{Read, Write};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
 use tokio::sync::{mpsc, Mutex};
 
@@ -186,6 +197,142 @@ fn stall_timeout(segment_ms: u32) -> Duration {
     Duration::from_millis(segment_ms.max(1) as u64 * 3)
 }
 
+/// A live decode pipeline: one `ffmpeg` process reading a continuous MPEG-TS
+/// byte stream on stdin and writing continuous interleaved f32 PCM on
+/// stdout, plus the dedicated thread draining that stdout into the playout
+/// ring buffer. Torn down and replaced wholesale on `Start`/`Seek` (see
+/// module docs); left alone across `Pause`/`Resume`, where ffmpeg just blocks
+/// on its next stdin read with no CPU cost.
+struct DecoderSession {
+    child: Child,
+    stdin: ChildStdin,
+    reader: std::thread::JoinHandle<ringbuf::HeapProd<f32>>,
+}
+
+/// Spawns a fresh decode session and hands the ring's producer half to its
+/// reader thread. `producer` is always returned to the caller — inside the
+/// `Ok` session on success, or alongside the error on failure (spawning a
+/// subprocess is the only fallible step, before `producer` is touched at
+/// all) — so a failed spawn never silently drops the only handle to the
+/// ring and leaves playout permanently mute.
+fn spawn_decoder_session(
+    sample_rate: u32,
+    mut producer: ringbuf::HeapProd<f32>,
+) -> Result<DecoderSession, (std::io::Error, ringbuf::HeapProd<f32>)> {
+    let child = std::process::Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-f")
+        .arg("mpegts")
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-f")
+        .arg("f32le")
+        .arg("-ac")
+        .arg(CHANNELS.to_string())
+        .arg("-ar")
+        .arg(sample_rate.to_string())
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(err) => return Err((err, producer)),
+    };
+    let stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        // Bytes read but not yet forming a complete f32 (4 bytes); carried
+        // over to the front of the next read since `read()` gives no
+        // alignment guarantee against our sample boundaries.
+        let mut leftover: Vec<u8> = Vec::with_capacity(4);
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break, // ffmpeg exited or the pipe broke
+                Ok(n) => {
+                    leftover.extend_from_slice(&buf[..n]);
+                    let complete = leftover.len() - leftover.len() % 4;
+                    if complete == 0 {
+                        continue;
+                    }
+                    let samples: Vec<f32> = leftover[..complete]
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    push_all(&mut producer, &samples);
+                    leftover.drain(..complete);
+                }
+            }
+        }
+        producer
+    });
+
+    Ok(DecoderSession {
+        child,
+        stdin,
+        reader,
+    })
+}
+
+/// Kills the decoder process and joins its reader thread to reclaim the
+/// ring's producer half. Blocking, but brief: killing the process closes its
+/// stdout, so the reader's `read()` returns promptly.
+fn teardown_decoder_session(session: DecoderSession) -> ringbuf::HeapProd<f32> {
+    let DecoderSession {
+        mut child, reader, ..
+    } = session;
+    let _ = child.kill();
+    let _ = child.wait();
+    reader.join().unwrap_or_else(|_| {
+        // The reader thread only panics if `push_all` does, which never
+        // allocates or indexes out of bounds — practically unreachable, but
+        // an empty ring (rather than propagating the panic) keeps a single
+        // bad decode from taking the whole playout engine down.
+        tracing::error!("playout decoder reader thread panicked");
+        ringbuf::HeapRb::<f32>::new(1).split().0
+    })
+}
+
+/// Tears down any existing decoder session and starts a fresh one — used by
+/// `Start`/`Seek` (a discontinuity the old session's buffered state can't
+/// straddle) and by the feed loop when a stdin write fails (the decoder
+/// process died underneath it). On a failed spawn this reports the same way
+/// a failed output-device open does (`device_error`/`PlayoutState::Error`) —
+/// playout can't produce audio without a working decoder any more than
+/// without a device — while leaving `producer_holder` populated so the next
+/// `Start`/`Seek` (or the feed loop's own retry) can still use it.
+fn restart_decoder_session(
+    session: &mut Option<DecoderSession>,
+    producer_holder: &mut Option<ringbuf::HeapProd<f32>>,
+    sample_rate: u32,
+    handle: &Arc<PlayoutHandle>,
+) {
+    if let Some(old) = session.take() {
+        *producer_holder = Some(teardown_decoder_session(old));
+    }
+    let producer = producer_holder
+        .take()
+        .expect("producer_holder is always repopulated by teardown or a prior failed spawn");
+    match spawn_decoder_session(sample_rate, producer) {
+        Ok(s) => {
+            *session = Some(s);
+            handle.device_error.write().unwrap().take();
+        }
+        Err((err, producer)) => {
+            *producer_holder = Some(producer);
+            let msg = format!("failed to start audio decoder: {err}");
+            tracing::error!("{msg}");
+            handle.push_log(LogLevel::Error, msg.clone());
+            *handle.device_error.write().unwrap() = Some(msg);
+        }
+    }
+}
+
 /// Spawns the playout engine on its own OS thread and returns a handle for
 /// issuing commands and reading live status. `audio_cfg` picks the audio
 /// subsystem (cpal host) and output device from `obcast-server.toml`;
@@ -273,32 +420,29 @@ fn run_engine(
         buffer_size: cpal::BufferSize::Default,
     };
 
-    // Sized in segments rather than a fixed duration: decode is one blocking
-    // `ffmpeg` subprocess per segment (see `decode_to_pcm`), and a higher rung
-    // (e.g. the 320kbps "hd" rung vs. 32kbps "lo") has more bytes to read and
-    // demux per segment, so it eats more of a fixed time margin. Previously
-    // this was a flat ~1s capacity with the refill gate leaving only ~0.5s of
-    // slack before the ring ran dry — plenty for spawning ffmpeg to decode a
-    // small `lo` segment, but not always enough for a `hd` one under any load
-    // (competing disk/CPU from the encoder side, a slow spawn, etc.), which
-    // surfaced as spurious "buffer underrun" stalls specifically on the high
-    // rung. Sizing off `segment_ms` gives decode a full segment's wall-clock
-    // time of slack per refill (see the gate below) regardless of sample rate
-    // or segment length — but a `3`-segment ring (6s at the 2s default) still
-    // wasn't enough headroom: spawning a fresh ffmpeg process per segment on
-    // a machine where the encoder, its own ffmpeg, and playout's decode are
-    // all competing for the same CPU (the normal case for local dev, running
-    // client+server on one box) can occasionally push a single segment's
-    // decode past its 2s budget, draining the ring faster than a 3-segment
-    // margin can absorb — observed live as a stall that recovers on its own
-    // once decode catches back up, not a real data gap (confirmed both sides
-    // still had the segment on disk throughout). `RING_SEGMENTS` widens that
-    // margin so decode can work further ahead of playback when resources
-    // allow, banking more slack for the next contended patch.
+    // Sized in segments: with the persistent decode session (see module
+    // docs and `DecoderSession`), how far ahead of playback ffmpeg can work
+    // is governed by pipe backpressure through this ring rather than a
+    // per-segment gate — feeding segments to its stdin blocks once the ring
+    // (and ffmpeg's own internal buffers) fill up. A deeper ring means more
+    // bytes can be decoded and queued ahead of the cpal callback's real-time
+    // consumption, which is what actually absorbs a transient slowdown (a
+    // loaded machine, a slow disk read for one segment) without an audible
+    // underrun — previously this was only 3 segments' worth (6s at the 2s
+    // default) and still not enough headroom to survive every hiccup, which
+    // surfaced as spurious "buffer underrun" stalls that recovered on their
+    // own once decode caught back up (confirmed live: both the client and
+    // server still had every segment on disk throughout, so it was never a
+    // data gap).
     const RING_SEGMENTS: usize = 8;
     let segment_samples = (segment_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
     let ring = HeapRb::<f32>::new(segment_samples * RING_SEGMENTS);
-    let (mut producer, mut consumer) = ring.split();
+    let (producer, mut consumer) = ring.split();
+    // Held by whichever side currently doesn't have a live decoder: the
+    // engine loop between sessions, or a `DecoderSession`'s reader thread
+    // while one is running. `teardown_decoder_session` always hands it back.
+    let mut producer_holder = Some(producer);
+    let mut session: Option<DecoderSession> = None;
 
     let volume_handle = handle.clone();
     // Persistent across callbacks: the 300 ms VU and 650 ms PPM time
@@ -400,6 +544,7 @@ fn run_engine(
                 // No audio has actually reached the ring yet; the output
                 // callback will clear this on its first full buffer.
                 handle.underrun.store(true, Ordering::Relaxed);
+                restart_decoder_session(&mut session, &mut producer_holder, sample_rate, &handle);
                 let _ = stream.play();
                 tracing::info!(seq = position, "playout started");
             }
@@ -409,6 +554,9 @@ fn run_engine(
                 *handle.stall_reason.write().unwrap() = None;
                 handle.running.store(false, Ordering::Relaxed);
                 handle.position_seq.store(-1, Ordering::Relaxed);
+                if let Some(old) = session.take() {
+                    producer_holder = Some(teardown_decoder_session(old));
+                }
                 let _ = stream.pause();
                 tracing::info!("playout stopped");
             }
@@ -427,6 +575,11 @@ fn run_engine(
                 handle
                     .position_seq
                     .store(position as i64, Ordering::Relaxed);
+                // A seek is a discontinuity in the byte stream fed to the
+                // decoder, so the old session (mid-decode of the pre-seek
+                // position) must go — restart fresh rather than let stale
+                // audio for the old position keep draining out of it.
+                restart_decoder_session(&mut session, &mut producer_holder, sample_rate, &handle);
                 tracing::info!(seq = position, "playout seek");
             }
             Ok(EngineCommand::SetVolume { gain }) => {
@@ -440,100 +593,121 @@ fn run_engine(
 
         let should_feed =
             handle.running.load(Ordering::Relaxed) && !handle.paused.load(Ordering::Relaxed);
-        if should_feed {
+        if should_feed && session.is_none() {
+            // Self-heal after a failed spawn (see `restart_decoder_session`)
+            // instead of leaving playout permanently stuck — retried every
+            // tick, which is fine for a rare/exceptional failure (e.g.
+            // `ffmpeg` briefly unavailable) and self-limiting since a
+            // successful respawn clears this branch immediately.
+            restart_decoder_session(&mut session, &mut producer_holder, sample_rate, &handle);
+        }
+        if should_feed && session.is_some() {
             if let Some(seq) = current {
-                // Only decode the next segment once the ring has room for a
-                // full segment, so decode paces itself to playback instead of
-                // racing ahead of it unbounded — while still giving the
-                // blocking `ffmpeg` decode (see comment at the ring's
-                // creation) a full segment_ms of real-time slack rather than
-                // starting only once the ring is nearly drained.
-                if producer.vacant_len() >= segment_samples {
-                    let (path, abandoned) = rt.block_on(async {
-                        let store = store.lock().await;
-                        (
-                            best_available_path(&store, &rungs, seq),
-                            store.is_abandoned(seq),
-                        )
-                    });
+                // No per-segment gate on ring space here (unlike the old
+                // per-segment decode): feeding bytes to the persistent
+                // decoder's stdin naturally blocks once the ring — and
+                // ffmpeg's own internal buffers — fill up, since nothing
+                // downstream is draining fast enough. That backpressure
+                // chain paces feeding to playback on its own.
+                let (path, abandoned) = rt.block_on(async {
+                    let store = store.lock().await;
+                    (
+                        best_available_path(&store, &rungs, seq),
+                        store.is_abandoned(seq),
+                    )
+                });
 
-                    let mut advance = false;
-                    if let Some(path) = path {
-                        // Playable — the common case. A segment not yet on
-                        // disk holds the head in place rather than advancing
-                        // past it (see the `abandoned`/timeout branches
-                        // below for when it stops waiting), protecting "no
-                        // audio lost to a short outage" per CLAUDE.md §5.
-                        match decode_to_pcm(&path, sample_rate) {
-                            Ok(pcm) => {
-                                push_all(&mut producer, &pcm);
-                                // Real audio decoded and queued — whatever
-                                // stalled things before is no longer why.
-                                *handle.stall_reason.write().unwrap() = None;
-                            }
-                            Err(err) => {
-                                tracing::warn!(seq, error = %err, "decode failed, skipping segment");
-                                handle.push_log(
-                                    LogLevel::Warn,
-                                    format!("segment {seq} failed to decode, skipping: {err}"),
-                                );
-                                *handle.stall_reason.write().unwrap() =
-                                    Some(format!("segment {seq} failed to decode: {err}"));
-                            }
+                let mut advance = false;
+                if let Some(path) = path {
+                    // Playable — the common case. A segment not yet on
+                    // disk holds the head in place rather than advancing
+                    // past it (see the `abandoned`/timeout branches
+                    // below for when it stops waiting), protecting "no
+                    // audio lost to a short outage" per CLAUDE.md §5.
+                    let fed = std::fs::read(&path)
+                        .and_then(|bytes| session.as_mut().unwrap().stdin.write_all(&bytes));
+                    match fed {
+                        Ok(()) => {
+                            // Bytes hit the decoder's stdin — whatever
+                            // stalled things before is no longer why. The
+                            // reader thread clears `underrun` once PCM
+                            // actually reaches the ring.
+                            *handle.stall_reason.write().unwrap() = None;
+                            advance = true;
                         }
-                        advance = true;
-                    } else if abandoned {
-                        // The encoder explicitly gave up on this seq via
-                        // `/abandon` — nothing will ever fill it, so waiting
-                        // any longer would freeze the head on a gap that's
-                        // already known permanent.
-                        tracing::warn!(seq, "segment abandoned by encoder, skipping");
-                        handle.push_log(
-                            LogLevel::Warn,
-                            format!("segment {seq} was abandoned by the encoder, skipping"),
-                        );
-                        *handle.stall_reason.write().unwrap() =
-                            Some(format!("segment {seq} was abandoned by the encoder"));
-                        advance = true;
-                    } else {
-                        // Missing, not (yet) abandoned. Wait up to `timeout`
-                        // in case the encoder is just late/retrying, then
-                        // skip anyway — a backstop for the case where the
-                        // encoder crashed or disconnected and will never call
-                        // `/abandon` at all. Without this bound a permanent
-                        // gap freezes `position_seq` forever, violating the
-                        // "never block the playout head" invariant.
-                        let since = stall_since.get_or_insert_with(Instant::now);
-                        *handle.stall_reason.write().unwrap() =
-                            Some(format!("waiting on segment {seq} from the encoder"));
-                        if since.elapsed() >= timeout {
-                            tracing::warn!(
-                                seq,
-                                timeout_ms = timeout.as_millis() as u64,
-                                "segment missing past stall timeout, skipping to avoid freezing the playout head"
-                            );
+                        Err(err) => {
+                            // Most likely the decoder process died (broken
+                            // pipe) rather than this one segment being bad —
+                            // restart the session and retry the same seq
+                            // next tick instead of skipping past it.
+                            tracing::warn!(seq, error = %err, "failed to feed decoder, restarting decode session");
                             handle.push_log(
                                 LogLevel::Warn,
                                 format!(
-                                    "segment {seq} missing for over {}ms, skipped to avoid freezing the playout head",
-                                    timeout.as_millis()
+                                    "segment {seq} failed to decode ({err}), restarting decoder"
                                 ),
                             );
-                            *handle.stall_reason.write().unwrap() = Some(format!(
-                                "segment {seq} missing for over {}ms, skipped",
-                                timeout.as_millis()
-                            ));
-                            advance = true;
+                            *handle.stall_reason.write().unwrap() =
+                                Some(format!("segment {seq} failed to decode: {err}"));
+                            restart_decoder_session(
+                                &mut session,
+                                &mut producer_holder,
+                                sample_rate,
+                                &handle,
+                            );
                         }
                     }
-
-                    if advance {
-                        current = Some(seq + 1);
-                        stall_since = None;
-                        handle
-                            .position_seq
-                            .store((seq + 1) as i64, Ordering::Relaxed);
+                } else if abandoned {
+                    // The encoder explicitly gave up on this seq via
+                    // `/abandon` — nothing will ever fill it, so waiting
+                    // any longer would freeze the head on a gap that's
+                    // already known permanent.
+                    tracing::warn!(seq, "segment abandoned by encoder, skipping");
+                    handle.push_log(
+                        LogLevel::Warn,
+                        format!("segment {seq} was abandoned by the encoder, skipping"),
+                    );
+                    *handle.stall_reason.write().unwrap() =
+                        Some(format!("segment {seq} was abandoned by the encoder"));
+                    advance = true;
+                } else {
+                    // Missing, not (yet) abandoned. Wait up to `timeout`
+                    // in case the encoder is just late/retrying, then
+                    // skip anyway — a backstop for the case where the
+                    // encoder crashed or disconnected and will never call
+                    // `/abandon` at all. Without this bound a permanent
+                    // gap freezes `position_seq` forever, violating the
+                    // "never block the playout head" invariant.
+                    let since = stall_since.get_or_insert_with(Instant::now);
+                    *handle.stall_reason.write().unwrap() =
+                        Some(format!("waiting on segment {seq} from the encoder"));
+                    if since.elapsed() >= timeout {
+                        tracing::warn!(
+                            seq,
+                            timeout_ms = timeout.as_millis() as u64,
+                            "segment missing past stall timeout, skipping to avoid freezing the playout head"
+                        );
+                        handle.push_log(
+                            LogLevel::Warn,
+                            format!(
+                                "segment {seq} missing for over {}ms, skipped to avoid freezing the playout head",
+                                timeout.as_millis()
+                            ),
+                        );
+                        *handle.stall_reason.write().unwrap() = Some(format!(
+                            "segment {seq} missing for over {}ms, skipped",
+                            timeout.as_millis()
+                        ));
+                        advance = true;
                     }
+                }
+
+                if advance {
+                    current = Some(seq + 1);
+                    stall_since = None;
+                    handle
+                        .position_seq
+                        .store((seq + 1) as i64, Ordering::Relaxed);
                 }
             }
         }
@@ -564,31 +738,4 @@ fn best_available_path(store: &DvrStore, rungs: &[RungId], seq: Seq) -> Option<s
         .or_else(|| rungs.first())?;
     let path = store.segment_path(*rung, seq);
     path.exists().then_some(path)
-}
-
-/// Decode one MPEG-TS/AAC segment to interleaved f32 PCM at `sample_rate` via
-/// an `ffmpeg` subprocess. Blocking — called only from the dedicated playout
-/// thread, never from the async runtime.
-fn decode_to_pcm(path: &std::path::Path, sample_rate: u32) -> std::io::Result<Vec<f32>> {
-    let output = std::process::Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-i")
-        .arg(path)
-        .arg("-f")
-        .arg("f32le")
-        .arg("-ac")
-        .arg(CHANNELS.to_string())
-        .arg("-ar")
-        .arg(sample_rate.to_string())
-        .arg("-")
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output()?;
-    Ok(output
-        .stdout
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
 }
