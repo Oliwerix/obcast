@@ -411,6 +411,30 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   was deleted and inlined at its one call site. `client/gui/app.rs`'s `profile(&self)` method was left
   as-is — it's a genuine 5-call-site accessor now doing real work (`.filtered()` against the operator's
   enabled-rungs config, from the ABR ladder rework above), not redundant indirection.
+- **Fixed: waveform decode starving ingest/playout of the DVR store lock.** Reported as playout
+  stalling worse and worse a couple of minutes into a session, on a LAN (so not a real bandwidth
+  problem), with the server "kinda stopping responding." Root cause: `GET /api/{stream}/waveform`
+  (`api.rs::waveform_handler`) defaults to the full DVR window when the web remote's `applyWaveform()`
+  calls it unbounded every 5s (`web/remote/stream.html`), and `waveform::build` decoded every segment
+  in range via a **serial `ffmpeg` subprocess per segment** — dozens of spawns for a multi-minute
+  buffer, as the function's own doc comment already warned. The whole decode ran inside
+  `spawn_blocking` while holding `store.blocking_lock()` for its entire duration — the same
+  `Arc<Mutex<DvrStore>>` that segment ingest (`ingest.rs`) and the playout engine's own per-tick
+  segment-availability check (`playout.rs`, `rt.block_on(store.lock().await ...)` every 20ms) both
+  need. As the DVR buffer grew with session length, each poll's decode (and thus lock-hold) grew with
+  it, increasingly starving both ingest and playout of the lock — surfacing exactly as the playout
+  stall reason text `"waiting on segment N from the encoder"` even though the segment was already on
+  disk the whole time, just unreachable because the index lookup needed the same lock a five-second-old
+  waveform poll was still sitting on. Fixed by splitting the handler into `waveform::snapshot_index`
+  (cheap, index-only `(seq, rung, path)` lookups, done under the lock) and `waveform::build_from_index`
+  (the actual `ffmpeg` decode loop, taking an owned snapshot with no `DvrStore` reference at all) — the
+  `MutexGuard` in `api.rs::waveform_handler` now drops before any decode runs. The web remote still
+  polls the unbounded full-window range every 5s and the decode cost itself is unchanged (still one
+  `ffmpeg` spawn per segment, still grows with session length) — only the lock-holding is fixed. If the
+  waveform card's own responsiveness (not playout) becomes the next complaint on a long-running show,
+  the fix is on the client side: have `stream.html` pass `start_seq`/`end_seq` (already accepted by the
+  endpoint, just never used by the caller) to fetch only the newly-arrived tail instead of re-decoding
+  the whole buffer every poll.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);

@@ -298,6 +298,16 @@ pub struct WaveformQuery {
 /// `rungs`/`seqs` extension) covering `[start_seq, end_seq]`, defaulting to
 /// the full DVR window. Decodes every segment in range via `ffmpeg`, so this
 /// runs on a blocking task rather than the async executor.
+///
+/// The store lock is held only long enough to snapshot which rung/path each
+/// seq resolves to (`waveform::snapshot_index`) — never across the actual
+/// `ffmpeg` decode loop (`waveform::build_from_index`). A multi-minute DVR
+/// window means dozens of serial decodes here; holding the store's lock for
+/// all of that would starve every other store user for the same span —
+/// segment ingest and the playout engine's own per-tick segment lookup both
+/// need it too — which is exactly what was surfacing as spurious playout
+/// stalls ("waiting on segment N from the encoder") on an otherwise healthy
+/// link once the web remote's 5s waveform poll had enough buffer to decode.
 pub async fn waveform_handler(
     State(app): State<Arc<AppState>>,
     Path(stream): Path<String>,
@@ -314,15 +324,22 @@ pub async fn waveform_handler(
     let store = handle.store.clone();
     let log = handle.log.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let store = store.blocking_lock();
-        let start = q
-            .start_seq
-            .unwrap_or_else(|| store.dvr_start_seq().unwrap_or(0));
-        let end = q.end_seq.unwrap_or_else(|| store.live_seq().unwrap_or(0));
-        if end < start {
-            return Err("end_seq must be >= start_seq");
-        }
-        Ok(waveform::build(&store, store.profile(), start, end, &log))
+        let (entries, profile) = {
+            let store = store.blocking_lock();
+            let start = q
+                .start_seq
+                .unwrap_or_else(|| store.dvr_start_seq().unwrap_or(0));
+            let end = q.end_seq.unwrap_or_else(|| store.live_seq().unwrap_or(0));
+            if end < start {
+                return Err("end_seq must be >= start_seq");
+            }
+            (
+                waveform::snapshot_index(&store, start, end),
+                store.profile().clone(),
+            )
+            // `store` (the MutexGuard) drops here, before any ffmpeg decode runs.
+        };
+        Ok(waveform::build_from_index(&profile, &entries, &log))
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
