@@ -92,6 +92,10 @@ struct ObcastApp {
     /// Rung id as a plain float; only sampled while something is actually
     /// playing (skipped, not zero-filled, while stopped/unknown).
     quality_history: VecDeque<f32>,
+    /// % of the outstanding buffer (`ServerState::coverage`) held at the top
+    /// rung; only sampled when the server has reported any coverage at all
+    /// (skipped, not zero-filled, otherwise) — see `link_panel`.
+    buffer_quality_history: VecDeque<f32>,
     history_sampled_at: Option<Instant>,
 }
 
@@ -139,6 +143,7 @@ impl ObcastApp {
             buffer_history: VecDeque::new(),
             bandwidth_history: VecDeque::new(),
             quality_history: VecDeque::new(),
+            buffer_quality_history: VecDeque::new(),
             history_sampled_at: None,
         }
     }
@@ -707,10 +712,48 @@ impl ObcastApp {
             }
         }
 
+        // Buffer quality: of the segments the server currently reports
+        // coverage for ahead of the playout head (`ServerState::coverage` —
+        // "where the quality holes are", CLAUDE.md §1), what fraction sit at
+        // the top rung right now. 100% = the whole outstanding buffer is HD;
+        // 0% = none of it is — the rest may still be playable at a lower
+        // rung (that's `Buffer`/continuity's job to guarantee), this is
+        // purely a quality readout. Gaps (`best_rung == None`) don't count
+        // toward either the numerator or denominator — a missing segment is
+        // a continuity problem, not a quality one.
+        let top_rung = self.profile().top_rung();
+        let covered: Vec<_> = state.coverage.iter().filter_map(|c| c.best_rung).collect();
+        let buffer_quality_pct = if covered.is_empty() {
+            None
+        } else {
+            let hd = covered.iter().filter(|&&r| r == top_rung).count();
+            Some(hd as f32 / covered.len() as f32 * 100.0)
+        };
+        ui.label("Buffer quality (HD)");
+        match buffer_quality_pct {
+            Some(pct) => {
+                let color = if pct < 33.0 {
+                    egui::Color32::from_rgb(0xe2, 0x3d, 0x3d)
+                } else if pct < 67.0 {
+                    egui::Color32::from_rgb(0xe8, 0xc5, 0x2a)
+                } else {
+                    egui::Color32::from_rgb(0x35, 0xc7, 0x5f)
+                };
+                ui.add(
+                    egui::ProgressBar::new((pct / 100.0).clamp(0.0, 1.0))
+                        .fill(color)
+                        .text(format!("{pct:.0}% HD")),
+                );
+            }
+            None => {
+                ui.label("(no buffer coverage yet)");
+            }
+        }
+
         // Sample the rolling history at a fixed cadence, independent of the
         // ~30fps repaint (see `HISTORY_SAMPLE_INTERVAL`), then render it —
-        // all three share the "last 60s" framing the buffer/bandwidth/
-        // quality readouts above are snapshots of.
+        // all four share the "last 60s" framing the buffer/bandwidth/
+        // quality/buffer-quality readouts above are snapshots of.
         let now = Instant::now();
         if self
             .history_sampled_at
@@ -725,6 +768,9 @@ impl ObcastApp {
             push_capped(&mut self.bandwidth_history, bandwidth_pct, HISTORY_LEN);
             if let Some(q) = quality {
                 push_capped(&mut self.quality_history, q.rung as f32, HISTORY_LEN);
+            }
+            if let Some(pct) = buffer_quality_pct {
+                push_capped(&mut self.buffer_quality_history, pct, HISTORY_LEN);
             }
         }
 
@@ -751,15 +797,25 @@ impl ObcastApp {
             egui::Color32::from_rgb(0x5b, 0x8f, 0xc9),
         );
 
-        let top_rung = self.profile().top_rung().max(1) as f32;
+        let top_rung_f = self.profile().top_rung().max(1) as f32;
         ui.label(egui::RichText::new("Quality (rung, low→high)").small());
         meter::sparkline(
             ui,
             &self.quality_history,
             0.0,
-            top_rung,
+            top_rung_f,
             egui::vec2(200.0, 44.0),
             egui::Color32::from_rgb(0xc9, 0x8f, 0x5b),
+        );
+
+        ui.label(egui::RichText::new("Buffer quality (% HD)").small());
+        meter::sparkline(
+            ui,
+            &self.buffer_quality_history,
+            0.0,
+            100.0,
+            egui::vec2(200.0, 44.0),
+            egui::Color32::from_rgb(0x35, 0xc7, 0x5f),
         );
     }
 
