@@ -276,15 +276,26 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   silent (cpal zero-fills underruns) — the new stall-skip logging at least surfaces *why*, but the
   state itself is still not a lie-proof signal; `waveform.rs` silently swallows any per-segment decode
   failure as a flat `(0,0)` line, indistinguishable from real silence.
-- **Two more fixes (found chasing an operator report of "web remote says HD but it's actually
-  playing low, and playback sometimes jumps around").** (1) `api.rs::build_status()` computed the web
-  remote's `LinkHealth.current_rung` from `ServerState.live_seq` — the newest segment the server has
-  received — not from the playout head. Since the head lags the live edge by design (DVR), a bandwidth
-  dip that recovers reads as: newest segment HD, "Current rung" pill shows HD, but the head is still
-  seconds behind playing out the low-rung audio recorded during the dip. Now looked up at
-  `ServerState.playout.position_seq` in `coverage`, matching what the client GUI's own on-air estimate
-  already did correctly (`SharedState::playing_quality`, ground-truth branch). (2) `origin.rs`'s
-  per-rendition HLS playlist (feeding the web remote's "listen along" hls.js player) built
+- **Two more fixes (found chasing an operator report of "web remote *and* GUI both say HD but the
+  server is audibly outputting low quality, and playback sometimes jumps around").** (1) The quality
+  mismatch was deeper than it first looked. A first pass made `LinkHealth.current_rung` look up
+  `ServerState.playout.position_seq` in `coverage` instead of `live_seq` — necessary (using the live
+  edge was definitely wrong) but not sufficient, because the client GUI's `SharedState::playing_quality`
+  was already doing that same `coverage`-at-`position_seq` lookup and was *still* wrong, which is what
+  the operator saw persist. The real bug: `coverage`/`best_rung(seq)` reports whatever the DVR index
+  currently holds for that seq, but `playout.rs`'s decode pipeline feeds segments to its decoder many
+  segments ahead of real-time output (`RING_SEGMENTS = 8`, up to ~16s at the 2s default) to survive
+  slowdowns without an audible underrun. The rung the engine picks for a segment is locked in at *feed*
+  time — but a quality upgrade for that same segment routinely lands on disk well before that segment
+  is actually heard (uploads are far faster than the ring is deep), so by the time the head reaches it,
+  a live "best rung for this seq" lookup reports the *new* rung even though the decoder already
+  committed to the old one. Both readouts were asking the DVR index a question it can't truthfully
+  answer. Fixed by tracking the fed rung directly: `PlayoutHandle::pending` (the FIFO already used to
+  drain-track `position_seq` truthfully, per the M5 fix above) now carries `(seq, rung, samples)` instead
+  of `(seq, samples)`, and a new `PlayoutHandle::playing_rung()`/`PlayoutStatus.playing_rung` exposes
+  the rung of whichever entry is actually draining right now — ground truth, no index lookup. Both
+  `api.rs`'s `current_rung` and the client's `playing_quality` now read this field directly. (2)
+  `origin.rs`'s per-rendition HLS playlist (feeding the web remote's "listen along" hls.js player) built
   `EXT-X-MEDIA-SEQUENCE` and its segment list from only the seqs with media already on disk, skipping
   gaps silently. On the flaky uplink this whole system targets, a segment landing *late* (a retry
   succeeding after later ones already arrived) is normal, not exceptional — and every time that
@@ -294,7 +305,8 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   `[dvr_start_seq, live_seq]` range so a segment's list position always equals its real seq number, and
   emits `#EXT-X-GAP` for a seq with no media yet (or ever, if abandoned) instead of omitting it —
   covered by pure unit tests in `origin.rs` (`playlist_body`) demonstrating the position-stability
-  property directly.
+  property directly, and in `playout.rs` (`advance_pending`) demonstrating that a stale-but-fed low rung
+  is reported even once the index has moved on to HD for the same seq.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);

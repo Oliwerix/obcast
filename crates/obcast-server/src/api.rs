@@ -142,18 +142,16 @@ async fn build_status(stream: &str, handle: &StreamHandle) -> ControlStatus {
         }
         None => (false, u32::MAX),
     };
-    // On-air ground truth: the rung covering the segment actually at the
-    // playout head, not the newest segment received. `coverage`'s window
-    // starts exactly at the head while playing/paused/stalled (see
-    // `DvrStore::build_server_state`'s anchor logic), so this mirrors the
-    // client GUI's own `SharedState::playing_quality` — using `live_seq`
-    // here instead would report the live edge's rung, which can read as HD
-    // while the head (seconds behind by design) is still on a low rung from
-    // an earlier bandwidth dip. See `LinkHealth::current_rung`'s doc comment.
-    let current_rung = server
-        .playout
-        .position_seq
-        .and_then(|pos| server.coverage.iter().find(|c| c.seq == pos)?.best_rung);
+    // On-air ground truth, straight from the playout engine: which rung it
+    // actually fed the decoder for the segment currently draining. NOT a
+    // live "best rung for this seq" lookup against `coverage`/the DVR index
+    // — the engine feeds bytes many segments ahead of real-time playback
+    // (see `playout.rs`'s `RING_SEGMENTS`), so a quality upgrade for a
+    // segment already fed can land on disk before that segment is actually
+    // heard; a live lookup would then report the new rung while the speaker
+    // is still on the old one. See `PlayoutStatus::playing_rung`'s doc
+    // comment and `LinkHealth::current_rung`'s.
+    let current_rung = server.playout.playing_rung;
     let gaps = server
         .coverage
         .iter()

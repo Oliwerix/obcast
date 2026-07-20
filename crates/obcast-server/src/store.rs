@@ -349,6 +349,7 @@ mod tests {
         PlayoutStatus {
             state: PlayoutState::Stopped,
             position_seq: None,
+            playing_rung: None,
             device: None,
             volume: 1.0,
             detail: None,
@@ -360,6 +361,7 @@ mod tests {
         PlayoutStatus {
             state: PlayoutState::Error,
             position_seq: None,
+            playing_rung: None,
             device: None,
             volume: 1.0,
             detail: Some(detail.into()),
@@ -408,6 +410,7 @@ mod tests {
         let playing = PlayoutStatus {
             state: PlayoutState::Playing,
             position_seq: Some(3),
+            playing_rung: None,
             device: None,
             volume: 1.0,
             detail: None,
@@ -438,6 +441,7 @@ mod tests {
         let playing = PlayoutStatus {
             state: PlayoutState::Playing,
             position_seq: Some(0),
+            playing_rung: None,
             device: None,
             volume: 1.0,
             detail: None,

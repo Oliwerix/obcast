@@ -152,6 +152,17 @@ test-tone pattern (`set_test_tone`, above) is currently overriding the
 hardware output. It's orthogonal to `playout.state` — a pure
 wiring/routing check, never part of scheduler input.
 
+`playout.playing_rung` (`Option<RungId>`, `#[serde(default)]`) is the rung
+actually reaching the speaker for `playout.position_seq` right now — ground
+truth, set once when the playout engine feeds that segment to its decoder
+and never revised. Deliberately *not* derivable from `coverage`: the engine
+feeds segments many seconds ahead of real-time output, so a quality upgrade
+for an already-fed segment can land on disk (and thus into `coverage`)
+before that segment is actually heard. Both the web remote's "Current rung"
+and the client GUI's on-air quality readout read this field directly rather
+than looking up "best rung for this seq" against `coverage`, which would
+otherwise report a rung the speaker isn't actually playing yet.
+
 ### `ServerState` fields that drive the scheduler
 - `playout.state` + `playout.position_seq` — the anchor for all urgency.
   `position_seq` tracks the seq whose audio is actually draining out of the
