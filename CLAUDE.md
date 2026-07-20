@@ -218,9 +218,10 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
 - **M3 — DONE.** Client `ffmpeg` ABR encode (one proc → N rungs) → `{rung}/{seq}.ts` disk ring
   buffer; `inventory.rs` scan; uploader tick loop driving `plan_uploads` against the real server and
   folding `ServerState` from responses.
-- **M4 — DONE (server) / PARTIAL (web listen).** HLS origin (master + per-rung sliding-window
-  playlists, best-rung fallback) done. Web has hls.js listen-along, but the scrub bar drives *server*
-  playout via the waveform — browser-side DVR scrub of the listen-along player itself is **OPEN**.
+- **M4 — DONE.** HLS origin (master + per-rung sliding-window playlists, best-rung fallback) done.
+  Web has hls.js listen-along with its own scrub bar (`audio.currentTime`/`audio.buffered`, never
+  touching `/api/{stream}/playout`) independent of the waveform card's server-playout scrub — see the
+  "Browser-side DVR scrub" entry further down for how the listen-along gap was closed.
 - **M5 — DONE**, plus a correctness fix. Playout to hardware out via `cpal` (dedicated thread, ffmpeg
   decode, ring buffer, atomics for pos/state/vol/meters), start/stop + seek; head flows into
   `ServerState` (holds rather than skips on a not-yet-on-disk segment). Fixed: `position_seq` used to
