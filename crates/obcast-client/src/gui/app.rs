@@ -16,8 +16,10 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::JoinHandle;
 
+use std::collections::BTreeSet;
+
 use obcast_proto::control::{LogEntry, LogLevel};
-use obcast_proto::state::{PlayoutState, StreamProfile};
+use obcast_proto::state::{PlayoutState, RungId, StreamProfile};
 
 use crate::audio::{self, AudioHandle};
 use crate::config::{AppConfig, PeakMode};
@@ -55,6 +57,7 @@ enum ControllerCmd {
         out_dir: PathBuf,
         sample_rate: u32,
         auto_start_buffer_ms: Option<u32>,
+        bootstrap_rung: RungId,
     },
     StopLive,
 }
@@ -74,6 +77,13 @@ struct ObcastApp {
     selected_device: String,
     cfg: AppConfig,
     live: bool,
+    /// A rung checkbox click while live, staged behind a confirmation modal
+    /// (see `rungs_panel`) rather than applied immediately — toggling a rung
+    /// mid-session restarts the encoder pipeline (brief audio gap), so the
+    /// operator has to confirm it. `None` while not live or no click pending.
+    /// The bool is the click's target state (true = enabling, false =
+    /// disabling) so the modal can describe what's about to happen.
+    pending_rung_toggle: Option<(RungId, bool)>,
     /// Whether the operator log panel (bottom of the window) is open.
     show_log: bool,
     /// "All Input Channels" bank source data — resampled once/sec rather
@@ -136,6 +146,7 @@ impl ObcastApp {
             selected_device: cfg.device_name.clone(),
             cfg,
             live: false,
+            pending_rung_toggle: None,
             show_log: false,
             channel_peaks_target: Vec::new(),
             channel_peaks_display: Vec::new(),
@@ -182,8 +193,32 @@ impl ObcastApp {
         }
     }
 
+    /// The ladder this session actually encodes/uploads — the full default
+    /// ladder narrowed to whatever the operator has enabled (see
+    /// `StreamProfile::filtered`; never empty).
     fn profile(&self) -> StreamProfile {
-        StreamProfile::default_ladder(self.cfg.segment_ms)
+        let enabled: BTreeSet<RungId> = self.cfg.enabled_rungs.iter().copied().collect();
+        StreamProfile::default_ladder(self.cfg.segment_ms).filtered(&enabled)
+    }
+
+    fn go_live_cmd(&self) -> ControllerCmd {
+        let sample_rate = self.audio.sample_rate().max(44_100);
+        let ingest_token =
+            (!self.cfg.ingest_token.is_empty()).then(|| self.cfg.ingest_token.clone());
+        let auto_start_buffer_ms = self
+            .cfg
+            .auto_start
+            .then_some(self.cfg.auto_start_buffer_secs * 1000);
+        ControllerCmd::GoLive {
+            profile: self.profile(),
+            base_url: self.cfg.server.clone(),
+            stream: self.cfg.stream.clone(),
+            ingest_token,
+            out_dir: PathBuf::from(&self.cfg.out_dir),
+            sample_rate,
+            auto_start_buffer_ms,
+            bootstrap_rung: self.cfg.default_rung,
+        }
     }
 
     fn toggle_live(&mut self) {
@@ -191,22 +226,8 @@ impl ObcastApp {
             let _ = self.cmd_tx.send(ControllerCmd::StopLive);
             self.live = false;
         } else {
-            let sample_rate = self.audio.sample_rate().max(44_100);
-            let ingest_token =
-                (!self.cfg.ingest_token.is_empty()).then(|| self.cfg.ingest_token.clone());
-            let auto_start_buffer_ms = self
-                .cfg
-                .auto_start
-                .then_some(self.cfg.auto_start_buffer_secs * 1000);
-            let _ = self.cmd_tx.send(ControllerCmd::GoLive {
-                profile: self.profile(),
-                base_url: self.cfg.server.clone(),
-                stream: self.cfg.stream.clone(),
-                ingest_token,
-                out_dir: PathBuf::from(&self.cfg.out_dir),
-                sample_rate,
-                auto_start_buffer_ms,
-            });
+            let cmd = self.go_live_cmd();
+            let _ = self.cmd_tx.send(cmd);
             self.live = true;
         }
         self.persist_config();
@@ -536,6 +557,152 @@ impl ObcastApp {
         });
         if !self.live {
             ui.small("(target settings lock while live; stop to change them)");
+        }
+
+        // Unlike the rest of "Stream Target" above, rung selection stays
+        // interactive while live — toggling one restarts the pipeline (see
+        // `apply_rung_toggle`), but that's confirmed via a modal rather than
+        // requiring a full manual Stop first.
+        ui.separator();
+        ui.heading("Rungs");
+        self.rungs_panel(ui);
+    }
+
+    /// Per-rung enable/disable checkboxes plus the "Default quality"
+    /// (bootstrap rung) picker. Any rung may be disabled, including the
+    /// lowest — the scheduler always treats whatever's left as the
+    /// survival rung (see `StreamProfile::filtered`) — except the last
+    /// remaining enabled one, which the UI refuses to let go empty.
+    fn rungs_panel(&mut self, ui: &mut egui::Ui) {
+        let ladder = StreamProfile::default_ladder(self.cfg.segment_ms);
+        let enabled_count = self.cfg.enabled_rungs.len();
+
+        for rung in &ladder.rungs {
+            let mut checked = self.cfg.enabled_rungs.contains(&rung.id);
+            let is_only_one_left = checked && enabled_count <= 1;
+            let codec_tag = match rung.codec {
+                obcast_proto::state::AacCodec::He => " · HE-AAC",
+                obcast_proto::state::AacCodec::Lc => "",
+            };
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!is_only_one_left, |ui| {
+                    let resp = ui.checkbox(
+                        &mut checked,
+                        format!("{} — {} kbps{codec_tag}", rung.name, rung.bitrate_kbps),
+                    );
+                    let resp = if is_only_one_left {
+                        resp.on_hover_text("at least one rung must stay enabled")
+                    } else if self.live {
+                        resp.on_hover_text("restarts the encoder pipeline (confirmation required)")
+                    } else {
+                        resp
+                    };
+                    if resp.changed() {
+                        if self.live {
+                            self.pending_rung_toggle = Some((rung.id, checked));
+                        } else {
+                            self.apply_rung_toggle(rung.id, checked);
+                        }
+                    }
+                });
+            });
+        }
+
+        let enabled_rungs: Vec<_> = ladder
+            .rungs
+            .iter()
+            .filter(|r| self.cfg.enabled_rungs.contains(&r.id))
+            .collect();
+        let selected_label = enabled_rungs
+            .iter()
+            .find(|r| r.id == self.cfg.default_rung)
+            .or(enabled_rungs.first())
+            .map(|r| format!("{} ({} kbps)", r.name, r.bitrate_kbps))
+            .unwrap_or_else(|| "—".to_string());
+        let before = self.cfg.default_rung;
+        egui::ComboBox::from_label("Default quality")
+            .selected_text(selected_label)
+            .show_ui(ui, |ui| {
+                for rung in &enabled_rungs {
+                    ui.selectable_value(
+                        &mut self.cfg.default_rung,
+                        rung.id,
+                        format!("{} ({} kbps)", rung.name, rung.bitrate_kbps),
+                    );
+                }
+            })
+            .response
+            .on_hover_text(
+                "The rung the encoder assumes before real link feedback arrives. Takes effect \
+                 next time you go live — no restart needed.",
+            );
+        if self.cfg.default_rung != before {
+            self.persist_config();
+        }
+
+        if self.pending_rung_toggle.is_some() {
+            self.rung_toggle_confirm_window(ui.ctx());
+        }
+    }
+
+    /// Applies a rung enable/disable and persists it; if live, restarts the
+    /// pipeline by resending `GoLive` with the freshly filtered profile —
+    /// reuses the same stop+respawn path `toggle_live` already drives, so no
+    /// new controller command is needed.
+    fn apply_rung_toggle(&mut self, rung: RungId, enable: bool) {
+        if enable {
+            if !self.cfg.enabled_rungs.contains(&rung) {
+                self.cfg.enabled_rungs.push(rung);
+                self.cfg.enabled_rungs.sort_unstable();
+            }
+        } else if self.cfg.enabled_rungs.len() > 1 {
+            self.cfg.enabled_rungs.retain(|&r| r != rung);
+        }
+        self.persist_config();
+        if self.live {
+            let cmd = self.go_live_cmd();
+            let _ = self.cmd_tx.send(cmd);
+        }
+    }
+
+    /// Confirmation dialog for a rung toggle clicked while live — see
+    /// `pending_rung_toggle`.
+    fn rung_toggle_confirm_window(&mut self, ctx: &egui::Context) {
+        let Some((rung, enable)) = self.pending_rung_toggle else {
+            return;
+        };
+        let name = StreamProfile::default_ladder(self.cfg.segment_ms)
+            .rungs
+            .iter()
+            .find(|r| r.id == rung)
+            .map(|r| r.name.clone())
+            .unwrap_or_default();
+        let verb = if enable { "Enable" } else { "Disable" };
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Restart encoder?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{verb} rung \"{name}\" now? This briefly restarts the encoder pipeline \
+                     (a few seconds of audio gap) to pick up the change."
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Apply & restart").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            self.apply_rung_toggle(rung, enable);
+        }
+        if apply || cancel {
+            self.pending_rung_toggle = None;
         }
     }
 
@@ -998,7 +1165,7 @@ async fn controller(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(ControllerCmd::GoLive { profile, base_url, stream, ingest_token, out_dir, sample_rate, auto_start_buffer_ms }) => {
+                    Some(ControllerCmd::GoLive { profile, base_url, stream, ingest_token, out_dir, sample_rate, auto_start_buffer_ms, bootstrap_rung }) => {
                         stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
 
                         if let Err(err) = tokio::fs::create_dir_all(&out_dir).await {
@@ -1010,7 +1177,11 @@ async fn controller(
 
                         segment_ms = profile.segment_ms;
                         match encode::spawn(&encode::Source::Pcm { sample_rate }, &profile, &out_dir) {
-                            Ok(mut c) => {
+                            Ok((mut c, warnings)) => {
+                                for warning in &warnings {
+                                    tracing::warn!(%warning, "codec fallback");
+                                    shared.push_log(LogLevel::Warn, warning.clone());
+                                }
                                 stdin = c.stdin.take();
                                 child = Some(c);
                                 audio.set_live(true);
@@ -1028,7 +1199,7 @@ async fn controller(
                                 )));
                                 upload_handle = Some(tokio::spawn(uploader::run(
                                     client,
-                                    uploader::Config { base_url, stream, ingest_token, out_dir, profile, auto_start_buffer_ms },
+                                    uploader::Config { base_url, stream, ingest_token, out_dir, profile, auto_start_buffer_ms, bootstrap_rung },
                                     shared.clone(),
                                 )));
                                 tracing::info!("live: encoder pipeline started");

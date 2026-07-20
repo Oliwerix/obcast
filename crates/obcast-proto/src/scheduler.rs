@@ -301,26 +301,7 @@ mod tests {
     use crate::state::*;
 
     fn profile() -> StreamProfile {
-        StreamProfile {
-            segment_ms: 2000,
-            rungs: vec![
-                Rung {
-                    id: 0,
-                    name: "lo".into(),
-                    bitrate_kbps: 32,
-                },
-                Rung {
-                    id: 1,
-                    name: "mid".into(),
-                    bitrate_kbps: 128,
-                },
-                Rung {
-                    id: 2,
-                    name: "hd".into(),
-                    bitrate_kbps: 320,
-                },
-            ],
-        }
+        StreamProfile::default_ladder(2000)
     }
 
     fn server(state: PlayoutState, pos: Option<Seq>, water: WaterLevels) -> ServerState {
@@ -349,7 +330,7 @@ mod tests {
     fn inv_full(oldest: Seq, newest: Seq, server_best: &[(Seq, Option<RungId>)]) -> LocalInventory {
         let mut available = BTreeMap::new();
         for s in oldest..=newest {
-            available.insert(s, vec![0, 1, 2]);
+            available.insert(s, vec![0, 1, 2, 3]);
         }
         LocalInventory {
             encoded_seq: newest,
@@ -642,5 +623,95 @@ mod tests {
         };
         let plan = plan_uploads(&input);
         assert!(plan.iter().any(|a| a.seq >= 41));
+    }
+
+    /// An operator can disable any rung, including 0 — `filtered()` just
+    /// narrows `profile.rungs`, and `plan_uploads` derives "low"/"next" from
+    /// whatever's actually in there, never a hardcoded id. With rung 0
+    /// disabled, continuity must fall back to whatever rung *is* now lowest.
+    #[test]
+    fn continuity_uses_the_lowest_enabled_rung_when_rung_zero_is_disabled() {
+        let filtered = profile().filtered(&[1, 2, 3].into_iter().collect());
+        assert_eq!(
+            filtered.low_rung(),
+            1,
+            "rung 1 is now the effective survival rung"
+        );
+
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 16000,
+        };
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let inv = inv_full(0, 50, &[]); // server has nothing; encoder has every rung locally
+        let input = SchedulerInput {
+            profile: &filtered,
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 100, // barely enough for the 96k rung, not more
+            headroom: 0.9,
+            max_actions: 8,
+        };
+        let plan = plan_uploads(&input);
+
+        assert!(!plan.is_empty());
+        assert!(
+            plan.iter().all(|a| a.rung == 1),
+            "must use rung 1, never disabled rung 0"
+        );
+        assert!(plan.iter().all(|a| a.reason == UploadReason::Continuity));
+    }
+
+    /// A disabled rung must never be an upgrade target, even after several
+    /// ticks of ratcheting up from a comfortable, well-fed link.
+    #[test]
+    fn upgrades_never_ratchet_into_a_disabled_top_rung() {
+        let filtered = profile().filtered(&[0, 1, 2].into_iter().collect()); // rung 3 (hd) disabled
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 10000,
+        };
+        let srv = server(PlayoutState::Playing, Some(30), water);
+
+        // Server already holds the low rung 25..=50 so the frontier is
+        // comfortable from tick one; encoder has every rung on local disk.
+        let mut server_best: BTreeMap<Seq, Option<RungId>> =
+            (25..=50).map(|s| (s, Some(1))).collect();
+
+        for _ in 0..6 {
+            let inv = LocalInventory {
+                encoded_seq: 50,
+                oldest_seq: 0,
+                available: (0..=50).map(|s| (s, vec![0, 1, 2, 3])).collect(),
+                server_best: server_best.clone(),
+            };
+            let input = SchedulerInput {
+                profile: &filtered,
+                server: &srv,
+                inv: &inv,
+                throughput_kbps: 5000, // huge headroom
+                headroom: 0.9,
+                max_actions: 20,
+            };
+            let plan: Vec<UploadAction> = plan_uploads(&input);
+            assert!(
+                plan.iter().all(|a| a.rung != 3),
+                "disabled rung 3 must never be targeted, tick plan: {plan:?}"
+            );
+            for a in &plan {
+                server_best.insert(a.seq, Some(a.rung));
+            }
+        }
+
+        // After several ticks of ratcheting, the segments within the upgrade
+        // window (anchor+1..=anchor+high_ms/seg_ms, i.e. 31..=35) should have
+        // plateaued at rung 2 (hi) — the top of the *enabled* ladder — never
+        // the disabled rung 3.
+        assert!(
+            (31..=35).all(|s| server_best.get(&s) == Some(&Some(2))),
+            "expected every upgraded segment to plateau at the enabled top rung (2): {server_best:?}"
+        );
     }
 }

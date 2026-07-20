@@ -19,6 +19,20 @@ pub type Seq = u64;
 /// rung `0` is always the "survival" rung sent to prevent dropout.
 pub type RungId = u8;
 
+/// Which AAC profile a rung is encoded with. HE-AAC roughly doubles the
+/// perceptual quality-per-bit of plain LC at low bitrates, which is why the
+/// survival rung wants it — but it requires an ffmpeg build with
+/// `libfdk_aac` (native `aac` can only emit LC); see `encode.rs`'s
+/// auto-detect + fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AacCodec {
+    /// AAC-LC via ffmpeg's native `aac` encoder. HLS `CODECS` tag `mp4a.40.2`.
+    Lc,
+    /// HE-AAC (v1/SBR) via `libfdk_aac`. HLS `CODECS` tag `mp4a.40.5`.
+    He,
+}
+
 /// One encoded quality rung.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rung {
@@ -26,10 +40,20 @@ pub struct Rung {
     /// Human label, e.g. "lo", "mid", "hd".
     pub name: String,
     pub bitrate_kbps: u32,
+    pub codec: AacCodec,
 }
 
-/// Static description of a stream: segment length and the ABR ladder.
-/// `rungs` MUST be sorted ascending by bitrate; index 0 is the survival rung.
+/// Static description of a stream: segment length and the full ABR ladder.
+/// `rungs` MUST be sorted ascending by bitrate.
+///
+/// This is the *complete* ladder the client/server agree on; which rungs are
+/// actually active for a given session is a separate, dynamic concern (see
+/// [`StreamProfile::filtered`]) — any rung, including the lowest, can be
+/// disabled by the operator, so "rung 0" is not a hardcoded survival id.
+/// Whichever rung ends up lowest in the *filtered* profile becomes the
+/// effective survival rung the continuity tier defends (CLAUDE.md §5/§6);
+/// `low_rung()`/`rung_above()` below always derive "low"/"next" from
+/// whatever's actually in `rungs`, never a literal id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamProfile {
     pub segment_ms: u32,
@@ -37,9 +61,9 @@ pub struct StreamProfile {
 }
 
 impl StreamProfile {
-    /// The one ABR ladder every OBCast component ships today (32/128/320
-    /// kbps AAC, low/mid/hd) — previously copied separately in
-    /// `obcast-server::main`, `obcast-client::main`, and
+    /// The one ABR ladder every OBCast component ships today (48/96/192/320
+    /// kbps AAC, low/mid/hi/hd, low rung HE-AAC) — previously copied
+    /// separately in `obcast-server::main`, `obcast-client::main`, and
     /// `obcast-client::gui::app`, which could silently drift out of sync.
     /// `segment_ms` is the only axis that's actually configurable per run.
     pub fn default_ladder(segment_ms: u32) -> Self {
@@ -49,19 +73,53 @@ impl StreamProfile {
                 Rung {
                     id: 0,
                     name: "lo".into(),
-                    bitrate_kbps: 32,
+                    bitrate_kbps: 48,
+                    codec: AacCodec::He,
                 },
                 Rung {
                     id: 1,
                     name: "mid".into(),
-                    bitrate_kbps: 128,
+                    bitrate_kbps: 96,
+                    codec: AacCodec::Lc,
                 },
                 Rung {
                     id: 2,
+                    name: "hi".into(),
+                    bitrate_kbps: 192,
+                    codec: AacCodec::Lc,
+                },
+                Rung {
+                    id: 3,
                     name: "hd".into(),
                     bitrate_kbps: 320,
+                    codec: AacCodec::Lc,
                 },
             ],
+        }
+    }
+
+    /// A view of this profile containing only `enabled` rungs, still sorted
+    /// ascending by bitrate. Never empty: if `enabled` excludes every rung
+    /// (an empty selection, or a stale config referencing ids that no longer
+    /// exist), falls back to just the single lowest-bitrate rung of the full
+    /// ladder — the scheduler's continuity tier always needs *some* cheap
+    /// option to guarantee playback, so a filtered view degrading to "no
+    /// rungs at all" would be worse than ignoring an invalid selection.
+    pub fn filtered(&self, enabled: &std::collections::BTreeSet<RungId>) -> Self {
+        let mut rungs: Vec<Rung> = self
+            .rungs
+            .iter()
+            .filter(|r| enabled.contains(&r.id))
+            .cloned()
+            .collect();
+        if rungs.is_empty() {
+            if let Some(lowest) = self.rungs.iter().min_by_key(|r| r.bitrate_kbps) {
+                rungs.push(lowest.clone());
+            }
+        }
+        Self {
+            segment_ms: self.segment_ms,
+            rungs,
         }
     }
 
@@ -78,6 +136,9 @@ impl StreamProfile {
             .map(|r| r.bitrate_kbps)
             .unwrap_or(0)
     }
+    pub fn codec_of(&self, rung: RungId) -> Option<AacCodec> {
+        self.rungs.iter().find(|r| r.id == rung).map(|r| r.codec)
+    }
     /// Next rung strictly above `rung`, if any (one incremental step up).
     pub fn rung_above(&self, rung: RungId) -> Option<RungId> {
         self.rungs
@@ -85,6 +146,17 @@ impl StreamProfile {
             .filter(|r| r.id > rung)
             .min_by_key(|r| r.bitrate_kbps)
             .map(|r| r.id)
+    }
+    /// Resolves a persisted "preferred rung" (e.g. an operator's default-
+    /// quality setting) against this profile: returns `preferred` if it's
+    /// actually present, else falls back to `low_rung()` — handles the case
+    /// where the operator's saved preference was since disabled.
+    pub fn nearest_enabled_or_low(&self, preferred: RungId) -> RungId {
+        if self.rungs.iter().any(|r| r.id == preferred) {
+            preferred
+        } else {
+            self.low_rung()
+        }
     }
 }
 
@@ -267,4 +339,78 @@ pub struct EncoderState {
     /// by any means (manual or automatic) — see `docs/protocol.md` §3.
     #[serde(default)]
     pub auto_start_buffer_ms: Option<u32>,
+}
+
+#[cfg(test)]
+mod stream_profile_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn default_ladder_is_four_rungs_lo_he_rest_lc() {
+        let profile = StreamProfile::default_ladder(2000);
+        assert_eq!(profile.rungs.len(), 4);
+        assert_eq!(profile.bitrate_of(0), 48);
+        assert_eq!(profile.bitrate_of(1), 96);
+        assert_eq!(profile.bitrate_of(2), 192);
+        assert_eq!(profile.bitrate_of(3), 320);
+        assert_eq!(profile.codec_of(0), Some(AacCodec::He));
+        assert_eq!(profile.codec_of(1), Some(AacCodec::Lc));
+        assert_eq!(profile.codec_of(2), Some(AacCodec::Lc));
+        assert_eq!(profile.codec_of(3), Some(AacCodec::Lc));
+    }
+
+    #[test]
+    fn filtered_keeps_only_enabled_rungs_in_order() {
+        let profile = StreamProfile::default_ladder(2000);
+        let enabled: BTreeSet<RungId> = [1, 3].into_iter().collect();
+        let filtered = profile.filtered(&enabled);
+        assert_eq!(
+            filtered.rungs.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(filtered.low_rung(), 1);
+        assert_eq!(filtered.top_rung(), 3);
+    }
+
+    #[test]
+    fn filtered_excluding_rung_zero_makes_the_next_lowest_the_effective_survival_rung() {
+        let profile = StreamProfile::default_ladder(2000);
+        let enabled: BTreeSet<RungId> = [1, 2, 3].into_iter().collect();
+        let filtered = profile.filtered(&enabled);
+        assert_eq!(filtered.low_rung(), 1);
+        assert!(filtered.rungs.iter().all(|r| r.id != 0));
+    }
+
+    #[test]
+    fn filtered_never_returns_empty() {
+        let profile = StreamProfile::default_ladder(2000);
+        let filtered = profile.filtered(&BTreeSet::new());
+        assert_eq!(filtered.rungs.len(), 1);
+        assert_eq!(filtered.low_rung(), 0); // lowest-bitrate rung of the full ladder
+    }
+
+    #[test]
+    fn filtered_ignores_unknown_ids() {
+        let profile = StreamProfile::default_ladder(2000);
+        let enabled: BTreeSet<RungId> = [99].into_iter().collect();
+        let filtered = profile.filtered(&enabled);
+        assert_eq!(filtered.rungs.len(), 1);
+        assert_eq!(filtered.low_rung(), 0);
+    }
+
+    #[test]
+    fn nearest_enabled_or_low_prefers_the_preferred_rung_when_present() {
+        let profile = StreamProfile::default_ladder(2000);
+        let filtered = profile.filtered(&[0, 2].into_iter().collect());
+        assert_eq!(filtered.nearest_enabled_or_low(2), 2);
+    }
+
+    #[test]
+    fn nearest_enabled_or_low_falls_back_when_preferred_was_disabled() {
+        let profile = StreamProfile::default_ladder(2000);
+        let filtered = profile.filtered(&[0, 1].into_iter().collect());
+        // Operator's saved default (rung 3) isn't in this session's ladder.
+        assert_eq!(filtered.nearest_enabled_or_low(3), filtered.low_rung());
+    }
 }

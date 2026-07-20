@@ -1,0 +1,24 @@
+# dist (formerly cargo-dist) packaging config — https://opensource.axo.dev/cargo-dist/
+#
+# Only the encoder client is packaged as downloadable binaries: it's the
+# cross-platform GUI app operators run at the OB site. The server ships as a
+# Docker image (see the repo-root Dockerfile) and is opted out of dist via
+# `dist = false` in crates/obcast-server/Cargo.toml.
+#
+# dist is not installed in this repo's dev environment. Once it is, run
+# `dist init` / `dist generate-ci` to (re)generate the GitHub Actions release
+# workflow from this config — do not hand-write .github/workflows/release.yml.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.28.0"
+ci = ["github"]
+installers = ["shell", "powershell"]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]

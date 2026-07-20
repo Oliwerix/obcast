@@ -215,7 +215,7 @@ fn decode_mono_i16(path: &std::path::Path, sample_rate: u32) -> Option<Vec<i16>>
 mod tests {
     use super::*;
     use crate::store::DvrStore;
-    use obcast_proto::state::{Rung, WaterLevels};
+    use obcast_proto::state::{AacCodec, Rung, WaterLevels};
     use std::path::PathBuf;
 
     fn profile() -> StreamProfile {
@@ -225,6 +225,7 @@ mod tests {
                 id: 0,
                 name: "lo".into(),
                 bitrate_kbps: 32,
+                codec: AacCodec::He,
             }],
         }
     }

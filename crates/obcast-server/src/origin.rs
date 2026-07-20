@@ -12,7 +12,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 
-use obcast_proto::state::{RungId, Seq};
+use obcast_proto::state::{AacCodec, RungId, Seq};
 
 use crate::AppState;
 
@@ -45,11 +45,18 @@ pub async fn master_playlist(
 
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
     for rung in &profile.rungs {
-        // Native `aac` only produces LC; the "lo" rung is HE-AAC in the design
-        // doc but this MVP encoder can't produce that profile (no libfdk_aac).
+        // mp4a.40.2 = AAC-LC, mp4a.40.5 = HE-AAC (v1/SBR) — must match
+        // whatever `encode.rs` actually produced for this rung (it falls
+        // back to LC itself if the local ffmpeg lacks libfdk_aac, but that
+        // fallback isn't visible here, so this reflects the *requested*
+        // codec, not necessarily what was encoded on a degraded machine).
+        let codecs = match rung.codec {
+            AacCodec::Lc => "mp4a.40.2",
+            AacCodec::He => "mp4a.40.5",
+        };
         let _ = writeln!(
             out,
-            "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"mp4a.40.2\"",
+            "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"",
             rung.bitrate_kbps * 1000
         );
         let _ = writeln!(out, "{}/index.m3u8", rung.id);

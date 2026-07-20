@@ -41,3 +41,13 @@ cargo test                                    # scheduler + server unit tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt
 ```
+
+## Packaging
+
+- **Server** — Docker image built from the repo-root `Dockerfile`
+  (`docker build -t obcast-server .`).
+- **Client** — cross-platform binaries via [`dist`](https://opensource.axo.dev/cargo-dist/),
+  configured in `dist-workspace.toml` (Windows/macOS/Linux, shell + PowerShell
+  installers). `dist` isn't vendored here; on a machine that has it, run
+  `dist build` locally or `dist generate-ci` to emit the release workflow. The
+  server is excluded from `dist` (Docker-only).

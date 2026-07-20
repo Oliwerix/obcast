@@ -27,6 +27,11 @@ pub struct Config {
     /// Requested auto-start buffer, in ms — forwarded to the server on every
     /// heartbeat as `EncoderState::auto_start_buffer_ms`. `None` disables it.
     pub auto_start_buffer_ms: Option<u32>,
+    /// Operator's preferred rung to assume for the bootstrap bandwidth guess
+    /// before real throughput/`ServerState` feedback arrives. Resolved
+    /// against `profile` via `StreamProfile::nearest_enabled_or_low` in case
+    /// it's since been disabled.
+    pub bootstrap_rung: RungId,
 }
 
 /// How long a permanent-looking continuity gap (missing on both the local
@@ -52,8 +57,11 @@ struct AbandonBody<'a> {
 pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>) {
     let rungs: Vec<RungId> = cfg.profile.rungs.iter().map(|r| r.id).collect();
     let low = cfg.profile.low_rung();
-    // Seed conservatively; corrected from real upload timing after the first send.
-    let mut throughput_kbps: u32 = cfg.profile.bitrate_of(low) * 4;
+    // Seed from the operator's preferred bootstrap rung (falling back to the
+    // ladder's low rung if that preference was since disabled); corrected
+    // from real upload timing after the first send.
+    let bootstrap_rung = cfg.profile.nearest_enabled_or_low(cfg.bootstrap_rung);
+    let mut throughput_kbps: u32 = cfg.profile.bitrate_of(bootstrap_rung) * 4;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
 
     // Tracks the one continuity gap currently under an abandon countdown, and
