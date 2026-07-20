@@ -7,7 +7,7 @@
 //!    channel — never blocks a frame on network or process I/O.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tokio::io::AsyncWriteExt;
@@ -75,6 +75,13 @@ struct ObcastApp {
     live: bool,
     /// Whether the operator log panel (bottom of the window) is open.
     show_log: bool,
+    /// "All Input Channels" bank source data — resampled once/sec rather
+    /// than every repaint (see `sample_channel_peaks`). `channel_peaks_display`
+    /// eases toward `channel_peaks_target` every frame so the bars still
+    /// read as smoothly moving despite the coarser sample rate.
+    channel_peaks_target: Vec<f32>,
+    channel_peaks_display: Vec<f32>,
+    channel_peaks_sampled_at: Option<Instant>,
 }
 
 impl ObcastApp {
@@ -108,11 +115,44 @@ impl ObcastApp {
             cfg,
             live: false,
             show_log: false,
+            channel_peaks_target: Vec::new(),
+            channel_peaks_display: Vec::new(),
+            channel_peaks_sampled_at: None,
         }
     }
 
     fn persist_config(&self) {
         self.cfg.save();
+    }
+
+    /// Refresh `channel_peaks_target` from the audio thread at most once a
+    /// second, then ease `channel_peaks_display` toward it every frame. The
+    /// whole window still repaints at ~30fps regardless (see `ui()`), so
+    /// this doesn't reduce paint calls — it throttles the actual per-frame
+    /// cost, which was `channel_peaks()`'s lock-and-clone plus a full
+    /// per-channel re-layout, repeated 30x/sec for a view nobody reads at
+    /// that rate.
+    fn sample_channel_peaks(&mut self) {
+        let due = match self.channel_peaks_sampled_at {
+            None => true,
+            Some(at) => at.elapsed() >= Duration::from_secs(1),
+        };
+        if due {
+            self.channel_peaks_target = self.audio.channel_peaks();
+            self.channel_peaks_sampled_at = Some(Instant::now());
+        }
+        if self.channel_peaks_display.len() != self.channel_peaks_target.len() {
+            self.channel_peaks_display
+                .resize(self.channel_peaks_target.len(), 0.0);
+        }
+        const EASE: f32 = 0.15;
+        for (disp, target) in self
+            .channel_peaks_display
+            .iter_mut()
+            .zip(self.channel_peaks_target.iter())
+        {
+            *disp += (*target - *disp) * EASE;
+        }
     }
 
     fn profile(&self) -> StreamProfile {
@@ -390,10 +430,11 @@ impl ObcastApp {
         ui.label(
             "Every channel this device offers — find which one has signal, then assign it above.",
         );
+        self.sample_channel_peaks();
         egui::ScrollArea::vertical()
             .max_height(240.0)
             .show(ui, |ui| {
-                let peaks = self.audio.channel_peaks();
+                let peaks = self.channel_peaks_display.clone();
                 for (i, peak) in peaks.iter().enumerate() {
                     let ch = i as u16;
                     ui.horizontal(|ui| {
