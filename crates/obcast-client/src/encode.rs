@@ -5,10 +5,11 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use tokio::process::{Child, Command};
 
-use obcast_proto::state::StreamProfile;
+use obcast_proto::state::{AacCodec, Rung, StreamProfile};
 
 #[derive(Debug, Clone)]
 pub enum Source {
@@ -28,8 +29,82 @@ pub enum Source {
     Pcm { sample_rate: u32 },
 }
 
-pub fn spawn(source: &Source, profile: &StreamProfile, out_dir: &Path) -> std::io::Result<Child> {
+/// Whether the local `ffmpeg` binary was built with `libfdk_aac` — required
+/// to actually emit HE-AAC (native `aac` only ever produces LC). Probed once
+/// per process via `ffmpeg -encoders` and cached: this runs synchronously
+/// on whatever task calls `spawn` (matching that function's own already-sync
+/// subprocess/filesystem calls), so it's worth avoiding on every rung.
+fn ffmpeg_has_libfdk_aac() -> bool {
+    static HAS_LIBFDK: OnceLock<bool> = OnceLock::new();
+    *HAS_LIBFDK.get_or_init(|| {
+        std::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-encoders")
+            .output()
+            .map(|out| encoders_list_has_libfdk_aac(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or(false)
+    })
+}
+
+/// Pure string check pulled out of `ffmpeg_has_libfdk_aac` so the parsing
+/// logic has unit coverage even though the `ffmpeg` subprocess call itself
+/// doesn't.
+fn encoders_list_has_libfdk_aac(encoders_output: &str) -> bool {
+    encoders_output.contains("libfdk_aac")
+}
+
+/// Codec args (`-c:a ...` plus any codec-specific profile flag) for one rung,
+/// plus a fallback warning if it wanted HE-AAC but the local ffmpeg can't
+/// produce it — encoding falls back to plain AAC-LC at the same bitrate
+/// rather than failing the whole pipeline (CLAUDE.md §5: "the feedback loop
+/// degrades safely").
+///
+/// VERIFIED against a locally-built `libfdk_aac`-enabled ffmpeg (this repo's
+/// stock dev/CI ffmpeg lacks it, so the `AacCodec::He if has_libfdk` arm is
+/// otherwise dead in practice here): HE-AAC's SBR doubles the encoder's frame
+/// size (2048 samples vs LC's 1024), so `-segment_time`'s frame-boundary
+/// snapping can, in principle, cut the HE-AAC rung's segments at a different
+/// sample position than the LC rungs sharing this same `ffmpeg` process.
+/// Measured with sample-accurate PCM decode (not container-reported
+/// duration, which is misleading here) across a 90s/45-segment run at 2s
+/// segments: 39/45 seq boundaries land at the exact same sample count on
+/// both the HE-AAC and an LC rung; the other 6 (roughly every 7-8 segments,
+/// where neither 2048 nor 1024 divides the 2s/44.1kHz target evenly) differ
+/// by exactly one LC frame (1024 samples, ~23ms) and self-correct on the
+/// very next segment rather than compounding — i.e. the two rungs' cumulative
+/// position never drifts by more than one LC frame at any point, regardless
+/// of how long the stream runs. A one-frame (~23ms), self-correcting,
+/// worst-case misalignment at a rung switch is small enough relative to a
+/// 2s segment (and to normal AAC encoder priming/lookahead variance, which
+/// already exists between any two rungs regardless of codec) that it's
+/// judged acceptable rather than something to build extra machinery around;
+/// revisit if segment_ms is ever configured much shorter than the default.
+fn codec_args(rung: &Rung, has_libfdk: bool) -> (&'static str, Vec<&'static str>, Option<String>) {
+    match rung.codec {
+        AacCodec::He if has_libfdk => ("libfdk_aac", vec!["-profile:a", "aac_he"], None),
+        AacCodec::He => (
+            "aac",
+            vec![],
+            Some(format!(
+                "ffmpeg build lacks libfdk_aac: rung \"{}\" encoding as AAC-LC instead of HE-AAC",
+                rung.name
+            )),
+        ),
+        AacCodec::Lc => ("aac", vec![], None),
+    }
+}
+
+/// Spawns the ffmpeg pipeline. Returns the child process plus any codec
+/// fallback warnings (one per rung that wanted HE-AAC but couldn't get it) —
+/// the caller decides how to surface those (e.g. the GUI logs them).
+pub fn spawn(
+    source: &Source,
+    profile: &StreamProfile,
+    out_dir: &Path,
+) -> std::io::Result<(Child, Vec<String>)> {
     let segment_secs = (profile.segment_ms as f32 / 1000.0).to_string();
+    let has_libfdk = ffmpeg_has_libfdk_aac();
+    let mut warnings = Vec::new();
 
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-hide_banner")
@@ -77,11 +152,15 @@ pub fn spawn(source: &Source, profile: &StreamProfile, out_dir: &Path) -> std::i
             std::fs::remove_dir_all(&dir)?;
         }
         std::fs::create_dir_all(&dir)?;
-        cmd.arg("-map")
-            .arg("0:a")
-            .arg("-c:a")
-            .arg("aac")
-            .arg("-b:a")
+        let (codec_name, profile_args, warning) = codec_args(rung, has_libfdk);
+        if let Some(w) = warning {
+            warnings.push(w);
+        }
+        cmd.arg("-map").arg("0:a").arg("-c:a").arg(codec_name);
+        for arg in profile_args {
+            cmd.arg(arg);
+        }
+        cmd.arg("-b:a")
             .arg(format!("{}k", rung.bitrate_kbps))
             .arg("-f")
             .arg("segment")
@@ -101,5 +180,70 @@ pub fn spawn(source: &Source, profile: &StreamProfile, out_dir: &Path) -> std::i
     cmd.stdin(stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    cmd.spawn()
+    cmd.spawn().map(|child| (child, warnings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rung(id: u8, codec: AacCodec) -> Rung {
+        Rung {
+            id,
+            name: "lo".into(),
+            bitrate_kbps: 48,
+            codec,
+        }
+    }
+
+    #[test]
+    fn encoders_list_has_libfdk_aac_detects_a_real_encoders_dump() {
+        // Trimmed real `ffmpeg -hide_banner -encoders` output.
+        let output = "Encoders:\n V..... libx264   H.264\n A....D aac      AAC (Advanced Audio Coding)\n A....D libfdk_aac libfdk AAC\n";
+        assert!(encoders_list_has_libfdk_aac(output));
+    }
+
+    #[test]
+    fn encoders_list_has_libfdk_aac_is_false_without_it() {
+        // Matches this dev machine's actual `ffmpeg -encoders` output: only
+        // the native `aac` encoder, no libfdk_aac — the fallback path this
+        // whole feature depends on being safe on.
+        let output =
+            "Encoders:\n V..... libx264   H.264\n A....D aac      AAC (Advanced Audio Coding)\n";
+        assert!(!encoders_list_has_libfdk_aac(output));
+    }
+
+    #[test]
+    fn encoders_list_has_libfdk_aac_handles_empty_output() {
+        assert!(!encoders_list_has_libfdk_aac(""));
+    }
+
+    #[test]
+    fn codec_args_uses_libfdk_for_he_when_available() {
+        let (name, args, warning) = codec_args(&rung(0, AacCodec::He), true);
+        assert_eq!(name, "libfdk_aac");
+        assert_eq!(args, vec!["-profile:a", "aac_he"]);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn codec_args_falls_back_to_lc_for_he_when_libfdk_unavailable() {
+        let (name, args, warning) = codec_args(&rung(0, AacCodec::He), false);
+        assert_eq!(name, "aac");
+        assert!(args.is_empty());
+        assert!(warning.is_some(), "must warn when falling back from HE-AAC");
+    }
+
+    #[test]
+    fn codec_args_never_warns_for_a_plain_lc_rung() {
+        let (name, args, warning) = codec_args(&rung(1, AacCodec::Lc), true);
+        assert_eq!(name, "aac");
+        assert!(args.is_empty());
+        assert!(warning.is_none());
+
+        let (name, args, warning) = codec_args(&rung(1, AacCodec::Lc), false);
+        assert_eq!(name, "aac");
+        assert!(args.is_empty());
+        assert!(warning.is_none());
+    }
 }

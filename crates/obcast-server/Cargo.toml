@@ -3,6 +3,11 @@ name = "obcast-server"
 version = "0.1.0"
 edition = "2021"
 
+# The server ships as a Docker image (repo-root Dockerfile), not a dist
+# archive, so it is excluded from cargo-dist's release artifacts.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 obcast-proto = { path = "../obcast-proto" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "sync", "time"] }

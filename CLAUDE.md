@@ -69,7 +69,7 @@ Chosen for single-binary robustness in the field and one shared type crate acros
 | Server framework   | `axum` (ingest, HLS origin, control REST, WS) + `tower-http`      |
 | Server → encoder feed | SSE over `axum`; also piggybacked on upload responses          |
 | Client audio I/O   | `cpal` (capture + playout device access)                          |
-| Encode / decode    | `ffmpeg` via subprocess, one process → N rungs (currently AAC-LC on every rung; native `aac` can't emit HE-AAC, so the low rung needs `libfdk_aac` to get its intended win). `symphonia` for decode-only paths |
+| Encode / decode    | `ffmpeg` via subprocess, one process → N rungs. The low rung is HE-AAC via `libfdk_aac` (native `aac` can only emit LC) — auto-detected once at startup; if the local ffmpeg build lacks it, that rung silently falls back to AAC-LC at the same bitrate with a logged warning rather than failing the pipeline. A `libfdk_aac`-enabled ffmpeg is built per-platform in CI (`scripts/build-libfdk-ffmpeg*`, see "packaging" in §8) as a downloadable build artifact; wiring it into the actual release archive so it ships by default is the one remaining piece (also §8). `symphonia` for decode-only paths |
 | Client GUI         | `egui`/`eframe` (chosen, done); also a `--headless` CLI path with no GUI |
 | DVR store          | Filesystem segments + in-memory index (optionally `rusqlite`)     |
 | Web listen / UI    | `hls.js` + `peaks.js`, loaded from CDN by static `web/remote/index.html` (shows overview) + `stream.html` (per-show remote) — no bundler/build step |
@@ -151,8 +151,13 @@ CDNs: `web/remote/index.html` is the shows overview served at `/remote/`, linkin
   playout immediately rather than waiting out the timeout.
 - **No audio lost to a short outage.** Segments persist on disk until acked and within the DVR
   window; on reconnect, resume from the oldest un-acked segment.
-- **Rungs are ordered low→high; rung 0 is the survival rung.** The scheduler always has a cheap
-  option to guarantee continuity.
+- **Rungs are ordered low→high in the full ladder.** This describes the *default,
+  fully-enabled* ladder, not a hardcoded id — the operator may disable any rung, including the
+  lowest, from the encoder GUI (any rung except the sole remaining enabled one). Whichever rung
+  ends up lowest in the *filtered* profile becomes the effective survival rung for that session;
+  `plan_uploads`/`stalled_continuity_seq` always derive "low" from `StreamProfile::low_rung()`,
+  never a literal `0`, so the scheduler always has a cheap option to guarantee continuity
+  regardless of which rungs are enabled.
 - **The server owns the published playlist** and rebuilds it from what it actually received.
 - **The feedback loop degrades safely.** If `ServerState` goes stale, the encoder assumes
   `ServerState::unknown()` (stopped, empty buffer) and plays it safe: low rung, protect the live edge.
@@ -213,9 +218,10 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
 - **M3 — DONE.** Client `ffmpeg` ABR encode (one proc → N rungs) → `{rung}/{seq}.ts` disk ring
   buffer; `inventory.rs` scan; uploader tick loop driving `plan_uploads` against the real server and
   folding `ServerState` from responses.
-- **M4 — DONE (server) / PARTIAL (web listen).** HLS origin (master + per-rung sliding-window
-  playlists, best-rung fallback) done. Web has hls.js listen-along, but the scrub bar drives *server*
-  playout via the waveform — browser-side DVR scrub of the listen-along player itself is **OPEN**.
+- **M4 — DONE.** HLS origin (master + per-rung sliding-window playlists, best-rung fallback) done.
+  Web has hls.js listen-along with its own scrub bar (`audio.currentTime`/`audio.buffered`, never
+  touching `/api/{stream}/playout`) independent of the waveform card's server-playout scrub — see the
+  "Browser-side DVR scrub" entry further down for how the listen-along gap was closed.
 - **M5 — DONE**, plus a correctness fix. Playout to hardware out via `cpal` (dedicated thread, ffmpeg
   decode, ring buffer, atomics for pos/state/vol/meters), start/stop + seek; head flows into
   `ServerState` (holds rather than skips on a not-yet-on-disk segment). Fixed: `position_seq` used to
@@ -255,27 +261,35 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   `PlayoutPosition::SecondsBehindLive`, which is a `u32` — any non-integer click position (e.g.
   `4.192`) got rejected with a 422 `invalid type: floating point, expected u32`. Now rounded with
   `Math.round()` before sending, matching the seconds-granularity the server type expects.
-- **M7 — PARTIAL.** Done: optional single-token ingest auth (`X-Auth`); SSE + uploader reconnect on
-  drop; client-side abandon + a bounded stall timeout in `playout.rs` (a permanent segment gap no
-  longer stalls the playout head indefinitely — verified live: an unfilled gap gets skipped after
-  `3 * segment_ms`, and an explicit `/abandon` unsticks it immediately); stale-`ServerState` fallback
-  (client now discards state older than 5 s, and the server seeds a fresh store's `rev` from
-  wall-clock epoch millis so a restart can no longer look "older" than what a client already held —
-  see §5 for both). Open: auth split (separate ingest/control/listen tokens) — note the control-plane
-  POST (`/api/{stream}/playout`) has **no auth check at all** today, unlike ingest's `X-Auth`, so
-  anyone reachable can stop/seek/volume any stream's hardware output; server-side DVR file reaping
-  (`evict_old()` drops index entries but the underlying `.ts` files are never deleted — unbounded disk
-  growth on a long OB, verified by Rust review); reverse telemetry path (client sends `EncoderState`;
-  server populates `ControlStatus.encoder` + real `throughput_kbps`, incl. the
-  `POST /ingest/{stream}/heartbeat` route `docs/protocol.md` already documents — confirmed purely
-  cosmetic/dashboard-visibility, not load-bearing for scheduling); packaging (server Docker, static
-  client binaries); an unbounded resource leak where any GET against a new/typo'd stream name spawns
-  a permanent OS thread + `DvrStore` with no idle reaping (only explicit `DELETE /api/shows/{name}`
-  tears one down — verified by adversarial review); `playout_state()` reports `Playing` from the
-  `running` flag alone, so it (and the web pill) can say "playing" while the output is genuinely
-  silent (cpal zero-fills underruns) — the new stall-skip logging at least surfaces *why*, but the
-  state itself is still not a lie-proof signal; `waveform.rs` silently swallows any per-segment decode
-  failure as a flat `(0,0)` line, indistinguishable from real silence.
+- **M7 — DONE**, across this and later sessions (this entry originally shipped marked PARTIAL with a
+  long "Open:" list below it; that list is stale — every item on it has since been fixed, in sessions
+  whose commits predate this document being updated to say so, which is itself the kind of
+  doc/reality drift this session's own CLAUDE.md pass went back and corrected throughout). Done:
+  optional single-token ingest auth (`X-Auth`); SSE + uploader reconnect on drop; client-side abandon
+  + a bounded stall timeout in `playout.rs` (a permanent segment gap no longer stalls the playout head
+  indefinitely — verified live: an unfilled gap gets skipped after `3 * segment_ms`, and an explicit
+  `/abandon` unsticks it immediately); stale-`ServerState` fallback (client now discards state older
+  than 5 s, and the server seeds a fresh store's `rev` from wall-clock epoch millis so a restart can no
+  longer look "older" than what a client already held — see §5 for both). Also fixed since: **auth
+  split** — a separate `OBCAST_CONTROL_TOKEN`/`control_token` gates `POST /api/{stream}/playout` via
+  `check_control_auth` (`api.rs`), checked before any stream lookup so a bad/missing token can't be
+  used to spin up a stream's playout thread just to get rejected (`AppState::control_token`,
+  `main.rs`) — distinct from ingest's `X-Auth` by design, since an OB site's upload token shouldn't
+  also be able to stop/seek/volume the hardware output. **Per-stream resource leak** — read-only
+  control/HLS routes (`status`/`waveform`/`ws`, HLS origin) use `AppState::stream_if_known`, which
+  never auto-vivifies a permanent OS thread + `DvrStore` for a name nobody has ingested into (unlike
+  `AppState::stream`, reserved for the ingest/media-plane entry points where "doesn't exist yet"
+  legitimately means "a new stream is starting"). **DVR file reaping** — `DvrStore::record()` returns
+  the on-disk paths any given call evicted from the index; `ingest.rs`'s `reap()` actually deletes them
+  via `tokio::fs::remove_file` (best-effort, logged on failure) instead of leaking them forever.
+  **Reverse telemetry** — `POST /ingest/{stream}/heartbeat` is wired to `DvrStore::set_encoder_state`,
+  and `api.rs::build_status` populates `ControlStatus.encoder` + real `throughput_kbps` from it.
+  **Stalled-vs-playing distinction** — `playout.rs`'s `playout_state()` has a `PlayoutState::Stalled`
+  variant, distinct from `Playing`, surfaced through `ServerState`/the web pill/`computeReason()` in
+  `stream.html`. **Waveform decode-failure surfacing** — `WaveformJson` carries a `decode_failed`
+  array parallel to `rungs`/`data`, distinguishing a real gap (no rung ever recorded) from an
+  indexed-but-undecodable segment, covered by tests in `waveform.rs`. Packaging (the one remaining item
+  from the old "Open:" list) is covered by the "Packaging" entry further down.
 - **Two more fixes (found chasing an operator report of "web remote *and* GUI both say HD but the
   server is audibly outputting low quality, and playback sometimes jumps around").** (1) The quality
   mismatch was deeper than it first looked. A first pass made `LinkHealth.current_rung` look up
@@ -307,6 +321,96 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   covered by pure unit tests in `origin.rs` (`playlist_body`) demonstrating the position-stability
   property directly, and in `playout.rs` (`advance_pending`) demonstrating that a stale-but-fed low rung
   is reported even once the index has moved on to HD for the same seq.
+- **ABR ladder rework: HE-AAC survival rung + a fully operator-controllable ladder.** Closes the
+  long-open "low rung should be HE-AAC" gap and adds three new operator controls to the encoder GUI.
+  The default ladder (`StreamProfile::default_ladder`, `obcast-proto`) is now four rungs —
+  `lo`/48k/HE-AAC, `mid`/96k, `hi`/192k, `hd`/320k (all LC except `lo`) — up from three (32/128/320,
+  all LC). `encode.rs` probes `ffmpeg -encoders` once at startup for `libfdk_aac`; if present, `lo`
+  encodes as real HE-AAC (`-c:a libfdk_aac -profile:a aac_he`), otherwise it falls back to AAC-LC at
+  the same bitrate with a logged warning — never a hard failure. `origin.rs`'s master playlist now
+  emits the matching HLS `CODECS` tag per rung (`mp4a.40.5` for HE-AAC, `mp4a.40.2` for LC) instead of
+  hardcoding LC for everything. Operators can enable/disable any rung (including the lowest — see the
+  §5 invariant update above) and pick a "default quality" (the rung the uploader's bootstrap bandwidth
+  guess assumes before real `ServerState`/throughput feedback arrives; purely a starting point, the
+  closed-loop scheduler takes over immediately once real data flows) from a new "Rungs" section in the
+  GUI that — unlike the rest of "Stream Target" — stays interactive while live. `StreamProfile::filtered()`
+  is the mechanism: it narrows the full ladder to the enabled subset (never empty; falls back to the
+  single lowest-bitrate rung of the full ladder if a stale config would otherwise empty it), and that
+  filtered profile is all `plan_uploads` ever sees — **no scheduler code changed**, since it already
+  derived every "low"/"next rung" concept from `profile.rungs` rather than a hardcoded id. Toggling a
+  rung while live requires confirming a warning dialog (it restarts the encoder pipeline — ffmpeg can't
+  add/remove `-map` outputs without a respawn — causing a few seconds of audio gap that the existing
+  continuity/abandon/stall-skip machinery already absorbs); the dialog exists specifically so a live
+  toggle is a deliberate operator action, not an accidental one. **Segment-alignment risk, raised by
+  adversarial review and since verified**: this repo's stock dev/CI ffmpeg lacks `libfdk_aac`, so a
+  second, `libfdk_aac`-enabled ffmpeg (built from source locally against the already-present
+  `libfdk-aac` system library — see `dist`/packaging entry below for why this isn't the default build)
+  was used to actually exercise the HE-AAC path and check `encode.rs`'s own module-doc claim of
+  sample-aligned segment boundaries across rungs. HE-AAC's SBR doubles the encoder's frame size (2048
+  samples vs LC's 1024), so in principle `-segment_time`'s frame-boundary snapping could cut the `lo`
+  rung's segments at a different sample position than the LC rungs sharing the same `ffmpeg` process.
+  Measured with sample-accurate PCM decode (container-reported duration turned out to be unreliable
+  here) across a 90s/45-segment run at the default 2s segment length: 39/45 seq boundaries land at the
+  *exact* same sample count on both `lo` (HE-AAC) and an LC rung; the other 6 — at the points where
+  neither 2048 nor 1024 samples divides the 2s/44.1kHz target evenly, roughly every 7-8 segments —
+  differ by exactly one LC frame (1024 samples, ~23ms), and self-correct on the very next segment
+  rather than compounding. The two rungs' cumulative position never drifts by more than one LC frame at
+  any point, regardless of stream length. Judged acceptable as-is (a bounded ~23ms worst-case,
+  self-correcting misalignment at a rung switch, comparable to normal AAC encoder priming/lookahead
+  variance that already exists between any two rungs) rather than something to build extra machinery
+  around; see `encode.rs`'s `codec_args` doc comment for the same finding in context. Revisit if
+  `segment_ms` is ever configured much shorter than the 2000ms default, which would shrink the
+  denominator this tolerance is relative to.
+- **Browser-side DVR scrub for the listen-along player** (`web/remote/stream.html`), closing the M4
+  gap noted below: the independent hls.js `<audio>` preview player gained its own seek bar and "Go
+  live" button, driven purely by `audio.currentTime`/`audio.buffered` — it never touches
+  `/api/{stream}/playout`, so it stays fully decoupled from the server's real hardware-output playhead
+  (the waveform card above it). `backBufferLength: 300` set on the `Hls()` instance so a useful chunk
+  of DVR history (matching the server's 5-minute window) actually stays seekable, since hls.js
+  otherwise aggressively flushes back-buffer for live streams.
+- **Packaging.** The server was already Docker-only (repo-root `Dockerfile`). The client (the
+  cross-platform `egui` GUI app run at the OB site) now has a `dist-workspace.toml` (using
+  [`cargo-dist`](https://opensource.axo.dev/cargo-dist/)'s modern standalone-file config) targeting
+  Windows/macOS (x86_64 + aarch64)/Linux with shell + PowerShell installers; the server crate opts out
+  via `dist = false` in its own `Cargo.toml` since it stays Docker-only. `dist` was installed locally
+  and actually run (`dist init` / `dist generate-ci`, `dist plan`) rather than just hand-writing config
+  against a guessed schema — `dist plan` confirms the four target archives it produces cover only
+  `obcast-client`. This generated the real `.github/workflows/release.yml`; don't hand-edit that file,
+  edit `dist-workspace.toml` and regenerate instead. Also bundles the `libfdk_aac`-enabled ffmpeg from
+  the ABR ladder rework entry above: `scripts/build-libfdk-ffmpeg.sh` (Linux/macOS, from source against
+  each platform's `fdk-aac` package) and `-windows.sh` (Windows, an MSYS2/MinGW source build of both
+  `fdk-aac` and ffmpeg — a first attempt used vcpkg's `ffmpeg[fdk-aac]` port instead, which builds fine
+  but passes `--disable-ffmpeg` internally and so never produces the `ffmpeg.exe` CLI binary this
+  actually needs, only the libav* libraries for linking into other software) are wired into
+  `.github/workflows/build-libfdk-ffmpeg.yml`, a `workflow_call`-able job matrix covering all four
+  `dist` targets. Kept as its own workflow rather than folded into the dist-generated one since `dist`
+  has no hook for bundling an externally-built, non-Cargo binary artifact. Actually run on real
+  GitHub-hosted runners (not just written and assumed correct) — all four legs came back green with a
+  working `libfdk_aac`-enabled `ffmpeg` binary as an artifact, including catching and fixing two real
+  bugs a "looks right" review wouldn't have: Windows' first attempt used vcpkg's `ffmpeg[fdk-aac]` port,
+  which builds successfully but passes `--disable-ffmpeg` internally and so never produces the actual
+  `ffmpeg.exe` CLI binary (only libav* libraries) — replaced with the MSYS2/MinGW source build described
+  above; and the macOS x86_64 leg initially targeted the `macos-13` runner label, which sat queued for
+  45+ minutes doing nothing because — confirmed with `actionlint`, not just inferred from the hang —
+  GitHub has fully decommissioned that label, so a job requesting it can never be scheduled at all, no
+  matter how long you wait. Fixed to `macos-15-intel`, the current label for x86_64 macOS runners.
+  `.github/workflows/attach-libfdk-ffmpeg.yml` wires these binaries into the actual release: triggered
+  by `release: published` (i.e. after `dist`'s own `release.yml` creates the release), it builds all
+  four ffmpeg binaries, downloads and unpacks each platform's release archive, injects the matching
+  ffmpeg binary alongside `obcast-client`, repacks, and re-uploads (regenerating that asset's checksum
+  in both its own `.sha256` file and the aggregate `sha256.sum`). The archive-manipulation logic (finding
+  dist's single top-level directory inside each archive, repacking without introducing a stray leading
+  `./` on every path, matching dist's own `{hash} *{filename}` checksum format) was verified locally
+  byte-for-byte against a real `dist build` output rather than assumed from `dist plan`'s summary alone.
+  Both workflow files pass `actionlint` with zero errors. Not yet independently exercised end-to-end
+  against a real published release, since that requires actually cutting a version tag — a genuine
+  release event with real user-facing consequences, deliberately left for the maintainer to trigger
+  rather than done unilaterally by an agent working on a feature branch.
+- **De-duplicated `StreamProfile` construction in the client crate.** `client/main.rs`'s single-use
+  `fn profile(segment_ms) -> StreamProfile` wrapper (just `StreamProfile::default_ladder(segment_ms)`)
+  was deleted and inlined at its one call site. `client/gui/app.rs`'s `profile(&self)` method was left
+  as-is — it's a genuine 5-call-site accessor now doing real work (`.filtered()` against the operator's
+  enabled-rungs config, from the ABR ladder rework above), not redundant indirection.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
@@ -329,26 +433,26 @@ plotting crate: a dependency scan found no `egui_plot` release compatible with t
 version (its latest, 0.35.0, pins `egui ^0.34`), so this follows the same hand-painted-widget approach
 `level_meter`/`mini_meter` already use rather than fighting that mismatch.
 
-**What's next (priority order, re-ranked after Rust/design review and a follow-up adversarial
-review — correctness/security risks before features):** (1) Auth split, and in particular give
-`/api/{stream}/playout` *some* auth check — right now it has none at all, unlike ingest, so any
-reachable client can stop/seek/volume a live hardware output. (2) Fix the per-stream resource leak:
-any GET against a new stream name spawns a permanent OS thread + `DvrStore` with no idle timeout, so
-unauthenticated probing/typos leak threads forever — pair naturally with (1) since gating the routes
-that auto-vivify a stream also bounds this. (3) Server-side DVR file reaping so `.ts` files are
-actually deleted when evicted from the index (currently unbounded disk growth on a long OB). (4) Make
-`playout_state()`/`ServerState` distinguish "playing" from "playing but the head is stalled/skipping"
-— today a stalled or silently-underrunning playout still reports plain `Playing`. (5) Stop
-`waveform.rs` from swallowing per-segment decode failures as a flat `(0,0)` line; surface the failure
-instead so it isn't indistinguishable from real silence. (6) Close the reverse telemetry path — client
-sends `EncoderState` periodically, server fills `ControlStatus.encoder` + real `throughput_kbps`,
-wiring the documented `/ingest/{stream}/heartbeat` route (confirmed cosmetic/dashboard-only; the core
-server→encoder loop of §1 is intact and must stay that way). (7) Packaging (Docker + cargo-dist).
-(8) De-duplicate `StreamProfile` (currently copied in `server/main.rs`, `client/main.rs`,
-`client/gui/app.rs`) into one shared/config-driven source. (9) Lower priority: browser-side DVR scrub
-for listen-along; a true HE-AAC survival rung via `libfdk_aac` (native `aac` emits LC for all rungs);
-add scheduler test coverage for the coverage-window-vs-far-behind-head case and misconfigured water
-levels, both identified as untested edge cases by adversarial review.
+**What's next.** Everything from the previous "auth split / resource leak / DVR reaping / stalled
+playout state / waveform decode failures / reverse telemetry / packaging / StreamProfile dedup /
+browser DVR scrub / HE-AAC survival rung / scheduler edge-case tests" punch list is now DONE — see the
+milestone entries above (M7's auth-split and resource-leak fixes; the DVR-file-reaping, stalled-state,
+and waveform-decode-failure fixes folded into store.rs/playout.rs/waveform.rs; the reverse-telemetry
+heartbeat wiring in store.rs/api.rs; and the ABR ladder rework / browser DVR scrub / packaging /
+StreamProfile dedup entries just above), including the three items this section used to list as
+follow-ups, all now genuinely closed rather than left as documented-but-unverified: the HE-AAC
+segment-alignment risk is measured empirically (not theoretical); `libfdk_aac` ffmpeg bundling has a
+working build **actually confirmed green on all four `dist` targets on real GitHub-hosted runners**
+(Linux, Windows, macOS aarch64, and macOS x86_64 — the last of which required finding and fixing a
+real bug, not just re-running the same job: it targeted the `macos-13` runner label, which
+`actionlint` confirms GitHub has fully decommissioned, so the job could never have been scheduled no
+matter how long it waited; fixed to `macos-15-intel`); and the built ffmpeg binaries are wired into
+the actual release archives by `attach-libfdk-ffmpeg.yml`, with its archive-manipulation logic verified
+locally byte-for-byte against a real `dist build` output. See the "Packaging" milestone entry above for
+the full detail on all three, including the one honestly-flagged gap: `attach-libfdk-ffmpeg.yml`
+itself hasn't been exercised against an actual published release (deliberately not done by cutting a
+real version tag unilaterally) — first real release should be watched to confirm it behaves as
+designed.
 
 ---
 
@@ -374,7 +478,8 @@ native mobile apps (web only); multi-tenant/multi-stream orchestration.
 ## 11. Glossary
 
 **OB** outside broadcast · **ABR ladder** set of bitrate rungs · **rung/rendition** one bitrate
-variant (rung 0 = survival) · **segment** one short media file, keyed `(rung, seq)` · **DVR window**
+variant (the lowest-bitrate *enabled* rung is the survival rung — not necessarily id `0`; see §5) ·
+**segment** one short media file, keyed `(rung, seq)` · **DVR window**
 rolling buffer of retained segments · **live edge** newest segment · **playout head** the segment
 being rendered to the server's HW output · **frontier** highest seq contiguously playable from the
 head · **lead** ms of contiguous audio ahead of the head · **water levels** low/target/high buffer

@@ -5,3 +5,8 @@ members = [
     "crates/obcast-server",
     "crates/obcast-client",
 ]
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

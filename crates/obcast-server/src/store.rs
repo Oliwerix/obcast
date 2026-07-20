@@ -320,29 +320,10 @@ impl DvrStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use obcast_proto::state::{PlayoutState, Rung};
+    use obcast_proto::state::PlayoutState;
 
     fn profile() -> StreamProfile {
-        StreamProfile {
-            segment_ms: 2000,
-            rungs: vec![
-                Rung {
-                    id: 0,
-                    name: "lo".into(),
-                    bitrate_kbps: 32,
-                },
-                Rung {
-                    id: 1,
-                    name: "mid".into(),
-                    bitrate_kbps: 128,
-                },
-                Rung {
-                    id: 2,
-                    name: "hd".into(),
-                    bitrate_kbps: 320,
-                },
-            ],
-        }
+        StreamProfile::default_ladder(2000)
     }
 
     fn stopped() -> PlayoutStatus {

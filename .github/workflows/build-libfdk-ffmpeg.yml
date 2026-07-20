@@ -1,0 +1,98 @@
+# Builds the libfdk_aac-enabled ffmpeg bundled alongside the obcast-client
+# release binary (see scripts/build-libfdk-ffmpeg*.sh and CLAUDE.md §8
+# "packaging"). Separate from the dist-generated .github/workflows/release.yml
+# (don't hand-edit that one — see dist-workspace.toml) since dist doesn't
+# have a hook for bundling an externally-built, non-Cargo binary artifact;
+# this job produces the ffmpeg binaries as its own artifacts, which
+# attach-libfdk-ffmpeg.yml attaches to each platform's release archive.
+#
+# Artifact names are the fixed, deterministic `libfdk-ffmpeg-{dist target
+# triple}` pattern, hardcoded as literals here and in attach-libfdk-ffmpeg.yml
+# rather than threaded through `workflow_call` job outputs — the `macos` job
+# below is itself a 2-target matrix, and GitHub Actions job outputs are only
+# well-defined for a single value per job; a matrixed job writing the same
+# output key from multiple legs is explicitly undocumented/unreliable, not
+# "last one wins" in any guaranteed way.
+name: Build libfdk_aac ffmpeg
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "scripts/build-libfdk-ffmpeg.sh"
+      - "scripts/build-libfdk-ffmpeg-windows.sh"
+      - ".github/workflows/build-libfdk-ffmpeg.yml"
+  workflow_call:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential yasm nasm pkg-config libfdk-aac-dev
+      - name: Build ffmpeg with libfdk_aac
+        run: ./scripts/build-libfdk-ffmpeg.sh "$PWD/ffmpeg-install"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libfdk-ffmpeg-x86_64-unknown-linux-gnu
+          path: ffmpeg-install/bin/ffmpeg
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: brew install fdk-aac yasm nasm pkg-config
+      - name: Build ffmpeg with libfdk_aac
+        run: ./scripts/build-libfdk-ffmpeg.sh "$PWD/ffmpeg-install"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libfdk-ffmpeg-${{ matrix.target }}
+          path: ffmpeg-install/bin/ffmpeg
+          if-no-files-found: error
+
+  windows:
+    # A MinGW-built ffmpeg.exe is a standalone external tool encode.rs shells
+    # out to as a subprocess — its toolchain doesn't need to match
+    # obcast-client's own x86_64-pc-windows-msvc build (only that binary is
+    # linked/compiled by Cargo). vcpkg's ffmpeg port was tried first and
+    # rejected: it builds the libav* libraries with the fdk-aac feature fine,
+    # but passes --disable-ffmpeg internally, so it never produces the
+    # ffmpeg.exe CLI binary this needs — see build-libfdk-ffmpeg-windows.sh.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-yasm
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-pkg-config
+            autoconf
+            automake
+            libtool
+            git
+      - name: Build ffmpeg with libfdk_aac
+        shell: msys2 {0}
+        run: ./scripts/build-libfdk-ffmpeg-windows.sh "$(pwd -W)/ffmpeg-install"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libfdk-ffmpeg-x86_64-pc-windows-msvc
+          path: ffmpeg-install/bin/ffmpeg.exe
+          if-no-files-found: error

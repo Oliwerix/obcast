@@ -1,0 +1,124 @@
+# Post-processes a GitHub Release that dist's generated release.yml just
+# published: builds the libfdk_aac ffmpeg for all four dist targets
+# (build-libfdk-ffmpeg.yml) and injects each into its matching release
+# archive, so the HE-AAC survival rung (crates/obcast-client/src/encode.rs,
+# CLAUDE.md's "ABR ladder rework" entry) works out of the box for anyone who
+# downloads a release, instead of only for someone whose own ffmpeg happens
+# to have libfdk_aac.
+#
+# Kept as a separate, hand-maintained workflow rather than folded into
+# dist's generated release.yml (don't hand-edit that file — see
+# dist-workspace.toml) since dist has no hook for bundling an externally
+# built, non-Cargo binary into its archives. Runs after the fact, against
+# the already-published release, rather than trying to race dist's own
+# build-and-publish job.
+name: Attach libfdk_aac ffmpeg to release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-ffmpeg:
+    uses: ./.github/workflows/build-libfdk-ffmpeg.yml
+
+  attach:
+    needs: build-ffmpeg
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name }}
+    strategy:
+      matrix:
+        include:
+          # ffmpeg_artifact names must stay in sync with the literal names
+          # build-libfdk-ffmpeg.yml's upload-artifact steps use — not piped
+          # through workflow_call outputs, since that job's `macos` leg is
+          # itself a 2-target matrix and GitHub Actions doesn't define
+          # sane semantics for a matrixed job's shared output key.
+          - dist_target: x86_64-unknown-linux-gnu
+            ffmpeg_artifact: libfdk-ffmpeg-x86_64-unknown-linux-gnu
+            archive_ext: tar.xz
+            ffmpeg_name: ffmpeg
+          - dist_target: x86_64-apple-darwin
+            ffmpeg_artifact: libfdk-ffmpeg-x86_64-apple-darwin
+            archive_ext: tar.xz
+            ffmpeg_name: ffmpeg
+          - dist_target: aarch64-apple-darwin
+            ffmpeg_artifact: libfdk-ffmpeg-aarch64-apple-darwin
+            archive_ext: tar.xz
+            ffmpeg_name: ffmpeg
+          - dist_target: x86_64-pc-windows-msvc
+            ffmpeg_artifact: libfdk-ffmpeg-x86_64-pc-windows-msvc
+            archive_ext: zip
+            ffmpeg_name: ffmpeg.exe
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.ffmpeg_artifact }}
+          path: ffmpeg-bin
+
+      - name: Download and unpack the release archive
+        run: |
+          set -euo pipefail
+          asset="obcast-client-${{ matrix.dist_target }}.${{ matrix.archive_ext }}"
+          gh release download "$TAG" --pattern "$asset" --dir .
+          mkdir extracted
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            unzip -q "$asset" -d extracted
+          else
+            tar -xf "$asset" -C extracted
+          fi
+          echo "asset=$asset" >> "$GITHUB_ENV"
+
+      - name: Inject the libfdk_aac ffmpeg binary alongside obcast-client
+        run: |
+          set -euo pipefail
+          # dist archives wrap contents in a single top-level directory
+          # (e.g. obcast-client-x86_64-unknown-linux-gnu/) — find it rather
+          # than hardcoding the exact name dist happens to choose. Verified
+          # locally against a real `dist build` output before this workflow
+          # was written, not just assumed.
+          root="$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1)"
+          if [ -z "$root" ]; then
+            echo "::error::couldn't find the archive's top-level directory" >&2
+            exit 1
+          fi
+          cp "ffmpeg-bin/${{ matrix.ffmpeg_name }}" "$root/${{ matrix.ffmpeg_name }}"
+          chmod +x "$root/${{ matrix.ffmpeg_name }}" 2>/dev/null || true
+          echo "root_name=$(basename "$root")" >> "$GITHUB_ENV"
+
+      - name: Repack and re-upload
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            (cd extracted && zip -qr "../$asset" "$root_name")
+          else
+            # Pass the directory name explicitly (not `.`) so entries match
+            # dist's own archives exactly (no leading `./` on every path) —
+            # verified byte-for-byte against a real `dist build` output.
+            tar -C extracted -cJf "$asset" "$root_name"
+          fi
+          # Matches dist's own checksum format exactly (`{hash} *{filename}`,
+          # verified against a real `dist build`'s own .sha256 output) rather
+          # than inventing a different one for just this asset.
+          sha256sum "$asset" > "$asset.sha256"
+          gh release upload "$TAG" "$asset" "$asset.sha256" --clobber
+
+      - name: Regenerate the aggregate sha256.sum entry for this asset
+        run: |
+          set -euo pipefail
+          # sha256.sum lists every artifact's checksum in one file; dist
+          # generates it as part of the original release, so this only
+          # needs to overwrite this asset's own line, not the whole file.
+          gh release download "$TAG" --pattern "sha256.sum" --dir . --clobber || true
+          if [ -f sha256.sum ]; then
+            new_line="$(sha256sum "$asset")"
+            grep -v " \*$asset\$" sha256.sum > sha256.sum.new || true
+            echo "$new_line" >> sha256.sum.new
+            mv sha256.sum.new sha256.sum
+            gh release upload "$TAG" sha256.sum --clobber
+          fi

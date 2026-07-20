@@ -9,6 +9,19 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use obcast_proto::state::RungId;
+
+/// Ids of `StreamProfile::default_ladder`'s rungs, in ascending order — used
+/// as the persisted default for `AppConfig::enabled_rungs` so a fresh install
+/// starts with every rung on.
+fn all_rung_ids() -> Vec<RungId> {
+    obcast_proto::state::StreamProfile::default_ladder(0)
+        .rungs
+        .iter()
+        .map(|r| r.id)
+        .collect()
+}
+
 /// Which reading the meter's flying peak marker shows: the broadcast-standard
 /// IEC 60268-10 PPM ballistic, or the raw true digital sample peak
 /// (`obcast_proto::meter::Peak`). See `gui::meter`.
@@ -47,6 +60,22 @@ pub struct AppConfig {
     /// `obcast_proto::state::EncoderState::auto_start_buffer_ms`.
     pub auto_start: bool,
     pub auto_start_buffer_secs: u32,
+
+    /// Which rungs of `StreamProfile::default_ladder` this session encodes
+    /// and uploads. Any rung, including the lowest, may be disabled — the
+    /// scheduler derives its "survival" rung from whatever's actually left
+    /// in the filtered profile (see `obcast_proto::state::StreamProfile::filtered`),
+    /// not a hardcoded id. Must never be empty in practice; `normalize()`
+    /// repairs a stale/hand-edited config that violates that.
+    pub enabled_rungs: Vec<RungId>,
+    /// The rung the uploader assumes for its bootstrap bandwidth guess
+    /// before real throughput/`ServerState` feedback arrives (a few hundred
+    /// ms at most) — purely a starting point, not a cap; the closed-loop
+    /// scheduler takes over immediately once real data is flowing. Resolved
+    /// against whatever's actually enabled via
+    /// `StreamProfile::nearest_enabled_or_low` if this rung has since been
+    /// disabled.
+    pub default_rung: RungId,
 }
 
 impl Default for AppConfig {
@@ -66,6 +95,8 @@ impl Default for AppConfig {
             peak_mode: PeakMode::Ppm,
             auto_start: false,
             auto_start_buffer_secs: 300,
+            enabled_rungs: all_rung_ids(),
+            default_rung: 0,
         }
     }
 }
@@ -83,10 +114,22 @@ impl AppConfig {
         let Ok(text) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        toml::from_str(&text).unwrap_or_else(|err| {
+        let mut cfg: Self = toml::from_str(&text).unwrap_or_else(|err| {
             tracing::warn!(error = %err, ?path, "failed to parse config, using defaults");
             Self::default()
-        })
+        });
+        cfg.normalize();
+        cfg
+    }
+
+    /// Repairs an `enabled_rungs` left empty by a stale or hand-edited
+    /// config file — an empty ladder has no cheap continuity option at all,
+    /// so this is a hard floor rather than something left to
+    /// `StreamProfile::filtered`'s own (looser) empty-set fallback.
+    fn normalize(&mut self) {
+        if self.enabled_rungs.is_empty() {
+            self.enabled_rungs = vec![0];
+        }
     }
 
     pub fn save(&self) {

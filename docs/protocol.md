@@ -46,7 +46,7 @@ edge).
 POST /ingest/{stream}/segment
 Headers:
   X-Auth: <ingest token>
-  X-Rendition: <rung id>          # 0 = survival rung
+  X-Rendition: <rung id>          # lowest currently-enabled rung = survival rung
   X-Seq: <u64>                    # canonical clock; idempotent on (rung, seq)
   Content-Type: audio/mp2t
 Body: <segment bytes>

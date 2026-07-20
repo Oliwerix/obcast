@@ -49,10 +49,6 @@ struct Args {
     auto_start_secs: Option<u32>,
 }
 
-fn profile(segment_ms: u32) -> StreamProfile {
-    StreamProfile::default_ladder(segment_ms)
-}
-
 fn main() {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
@@ -95,7 +91,7 @@ fn main() {
 }
 
 async fn run_headless(args: Args) {
-    let profile = profile(args.segment_ms);
+    let profile = StreamProfile::default_ladder(args.segment_ms);
 
     std::fs::create_dir_all(&args.out_dir).expect("failed to create output dir");
 
@@ -103,8 +99,11 @@ async fn run_headless(args: Args) {
         Some(d) => encode::Source::Device(d.clone()),
         None => encode::Source::SineTest,
     };
-    let mut ffmpeg =
+    let (mut ffmpeg, warnings) =
         encode::spawn(&source, &profile, &args.out_dir).expect("failed to spawn ffmpeg");
+    for warning in &warnings {
+        tracing::warn!(%warning, "codec fallback");
+    }
     tracing::info!(?source, out_dir = ?args.out_dir, "encoder started");
 
     let client = reqwest::Client::new();
@@ -125,6 +124,7 @@ async fn run_headless(args: Args) {
             out_dir: args.out_dir.clone(),
             profile,
             auto_start_buffer_ms: args.auto_start_secs.map(|s| s * 1000),
+            bootstrap_rung: 0,
         },
         shared,
     ));

@@ -150,9 +150,10 @@
 
   <div id="zoomview-container" style="margin-top:16px;"></div>
   <div class="legend">
-    <span><i style="background:#f87171;"></i>lo</span>
-    <span><i style="background:#facc15;"></i>mid</span>
-    <span><i style="background:#4ade80;"></i>hd</span>
+    <span><i style="background:#d03b3b;"></i>lo</span>
+    <span><i style="background:#ec835a;"></i>mid</span>
+    <span><i style="background:#fab219;"></i>hi</span>
+    <span><i style="background:#0ca30c;"></i>hd</span>
     <span><i style="background:#3a3f47;"></i>gap</span>
     <span><i style="background:#a78bfa;"></i>decode error</span>
   </div>
@@ -197,6 +198,10 @@
     <button id="la-mute">Mute</button>
     <input id="la-volume" type="range" min="0" max="100" value="100" />
     <span id="la-volume-val" style="font-size:12px; color:#8a8f98;">100%</span>
+  </div>
+  <div class="row" style="margin-top:12px;">
+    <button id="la-golive" disabled>Go live</button>
+    <input id="la-seek" type="range" min="0" max="1000" value="1000" style="flex:1 1 auto; width:auto;" disabled />
   </div>
   <div class="note" id="la-time">—</div>
 </div>
@@ -622,7 +627,10 @@ function applyMeters(vuDbL, vuDbR, ppmDbL, ppmDbR, peakDbL, peakDbR) {
 let peaksInstance = null;
 let waveformPointMs = null; // ms per waveform point, known once the first payload loads
 
-const RUNG_COLORS = { 0: '#f87171', 1: '#facc15', 2: '#4ade80' }; // lo/mid/hd
+// lo/mid/hi/hd, worst->best quality. The dataviz skill's fixed, pre-validated
+// status scale (critical/serious/warning/good) — a deliberate fit since rung
+// quality really is a state (dropout risk), not an arbitrary series identity.
+const RUNG_COLORS = { 0: '#d03b3b', 1: '#ec835a', 2: '#fab219', 3: '#0ca30c' };
 const GAP_COLOR = '#3a3f47';
 // A flat line here is an artifact of a decode failure, not necessarily real
 // silence — kept visually distinct from both a genuine gap and rung colors
@@ -800,6 +808,8 @@ const laMute = document.getElementById('la-mute');
 const laVolume = document.getElementById('la-volume');
 const laVolumeVal = document.getElementById('la-volume-val');
 const laTime = document.getElementById('la-time');
+const laSeek = document.getElementById('la-seek');
+const laGoLive = document.getElementById('la-golive');
 
 let laHls = null;
 let laLevels = [];
@@ -810,9 +820,10 @@ function setLaState(state, label) {
   laStatePill.className = 'pill ' + state;
 }
 
-// Map an hls.js level index to lo/mid/hd naming + the waveform's RUNG_COLORS,
-// ranking levels by bitrate so the label stays meaningful for any rung count.
-const LA_RUNG_NAMES = ['lo', 'mid', 'hd'];
+// Map an hls.js level index to lo/mid/hi/hd naming + the waveform's
+// RUNG_COLORS, ranking levels by bitrate so the label stays meaningful for
+// any rung count.
+const LA_RUNG_NAMES = ['lo', 'mid', 'hi', 'hd'];
 function setLaQuality(idx) {
   if (idx == null || idx < 0 || !laLevels.length || !laLevels[idx]) {
     laQualityDot.style.background = GAP_COLOR;
@@ -858,16 +869,54 @@ audio.addEventListener('pause',   () => { setLaState('paused', 'paused'); laPlay
 audio.addEventListener('waiting', () => setLaState('buffering', 'buffering'));
 audio.addEventListener('stalled', () => setLaState('stalled', 'stalled'));
 audio.addEventListener('ended',   () => { setLaState('stopped', 'ended'); laPlayPause.textContent = 'Play'; });
-audio.addEventListener('timeupdate', () => {
-  let behind = 0;
-  if (audio.buffered.length) {
-    behind = Math.max(0, audio.buffered.end(audio.buffered.length - 1) - audio.currentTime);
+// This player's own DVR scrub: an independent HTML5 seek within the browser's
+// retained back-buffer, distinct from the server-playout scrub above — moving
+// it never posts to /api/{stream}/playout, so the hardware output is untouched.
+let laSeeking = false;
+function laBufferedRange() {
+  if (!audio.buffered.length) return null;
+  const start = audio.buffered.start(0);
+  const end = audio.buffered.end(audio.buffered.length - 1);
+  return end > start ? { start, end } : null;
+}
+function laBehindText(end) {
+  const behind = Math.max(0, end - audio.currentTime);
+  return behind < 1 ? 'At live edge' : `~${behind.toFixed(1)}s behind live edge`;
+}
+function updateLaScrub() {
+  const r = laBufferedRange();
+  laSeek.disabled = laGoLive.disabled = !r;
+  if (!r) { laTime.textContent = '—'; if (!laSeeking) laSeek.value = 1000; return; }
+  laTime.textContent = laBehindText(r.end);
+  if (!laSeeking) {
+    const frac = (audio.currentTime - r.start) / (r.end - r.start);
+    laSeek.value = Math.round(Math.min(1, Math.max(0, frac)) * 1000);
   }
-  laTime.textContent = behind < 1 ? 'At live edge' : `~${behind.toFixed(1)}s behind live edge`;
+}
+audio.addEventListener('timeupdate', updateLaScrub);
+
+laSeek.addEventListener('input', () => {
+  const r = laBufferedRange();
+  if (!r) return;
+  laSeeking = true;
+  audio.currentTime = r.start + (laSeek.value / 1000) * (r.end - r.start);
+  laTime.textContent = laBehindText(r.end);
 });
+laSeek.addEventListener('change', () => { laSeeking = false; });
+laGoLive.onclick = () => {
+  const r = laBufferedRange();
+  if (!r) return;
+  laSeeking = false;
+  audio.currentTime = r.end;
+  laSeek.value = 1000;
+  laTime.textContent = laBehindText(r.end);
+};
 
 function buildLaHls() {
-  const hls = new Hls();
+  // hls.js flushes the back-buffer aggressively for live streams by default,
+  // leaving nothing behind the live edge to scrub into; hold ~5 min to match
+  // the server's own DVR window (obcast-server dvr_window_ms).
+  const hls = new Hls({ backBufferLength: 300 });
   laHls = hls;
   hls.on(Hls.Events.MANIFEST_PARSED, () => {
     laLevels = hls.levels || [];
