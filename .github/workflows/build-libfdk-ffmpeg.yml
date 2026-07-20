@@ -9,6 +9,11 @@ name: Build libfdk_aac ffmpeg
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "scripts/build-libfdk-ffmpeg.sh"
+      - "scripts/build-libfdk-ffmpeg.ps1"
+      - ".github/workflows/build-libfdk-ffmpeg.yml"
   workflow_call:
     outputs:
       linux-artifact:
