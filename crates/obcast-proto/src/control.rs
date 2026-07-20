@@ -65,18 +65,20 @@ pub struct LinkHealth {
     pub connected: bool,
     /// Age of the newest received segment.
     pub last_segment_age_ms: u32,
-    /// The rung actually reaching the playout head right now (looked up at
-    /// `ServerState.playout.position_seq` in `ServerState.coverage`), i.e.
-    /// on-air ground truth for the web remote's "Current rung" readout —
-    /// mirrors what the client GUI's own on-air quality estimate shows (see
-    /// `SharedState::playing_quality`). Deliberately *not* the newest/live
-    /// segment's rung: the playout head lags the live edge by design (DVR),
-    /// so during a bandwidth dip that recovers, the newest segment can be HD
-    /// while the head is still seconds behind, playing out low-rung audio
-    /// recorded during the dip — showing the live-edge rung here reads as a
-    /// straight quality lie to whoever is watching this to know what's on
-    /// air right now. `None` while stopped or if the head's seq has fallen
-    /// out of the bounded `coverage` window.
+    /// The rung actually reaching the playout head right now — a direct copy
+    /// of `ServerState.playout.playing_rung`, i.e. on-air ground truth for
+    /// the web remote's "Current rung" readout, mirroring what the client
+    /// GUI's own on-air quality estimate shows (see
+    /// `SharedState::playing_quality`). Deliberately *not* a live "best rung
+    /// for this seq" lookup against the DVR index/`coverage`: the playout
+    /// engine feeds segments to its decoder many seconds ahead of real-time
+    /// output, so the rung it committed to for a given segment can lag
+    /// behind a quality upgrade that lands on disk for that same segment
+    /// before it's actually heard — a live lookup would then report the new
+    /// rung while the speaker is still on the old one. See
+    /// `PlayoutStatus::playing_rung`'s doc comment for the full mechanism.
+    /// `None` while stopped, just started/sought, or the segment at the head
+    /// was skipped without ever producing audio.
     pub current_rung: Option<RungId>,
     pub throughput_kbps: u32,
     /// Count of permanent gaps in the DVR window.

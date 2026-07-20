@@ -116,6 +116,26 @@ pub struct PlayoutStatus {
     pub state: PlayoutState,
     /// Segment currently being rendered. `None` when stopped.
     pub position_seq: Option<Seq>,
+    /// The rung whose bytes are actually draining out of the hardware output
+    /// right now, for `position_seq` — ground truth for "what quality is on
+    /// air," distinct from (and not derivable from) whatever the DVR index
+    /// currently reports as the best rung available for that seq. The
+    /// engine's decode pipeline runs many segments ahead of real-time
+    /// playback (it feeds a deep ring buffer to survive slowdowns without an
+    /// audible underrun — see `playout.rs` module docs), so the rung it
+    /// chose to feed for a given seq is locked in well before that seq's
+    /// audio is actually heard. If a quality upgrade for that same seq lands
+    /// on disk in the meantime (which routinely happens — uploads are far
+    /// faster than the ring's depth in playback time), the DVR index will
+    /// report the *new*, higher rung for that seq even though the decoder
+    /// already committed to the lower one. Looking up "best rung for this
+    /// seq" live at listen time therefore lies about what's actually
+    /// playing; this field is set once, at the moment the engine feeds the
+    /// segment, and never revised — see `PlayoutHandle::playing_rung`.
+    /// `None` when stopped or the segment was skipped without ever
+    /// producing audio (decode failure/abandoned/stall-timeout).
+    #[serde(default)]
+    pub playing_rung: Option<RungId>,
     /// Selected hardware output device id, if any.
     pub device: Option<String>,
     /// Linear gain 0.0..=1.0 (or higher for boost).
@@ -207,6 +227,7 @@ impl ServerState {
             playout: PlayoutStatus {
                 state: PlayoutState::Stopped,
                 position_seq: None,
+                playing_rung: None,
                 device: None,
                 volume: 1.0,
                 detail: None,

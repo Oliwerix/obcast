@@ -331,6 +331,7 @@ mod tests {
             playout: PlayoutStatus {
                 state,
                 position_seq: pos,
+                playing_rung: None,
                 device: None,
                 volume: 1.0,
                 detail: None,

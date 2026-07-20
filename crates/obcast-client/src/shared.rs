@@ -194,17 +194,24 @@ impl SharedState {
     }
 
     /// Best guess at the rung currently reaching listeners. While the link
-    /// is fresh this is ground truth, read straight off the server's own
-    /// `coverage` at the playout head (`ServerState::coverage[0]`, per
-    /// `store::build_server_state`'s anchor logic — the window always starts
-    /// exactly at the head while playing/paused/stalled). Once the feed's
-    /// gone stale (no fresh `ServerState` within `STALE_AFTER`), there's
-    /// nothing authoritative left to read, so this extrapolates instead:
-    /// assume the head has kept advancing at roughly one segment per
-    /// `segment_ms` since the last state we actually heard, then look up
-    /// which rung *we* sent for that seq in `upload_history`. Best-effort —
-    /// flagged via `QualityEstimate::estimated` so the GUI can label it as a
-    /// guess rather than fact.
+    /// is fresh this is ground truth, read straight off
+    /// `ServerState.playout.playing_rung` — the rung the server's playout
+    /// engine actually fed its decoder for the segment now draining, tracked
+    /// independently of the DVR index (see `PlayoutStatus::playing_rung`'s
+    /// doc comment on `obcast-proto`). This is deliberately *not* a lookup
+    /// of "best rung for this seq" against `ServerState.coverage`: the
+    /// engine feeds segments many seconds ahead of real-time output, so a
+    /// quality upgrade for an already-fed segment can land on disk before
+    /// that segment is actually heard, and a `coverage` lookup would then
+    /// report the new rung while the speaker is still on the old one — the
+    /// exact "GUI says HD, server is playing low" bug this field exists to
+    /// prevent. Once the feed's gone stale (no fresh `ServerState` within
+    /// `STALE_AFTER`), there's nothing authoritative left to read, so this
+    /// extrapolates instead: assume the head has kept advancing at roughly
+    /// one segment per `segment_ms` since the last state we actually heard,
+    /// then look up which rung *we* sent for that seq in `upload_history`.
+    /// Best-effort — flagged via `QualityEstimate::estimated` so the GUI can
+    /// label it as a guess rather than fact.
     pub fn playing_quality(&self, segment_ms: u32) -> Option<QualityEstimate> {
         let server = self.server.try_lock().ok()?;
         let pos = server.playout.position_seq?;
@@ -212,11 +219,7 @@ impl SharedState {
         let fresh = updated_at.is_some_and(|t| t.elapsed() < STALE_AFTER);
 
         if fresh {
-            let rung = server
-                .coverage
-                .first()
-                .filter(|c| c.seq == pos)
-                .and_then(|c| c.best_rung)?;
+            let rung = server.playout.playing_rung?;
             return Some(QualityEstimate {
                 rung,
                 seq: pos,
