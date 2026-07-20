@@ -39,6 +39,14 @@ pub struct AppConfig {
     pub right_channel: u16,
     pub gain_db: f32,
     pub peak_mode: PeakMode,
+
+    /// When enabled, the server starts playout on its own once
+    /// `auto_start_buffer_secs` of contiguous buffer has accumulated —
+    /// instead of waiting for a web operator to press Start. Irrelevant
+    /// once playout has been started by any means. See
+    /// `obcast_proto::state::EncoderState::auto_start_buffer_ms`.
+    pub auto_start: bool,
+    pub auto_start_buffer_secs: u32,
 }
 
 impl Default for AppConfig {
@@ -56,6 +64,8 @@ impl Default for AppConfig {
             right_channel: 1,
             gain_db: 0.0,
             peak_mode: PeakMode::Ppm,
+            auto_start: false,
+            auto_start_buffer_secs: 300,
         }
     }
 }

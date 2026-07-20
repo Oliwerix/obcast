@@ -53,6 +53,7 @@ enum ControllerCmd {
         ingest_token: Option<String>,
         out_dir: PathBuf,
         sample_rate: u32,
+        auto_start_buffer_ms: Option<u32>,
     },
     StopLive,
 }
@@ -126,6 +127,10 @@ impl ObcastApp {
             let sample_rate = self.audio.sample_rate().max(44_100);
             let ingest_token =
                 (!self.cfg.ingest_token.is_empty()).then(|| self.cfg.ingest_token.clone());
+            let auto_start_buffer_ms = self
+                .cfg
+                .auto_start
+                .then_some(self.cfg.auto_start_buffer_secs * 1000);
             let _ = self.cmd_tx.send(ControllerCmd::GoLive {
                 profile: self.profile(),
                 base_url: self.cfg.server.clone(),
@@ -133,6 +138,7 @@ impl ObcastApp {
                 ingest_token,
                 out_dir: PathBuf::from(&self.cfg.out_dir),
                 sample_rate,
+                auto_start_buffer_ms,
             });
             self.live = true;
         }
@@ -436,6 +442,28 @@ impl ObcastApp {
                     ui.label("Buffer dir:");
                     ui.text_edit_singleline(&mut self.cfg.out_dir);
                     ui.end_row();
+
+                    ui.label("Auto-start:");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.cfg.auto_start, "after buffer of")
+                            .on_hover_text(
+                                "Server starts playout on its own once this much buffer has \
+                                 accumulated, instead of waiting for a web operator. A manual \
+                                 start always takes precedence.",
+                            );
+                        ui.add_enabled(
+                            self.cfg.auto_start,
+                            egui::DragValue::new(&mut self.cfg.auto_start_buffer_secs)
+                                .range(10..=3600)
+                                .suffix(" s"),
+                        )
+                        .on_hover_text(
+                            "Must stay comfortably under the server's DVR window (5 min by \
+                             default) — the server can never buffer more than that while \
+                             stopped, so a larger request will never be satisfied.",
+                        );
+                    });
+                    ui.end_row();
                 });
         });
         if !self.live {
@@ -521,6 +549,101 @@ impl ObcastApp {
         });
     }
 
+    /// Link health at a glance: how much safety buffer is left, how hard
+    /// we're leaning on the link, and what quality is actually reaching
+    /// listeners right now. All three read off state already flowing
+    /// through the closed loop (CLAUDE.md §1/§6) — nothing here is polled
+    /// separately.
+    fn link_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Link");
+
+        let Some(state) = self.shared.server.try_lock().map(|g| g.clone()).ok() else {
+            ui.label("(no link yet)");
+            return;
+        };
+
+        // Buffer: while stopped, the pre-roll accumulating toward the
+        // auto-start target (if enabled) — otherwise just DVR depth. Once
+        // playing, the lead ahead of the playout head, i.e. the safety
+        // margin a network outage eats into first.
+        let stopped = state.playout.state == PlayoutState::Stopped;
+        let buffer_ms = if stopped {
+            state.buffered_ms
+        } else {
+            state.lead_ms
+        };
+        let buffer_target_ms = if stopped && self.cfg.auto_start {
+            (self.cfg.auto_start_buffer_secs * 1000).max(1)
+        } else {
+            state.water.high_ms.max(1)
+        };
+        let buffer_frac = buffer_ms as f32 / buffer_target_ms as f32;
+        let buffer_color = if buffer_ms < state.water.low_ms {
+            egui::Color32::from_rgb(0xe2, 0x3d, 0x3d)
+        } else if buffer_ms < state.water.target_ms {
+            egui::Color32::from_rgb(0xe8, 0xc5, 0x2a)
+        } else {
+            egui::Color32::from_rgb(0x35, 0xc7, 0x5f)
+        };
+        let buffer_text = if stopped && self.cfg.auto_start {
+            format!(
+                "{:.0}s / {:.0}s buffered (auto-start pending)",
+                buffer_ms as f32 / 1000.0,
+                buffer_target_ms as f32 / 1000.0
+            )
+        } else {
+            format!("{:.1} s", buffer_ms as f32 / 1000.0)
+        };
+        ui.label("Buffer");
+        ui.add(
+            egui::ProgressBar::new(buffer_frac.clamp(0.0, 1.0))
+                .fill(buffer_color)
+                .text(buffer_text),
+        );
+
+        // Bandwidth: the bitrate the currently-prioritized rung needs,
+        // against the link's last measured achievable throughput. 100% is
+        // exactly the boundary where the link can just barely sustain it —
+        // below that there's headroom for upgrades; at/above, the link is
+        // the bottleneck (why we may be stuck in survival).
+        let primary_kbps = self.profile().bitrate_of(self.shared.primary_rung()) as f32;
+        let link_kbps = self.shared.throughput_kbps().max(1) as f32;
+        let bandwidth_pct = primary_kbps / link_kbps * 100.0;
+        ui.label("Bandwidth used");
+        ui.add(
+            egui::ProgressBar::new((bandwidth_pct / 100.0).clamp(0.0, 1.0))
+                .text(format!("{bandwidth_pct:.0}% of link")),
+        );
+
+        // Quality on air: ground truth while connected, a best-effort guess
+        // from our own upload history while the link's gone quiet — see
+        // `SharedState::playing_quality`.
+        ui.label("Quality on air");
+        match self.shared.playing_quality(self.cfg.segment_ms) {
+            Some(q) => {
+                let name = self
+                    .profile()
+                    .rungs
+                    .iter()
+                    .find(|r| r.id == q.rung)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_else(|| format!("rung {}", q.rung));
+                let (text, color) = if q.estimated {
+                    (
+                        format!("{name} (estimated — link down)"),
+                        egui::Color32::from_rgb(0xe8, 0xc5, 0x2a),
+                    )
+                } else {
+                    (name, egui::Color32::from_rgb(0x35, 0xc7, 0x5f))
+                };
+                ui.colored_label(color, text);
+            }
+            None => {
+                ui.label("(not playing)");
+            }
+        }
+    }
+
     /// Scrollable operator status/error log — see `SharedState::recent_log`.
     /// Shown as a collapsible bottom panel (toggled from the status bar)
     /// rather than always-on, so it doesn't compete for space with the
@@ -586,6 +709,12 @@ impl eframe::App for ObcastApp {
                     self.device_panel(ui);
                 });
             });
+
+        egui::Panel::right("link").min_size(240.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.link_panel(ui);
+            });
+        });
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.meter_panel(ui);
@@ -686,7 +815,7 @@ async fn controller(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(ControllerCmd::GoLive { profile, base_url, stream, ingest_token, out_dir, sample_rate }) => {
+                    Some(ControllerCmd::GoLive { profile, base_url, stream, ingest_token, out_dir, sample_rate, auto_start_buffer_ms }) => {
                         stop_live(&mut stdin, &mut child, &mut sse_handle, &mut upload_handle, &audio).await;
 
                         if let Err(err) = tokio::fs::create_dir_all(&out_dir).await {
@@ -716,7 +845,7 @@ async fn controller(
                                 )));
                                 upload_handle = Some(tokio::spawn(uploader::run(
                                     client,
-                                    uploader::Config { base_url, stream, ingest_token, out_dir, profile },
+                                    uploader::Config { base_url, stream, ingest_token, out_dir, profile, auto_start_buffer_ms },
                                     shared.clone(),
                                 )));
                                 tracing::info!("live: encoder pipeline started");

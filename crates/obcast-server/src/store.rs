@@ -35,6 +35,12 @@ pub struct DvrStore {
     /// and real `throughput_kbps` — see `docs/protocol.md` §3. `None` until the
     /// first heartbeat arrives.
     encoder_state: Option<EncoderState>,
+    /// The `auto_start_buffer_ms` value (if any) that has already been used
+    /// to fire an auto-start, so `due_for_auto_start` doesn't fire again for
+    /// the same requested target after a later manual stop. A different
+    /// requested target (or a fresh `Some` after the encoder disabled and
+    /// re-enabled it) re-arms — see `due_for_auto_start`.
+    auto_start_fired_for: Option<u32>,
 }
 
 impl DvrStore {
@@ -63,6 +69,7 @@ impl DvrStore {
             index: BTreeMap::new(),
             abandoned: BTreeSet::new(),
             encoder_state: None,
+            auto_start_fired_for: None,
         }
     }
 
@@ -131,6 +138,49 @@ impl DvrStore {
             return;
         }
         self.encoder_state = Some(state);
+    }
+
+    /// Contiguous ms of buffered audio from `dvr_start_seq` forward, stopping
+    /// at the first gap — independent of the playout anchor (unlike the
+    /// frontier walk in `build_server_state`, which starts from the playout
+    /// head/live edge and is 0 while stopped). This is what the auto-start
+    /// check and `ServerState::buffered_ms` are built on.
+    pub fn buffered_ms(&self) -> u32 {
+        let (Some(start), Some(live)) = (self.dvr_start_seq(), self.live_seq()) else {
+            return 0;
+        };
+        let mut ms = 0u32;
+        let mut s = start;
+        while s <= live && self.has_any(s) {
+            ms = ms.saturating_add(self.profile.segment_ms);
+            s += 1;
+        }
+        ms
+    }
+
+    /// The seq to auto-start playout at, if an auto-start is due right now:
+    /// the encoder has requested a target buffer (via the latest heartbeat's
+    /// `EncoderState::auto_start_buffer_ms`), enough contiguous history has
+    /// accumulated to satisfy it, and this exact target hasn't already fired
+    /// once (so a later manual stop doesn't cause a surprise second
+    /// auto-start for the same standing request). Callers are responsible
+    /// for only acting on this while playout is actually `stopped`, and for
+    /// calling `mark_auto_start_fired` once they do.
+    pub fn due_for_auto_start(&self) -> Option<Seq> {
+        let target = self.encoder_state.as_ref()?.auto_start_buffer_ms?;
+        if self.auto_start_fired_for == Some(target) {
+            return None;
+        }
+        if self.buffered_ms() < target {
+            return None;
+        }
+        self.dvr_start_seq()
+    }
+
+    /// Records that `target` has been used to fire an auto-start, so
+    /// `due_for_auto_start` won't fire again for the same requested value.
+    pub fn mark_auto_start_fired(&mut self, target: u32) {
+        self.auto_start_fired_for = Some(target);
     }
 
     /// Mark seqs as permanently abandoned so frontier/playout can skip them.
@@ -258,6 +308,7 @@ impl DvrStore {
             lead_ms,
             water: self.water,
             coverage,
+            buffered_ms: self.buffered_ms(),
         }
     }
 }
@@ -501,6 +552,7 @@ mod tests {
             throughput_kbps: 128,
             backlog: 0,
             abandoned: vec![],
+            auto_start_buffer_ms: None,
         };
         s.set_encoder_state(base.clone());
         assert_eq!(s.encoder_state(), Some(&base));
@@ -518,5 +570,95 @@ mod tests {
         newer.throughput_kbps = 256;
         s.set_encoder_state(newer);
         assert_eq!(s.encoder_state().unwrap().throughput_kbps, 256);
+    }
+
+    fn encoder_state_requesting(
+        rev: u64,
+        auto_start_buffer_ms: Option<u32>,
+    ) -> obcast_proto::state::EncoderState {
+        obcast_proto::state::EncoderState {
+            rev,
+            active_rungs: vec![0],
+            encoded_seq: None,
+            primary_rung: 0,
+            throughput_kbps: 0,
+            backlog: 0,
+            abandoned: vec![],
+            auto_start_buffer_ms,
+        }
+    }
+
+    #[test]
+    fn buffered_ms_is_contiguous_span_from_dvr_start_regardless_of_playout_anchor() {
+        let mut s = store(60_000);
+        for seq in 0..=4 {
+            s.record(0, seq, None);
+        }
+        // 5 segments * 2000ms, independent of playout being stopped (unlike
+        // `lead_ms`, which anchors on the live edge and would read 2000ms).
+        assert_eq!(s.buffered_ms(), 5 * 2000);
+        let state = s.build_server_state(stopped());
+        assert_eq!(state.buffered_ms, 5 * 2000);
+        assert_eq!(state.lead_ms, 2000);
+    }
+
+    #[test]
+    fn buffered_ms_stops_at_the_first_gap() {
+        let mut s = store(60_000);
+        for seq in [0, 1, 3, 4] {
+            s.record(0, seq, None);
+        }
+        assert_eq!(s.buffered_ms(), 2 * 2000); // stops at the gap (seq 2)
+    }
+
+    #[test]
+    fn due_for_auto_start_is_none_without_a_request() {
+        let mut s = store(60_000);
+        for seq in 0..=9 {
+            s.record(0, seq, None);
+        }
+        assert_eq!(s.due_for_auto_start(), None);
+
+        s.set_encoder_state(encoder_state_requesting(1, None));
+        assert_eq!(s.due_for_auto_start(), None);
+    }
+
+    #[test]
+    fn due_for_auto_start_waits_for_the_target_buffer() {
+        let mut s = store(60_000);
+        s.set_encoder_state(encoder_state_requesting(1, Some(10_000))); // 5 segs
+        for seq in 0..=2 {
+            s.record(0, seq, None);
+        }
+        assert_eq!(s.due_for_auto_start(), None, "only 6000ms buffered so far");
+
+        for seq in 3..=4 {
+            s.record(0, seq, None);
+        }
+        assert_eq!(
+            s.due_for_auto_start(),
+            Some(0),
+            "10000ms buffered, target reached, starts at dvr_start_seq"
+        );
+    }
+
+    #[test]
+    fn due_for_auto_start_does_not_refire_the_same_target_after_marking() {
+        let mut s = store(60_000);
+        s.set_encoder_state(encoder_state_requesting(1, Some(4_000)));
+        for seq in 0..=4 {
+            s.record(0, seq, None);
+        }
+        assert_eq!(s.due_for_auto_start(), Some(0));
+        s.mark_auto_start_fired(4_000);
+        assert_eq!(
+            s.due_for_auto_start(),
+            None,
+            "already fired for this exact target; a later manual stop must not re-trigger it"
+        );
+
+        // A different requested target re-arms.
+        s.set_encoder_state(encoder_state_requesting(2, Some(6_000)));
+        assert_eq!(s.due_for_auto_start(), Some(0));
     }
 }

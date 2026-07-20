@@ -268,7 +268,18 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
 live channel-mapping capture (pick 2 of N device channels as L/R); K-14 + per-channel metering;
 persisted TOML operator config; a `--headless` client path (ffmpeg captures a device or sine tone
-directly, no GUI); `README.md` + `docs/getting-started.md`.
+directly, no GUI); `README.md` + `docs/getting-started.md`; encoder-requested auto-start
+(`EncoderState::auto_start_buffer_ms` + `ServerState::buffered_ms`, `docs/protocol.md` §3 "Auto-start") —
+the client GUI can ask the server to start playout on its own once a chosen buffer (e.g. 5 minutes)
+has accumulated, rather than waiting on a web operator, and only while playout is still `stopped` (a
+manual start always wins). The client GUI also gained a "Link" panel: a buffer gauge (pre-roll
+progress toward the auto-start target, or `lead_ms` once playing — the same number that drains if the
+uplink dies), a bandwidth gauge (primary rung's bitrate vs. last measured link throughput — 100% is
+the boundary where the link can just sustain it), and an on-air quality readout that's ground truth
+from `ServerState.coverage` while connected and falls back to a same-crate guess — extrapolating the
+playout head's position from elapsed time and looking up what rung *we* sent for that seq in a local
+upload-history map (`SharedState::playing_quality`) — once the link (and thus `ServerState`) goes
+stale, flagged as "(estimated)" in the UI.
 
 **What's next (priority order, re-ranked after Rust/design review and a follow-up adversarial
 review — correctness/security risks before features):** (1) Auth split, and in particular give

@@ -13,8 +13,9 @@ use futures::Stream;
 use serde::Deserialize;
 
 use obcast_proto::control::LogLevel;
-use obcast_proto::state::{EncoderState, RungId, Seq, ServerState};
+use obcast_proto::state::{EncoderState, PlayoutState, RungId, Seq, ServerState};
 
+use crate::playout::EngineCommand;
 use crate::{AppState, StreamHandle};
 
 pub struct ApiError(pub StatusCode, pub String);
@@ -69,6 +70,45 @@ async fn current_state(handle: &StreamHandle) -> ServerState {
     store.build_server_state(handle.playout_status())
 }
 
+/// Starts playout on its own once the encoder's requested auto-start buffer
+/// (`EncoderState::auto_start_buffer_ms`, set via heartbeat) has accumulated
+/// — see `DvrStore::due_for_auto_start`. A no-op whenever playout isn't
+/// `stopped`, which is what makes a manual start take precedence: once
+/// started (by any means), this simply has nothing to do. Called after both
+/// a segment ingest and a heartbeat, since either can be what pushes the
+/// buffer over the requested target.
+async fn maybe_auto_start(handle: &StreamHandle) {
+    if handle.playout.playout_state() != PlayoutState::Stopped {
+        return;
+    }
+    let fire_at = {
+        let mut store = handle.store.lock().await;
+        match store.due_for_auto_start() {
+            Some(seq) => {
+                let target = store
+                    .encoder_state()
+                    .and_then(|e| e.auto_start_buffer_ms)
+                    .unwrap_or(0);
+                store.mark_auto_start_fired(target);
+                Some(seq)
+            }
+            None => None,
+        }
+    };
+    let Some(seq) = fire_at else { return };
+    tracing::info!(
+        seq,
+        "auto-start: requested buffer reached, starting playout"
+    );
+    handle.push_log(
+        LogLevel::Info,
+        format!("auto-start: requested buffer reached, starting playout at seq {seq}"),
+    );
+    handle.playout.send(EngineCommand::Start { position: seq });
+    let state = current_state(handle).await;
+    let _ = handle.tx.send(state);
+}
+
 pub async fn upload_segment(
     State(app): State<Arc<AppState>>,
     Path(stream): Path<String>,
@@ -104,6 +144,7 @@ pub async fn upload_segment(
     let _ = handle.tx.send(state.clone());
     tracing::info!(stream, rung, seq, bytes = body.len(), "segment ingested");
     reap(&stream, &handle, evicted).await;
+    maybe_auto_start(&handle).await;
     Ok(Json(state))
 }
 
@@ -147,6 +188,7 @@ pub async fn heartbeat(
     check_auth(&handle, &headers)?;
 
     handle.store.lock().await.set_encoder_state(body);
+    maybe_auto_start(&handle).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
