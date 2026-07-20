@@ -42,6 +42,11 @@ struct Args {
     device: Option<String>,
     #[arg(long, default_value_t = 2000)]
     segment_ms: u32,
+    /// Ask the server to start playout on its own once this many seconds of
+    /// contiguous buffer have accumulated, instead of waiting for a web
+    /// operator to press Start. Omit to disable auto-start.
+    #[arg(long)]
+    auto_start_secs: Option<u32>,
 }
 
 fn profile(segment_ms: u32) -> StreamProfile {
@@ -79,6 +84,10 @@ fn main() {
     if args.segment_ms != 2000 {
         cfg.segment_ms = args.segment_ms;
     }
+    if let Some(secs) = args.auto_start_secs {
+        cfg.auto_start = true;
+        cfg.auto_start_buffer_secs = secs;
+    }
 
     if let Err(err) = gui::run(cfg) {
         tracing::error!(error = %err, "GUI exited with an error");
@@ -115,6 +124,7 @@ async fn run_headless(args: Args) {
             ingest_token: args.ingest_token.clone(),
             out_dir: args.out_dir.clone(),
             profile,
+            auto_start_buffer_ms: args.auto_start_secs.map(|s| s * 1000),
         },
         shared,
     ));

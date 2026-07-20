@@ -339,6 +339,7 @@ mod tests {
             lead_ms: 0,
             water,
             coverage: vec![],
+            buffered_ms: 0,
         }
     }
 

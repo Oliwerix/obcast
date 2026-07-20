@@ -4,12 +4,12 @@
 //! log for the GUI status panel — read via `try_lock`/atomics so the GUI's
 //! per-frame poll never blocks on network tasks.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use obcast_proto::control::{LogEntry, LogLevel};
-use obcast_proto::state::ServerState;
+use obcast_proto::state::{RungId, Seq, ServerState};
 use tokio::sync::Mutex;
 
 /// How long a held `ServerState` is trusted before the feedback loop degrades
@@ -25,6 +25,24 @@ const STALE_AFTER: Duration = Duration::from_secs(5);
 /// lifecycle) without unbounded growth; oldest entries are dropped first.
 const LOG_CAP: usize = 200;
 
+/// Cap on the retained (seq -> rung) upload history used to guess the
+/// on-air quality when the link's gone quiet (see `playing_quality`).
+/// Generous relative to any real DVR window (a couple hours at a 2s
+/// segment length) without growing unbounded across a long OB.
+const UPLOAD_HISTORY_CAP: usize = 4096;
+
+/// What quality is (probably) reaching listeners right now, from
+/// `SharedState::playing_quality`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QualityEstimate {
+    pub rung: RungId,
+    pub seq: Seq,
+    /// `false` when read straight from a fresh `ServerState` (ground truth);
+    /// `true` when the link's gone stale and this was extrapolated from our
+    /// own upload history instead — see `playing_quality`.
+    pub estimated: bool,
+}
+
 pub struct SharedState {
     pub server: Mutex<ServerState>,
     /// When `server` was last refreshed by `update()`. `None` until the first
@@ -32,6 +50,14 @@ pub struct SharedState {
     server_updated_at: Mutex<Option<Instant>>,
     last_uploaded_seq: AtomicI64,
     throughput_kbps: AtomicU32,
+    /// Rung the scheduler most recently prioritized (`plan_uploads`'
+    /// first/most-urgent action each tick, mirroring `EncoderState::primary_rung`
+    /// in the last heartbeat) — the reference bitrate for the bandwidth meter.
+    primary_rung: AtomicU32,
+    /// Which rung we uploaded for each seq, so `playing_quality` can guess
+    /// what's on air from our own upload record when the link (and thus
+    /// `ServerState`) has gone stale. Bounded by `UPLOAD_HISTORY_CAP`.
+    upload_history: std::sync::Mutex<BTreeMap<Seq, RungId>>,
     /// Operator-facing status/error log — a capped ring buffer, oldest first.
     /// Shares `obcast_proto::control::LogEntry`'s shape with the server's own
     /// operator log so both UIs render the same way, even though a client
@@ -51,6 +77,8 @@ impl SharedState {
             server_updated_at: Mutex::new(None),
             last_uploaded_seq: AtomicI64::new(-1),
             throughput_kbps: AtomicU32::new(0),
+            primary_rung: AtomicU32::new(0),
+            upload_history: std::sync::Mutex::new(BTreeMap::new()),
             log: std::sync::Mutex::new(VecDeque::new()),
             encoder_failed: AtomicBool::new(false),
         }
@@ -139,5 +167,71 @@ impl SharedState {
 
     pub fn throughput_kbps(&self) -> u32 {
         self.throughput_kbps.load(Ordering::Relaxed)
+    }
+
+    /// Records which rung the scheduler most recently prioritized, for the
+    /// bandwidth meter (see `playing_quality`'s sibling read, `primary_rung`).
+    pub fn note_primary_rung(&self, rung: RungId) {
+        self.primary_rung.store(rung as u32, Ordering::Relaxed);
+    }
+
+    pub fn primary_rung(&self) -> RungId {
+        self.primary_rung.load(Ordering::Relaxed) as RungId
+    }
+
+    /// Records that `seq` was successfully uploaded at `rung`, for
+    /// `playing_quality`'s stale-link fallback. Bounded to
+    /// `UPLOAD_HISTORY_CAP` entries, oldest seq evicted first.
+    pub fn note_sent(&self, seq: Seq, rung: RungId) {
+        let mut hist = self.upload_history.lock().unwrap();
+        hist.insert(seq, rung);
+        while hist.len() > UPLOAD_HISTORY_CAP {
+            let Some(&oldest) = hist.keys().next() else {
+                break;
+            };
+            hist.remove(&oldest);
+        }
+    }
+
+    /// Best guess at the rung currently reaching listeners. While the link
+    /// is fresh this is ground truth, read straight off the server's own
+    /// `coverage` at the playout head (`ServerState::coverage[0]`, per
+    /// `store::build_server_state`'s anchor logic — the window always starts
+    /// exactly at the head while playing/paused/stalled). Once the feed's
+    /// gone stale (no fresh `ServerState` within `STALE_AFTER`), there's
+    /// nothing authoritative left to read, so this extrapolates instead:
+    /// assume the head has kept advancing at roughly one segment per
+    /// `segment_ms` since the last state we actually heard, then look up
+    /// which rung *we* sent for that seq in `upload_history`. Best-effort —
+    /// flagged via `QualityEstimate::estimated` so the GUI can label it as a
+    /// guess rather than fact.
+    pub fn playing_quality(&self, segment_ms: u32) -> Option<QualityEstimate> {
+        let server = self.server.try_lock().ok()?;
+        let pos = server.playout.position_seq?;
+        let updated_at = *self.server_updated_at.try_lock().ok()?;
+        let fresh = updated_at.is_some_and(|t| t.elapsed() < STALE_AFTER);
+
+        if fresh {
+            let rung = server
+                .coverage
+                .first()
+                .filter(|c| c.seq == pos)
+                .and_then(|c| c.best_rung)?;
+            return Some(QualityEstimate {
+                rung,
+                seq: pos,
+                estimated: false,
+            });
+        }
+
+        let elapsed_ms = updated_at?.elapsed().as_millis() as u64;
+        let guessed_seq = pos + elapsed_ms / (segment_ms.max(1) as u64);
+        let hist = self.upload_history.lock().unwrap();
+        let rung = *hist.range(..=guessed_seq).next_back()?.1;
+        Some(QualityEstimate {
+            rung,
+            seq: guessed_seq,
+            estimated: true,
+        })
     }
 }

@@ -24,6 +24,9 @@ pub struct Config {
     pub ingest_token: Option<String>,
     pub out_dir: PathBuf,
     pub profile: StreamProfile,
+    /// Requested auto-start buffer, in ms — forwarded to the server on every
+    /// heartbeat as `EncoderState::auto_start_buffer_ms`. `None` disables it.
+    pub auto_start_buffer_ms: Option<u32>,
 }
 
 /// How long a permanent-looking continuity gap (missing on both the local
@@ -146,6 +149,12 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
             max_actions: 16,
         });
 
+        // Updated every tick (not gated by the heartbeat interval below) so
+        // the GUI's bandwidth meter — primary rung's bitrate vs. measured
+        // link throughput — stays responsive.
+        let primary_rung = actions.first().map(|a| a.rung).unwrap_or(low);
+        shared.note_primary_rung(primary_rung);
+
         if last_heartbeat.is_none_or(|t| t.elapsed() >= HEARTBEAT_INTERVAL) {
             heartbeat_rev += 1;
             last_heartbeat = Some(tokio::time::Instant::now());
@@ -158,10 +167,11 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
                 rev: heartbeat_rev,
                 active_rungs: rungs.clone(),
                 encoded_seq: (!inv.available.is_empty()).then_some(inv.encoded_seq),
-                primary_rung: actions.first().map(|a| a.rung).unwrap_or(low),
+                primary_rung,
                 throughput_kbps,
                 backlog,
                 abandoned: abandoned_locally.iter().copied().collect(),
+                auto_start_buffer_ms: cfg.auto_start_buffer_ms,
             };
             let mut req = client
                 .post(format!("{}/ingest/{}/heartbeat", cfg.base_url, cfg.stream))
@@ -203,6 +213,7 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
                     let elapsed = started.elapsed().as_secs_f32().max(0.001);
                     throughput_kbps = ((len as f32 * 8.0 / 1000.0) / elapsed) as u32;
                     shared.note_upload(action.seq, throughput_kbps);
+                    shared.note_sent(action.seq, action.rung);
                     if let Ok(state) = resp.json::<ServerState>().await {
                         shared.update(state).await;
                     }

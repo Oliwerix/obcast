@@ -182,6 +182,14 @@ pub struct ServerState {
     /// Per-seq best rung for a bounded window ahead of the anchor. Lets the
     /// encoder see precisely where HD is missing without guessing.
     pub coverage: Vec<SegCoverage>,
+    /// Contiguous ms of DVR history held from `dvr_start_seq` forward,
+    /// stopping at the first gap — independent of the playout anchor (unlike
+    /// `lead_ms`, which is 0 while stopped since it walks from the live
+    /// edge instead). Doubles as the auto-start progress readout (see
+    /// `EncoderState::auto_start_buffer_ms`) and a general "how deep is our
+    /// buffered history" indicator.
+    #[serde(default)]
+    pub buffered_ms: u32,
 }
 
 impl ServerState {
@@ -203,6 +211,7 @@ impl ServerState {
             lead_ms: 0,
             water: WaterLevels::default(),
             coverage: Vec::new(),
+            buffered_ms: 0,
         }
     }
 }
@@ -225,4 +234,11 @@ pub struct EncoderState {
     /// Seqs the encoder will never send (permanent gaps) so the server can stop
     /// blocking playout on them.
     pub abandoned: Vec<Seq>,
+    /// Requested auto-start buffer, in ms: once `ServerState::buffered_ms`
+    /// reaches this while playout is `stopped`, the server starts playout on
+    /// its own (from `dvr_start_seq`) without any web operator action.
+    /// `None` disables auto-start. Irrelevant once playout has been started
+    /// by any means (manual or automatic) — see `docs/protocol.md` §3.
+    #[serde(default)]
+    pub auto_start_buffer_ms: Option<u32>,
 }

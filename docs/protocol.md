@@ -91,6 +91,40 @@ additive dashboard data. It never feeds back into `plan_uploads`; the
 upload-scheduling loop (§1) runs entirely off `ServerState`, piggybacked on
 uploads and the SSE feed above.
 
+`EncoderState.auto_start_buffer_ms` is the one field that *does* feed back
+into server behaviour, outside `plan_uploads` — see "Auto-start" below.
+
+### Auto-start
+An encoder can ask the server to start playout on its own once enough buffer
+has accumulated, instead of waiting for a web operator to press Start —
+useful for an unattended/scripted OB where nobody is watching the web remote
+at the moment the link comes up. Set `EncoderState.auto_start_buffer_ms`
+(sent on every heartbeat, `None` to disable) to the desired buffer in ms —
+e.g. `300_000` for "start 5 minutes behind live." The server compares this
+against `ServerState.buffered_ms` (contiguous ms of DVR history held from
+`dvr_start_seq` forward, independent of the playout anchor — unlike
+`lead_ms`, which is 0 while stopped) after every ingest and every heartbeat;
+once it's met, playout starts at `dvr_start_seq`, giving an initial `lead_ms`
+of roughly the requested buffer. From that point on `lead_ms` *is* the
+"buffer remaining" — it shrinks if the encoder stops sending (dead link) and
+the head keeps consuming it, which is exactly the signal an operator wants
+to see.
+
+This only fires while `playout.state` is `stopped`: a manual start (via
+`POST /api/{stream}/playout`) always takes precedence, and once playout has
+started by any means the requested buffer is moot. The server also
+remembers which exact `auto_start_buffer_ms` value it has already used to
+auto-start once, so a later manual stop doesn't cause a surprise second
+auto-start for the same standing request; requesting a *different* value
+re-arms it.
+
+**Caveat:** while stopped, `buffered_ms` can never exceed the server's DVR
+window (`dvr_window_ms`, 5 minutes by default and not currently exposed to
+or configurable by the client) — eviction keeps trimming `dvr_start_seq`
+forward to hold that window, so a requested buffer larger than it will never
+be satisfied and auto-start will simply never fire. Keep the requested
+buffer comfortably under the server's DVR window.
+
 ### Playout states
 `playout.state` (`PlayoutState`) is one of `stopped` / `playing` / `paused` /
 `stalled` / `error`:
@@ -117,6 +151,10 @@ of just showing a color.
 - `playout.state` + `playout.position_seq` — the anchor for all urgency.
 - `frontier_seq` — highest seq contiguously playable from the anchor.
 - `lead_ms` — ms of contiguous audio ahead of the head (drain indicator).
+- `buffered_ms` — ms of contiguous DVR history from `dvr_start_seq` forward,
+  regardless of playout state; drives auto-start (see above) and doubles as
+  a general "how deep is our buffer" readout while stopped, when `lead_ms`
+  alone reads 0.
 - `water` = `{ low_ms, target_ms, high_ms }` — survival / target / upgrade gates.
 - `coverage[]` — best rung per seq for a bounded window ahead of the anchor, so
   the encoder sees exactly where HD is missing without guessing.
