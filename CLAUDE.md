@@ -276,6 +276,25 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   silent (cpal zero-fills underruns) — the new stall-skip logging at least surfaces *why*, but the
   state itself is still not a lie-proof signal; `waveform.rs` silently swallows any per-segment decode
   failure as a flat `(0,0)` line, indistinguishable from real silence.
+- **Two more fixes (found chasing an operator report of "web remote says HD but it's actually
+  playing low, and playback sometimes jumps around").** (1) `api.rs::build_status()` computed the web
+  remote's `LinkHealth.current_rung` from `ServerState.live_seq` — the newest segment the server has
+  received — not from the playout head. Since the head lags the live edge by design (DVR), a bandwidth
+  dip that recovers reads as: newest segment HD, "Current rung" pill shows HD, but the head is still
+  seconds behind playing out the low-rung audio recorded during the dip. Now looked up at
+  `ServerState.playout.position_seq` in `coverage`, matching what the client GUI's own on-air estimate
+  already did correctly (`SharedState::playing_quality`, ground-truth branch). (2) `origin.rs`'s
+  per-rendition HLS playlist (feeding the web remote's "listen along" hls.js player) built
+  `EXT-X-MEDIA-SEQUENCE` and its segment list from only the seqs with media already on disk, skipping
+  gaps silently. On the flaky uplink this whole system targets, a segment landing *late* (a retry
+  succeeding after later ones already arrived) is normal, not exceptional — and every time that
+  happened, the newly-filled seq shifted every later entry down one list position, which is exactly
+  what hls.js's playlist-sync logic uses to tell "already buffered" apart from "new." The shift read to
+  a listener as playback jumping around. The playlist now walks the true contiguous
+  `[dvr_start_seq, live_seq]` range so a segment's list position always equals its real seq number, and
+  emits `#EXT-X-GAP` for a seq with no media yet (or ever, if abandoned) instead of omitting it —
+  covered by pure unit tests in `origin.rs` (`playlist_body`) demonstrating the position-stability
+  property directly.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);

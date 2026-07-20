@@ -87,12 +87,6 @@ impl DvrStore {
         &self.profile
     }
 
-    /// Seqs that have media on disk at any rung, ascending. Abandoned seqs
-    /// with no media are excluded — there's nothing to serve for them.
-    pub fn playable_seqs(&self) -> impl Iterator<Item = Seq> + '_ {
-        self.index.keys().copied()
-    }
-
     pub fn has_rung(&self, seq: Seq, rung: RungId) -> bool {
         self.index.get(&seq).is_some_and(|r| r.contains(&rung))
     }
@@ -204,6 +198,16 @@ impl DvrStore {
 
     fn has_any(&self, seq: Seq) -> bool {
         self.index.get(&seq).is_some_and(|r| !r.is_empty()) || self.abandoned.contains(&seq)
+    }
+
+    /// Whether `seq` actually has media bytes on disk at some rung — unlike
+    /// `has_any`, an abandoned-with-no-media seq is *not* media (there's
+    /// nothing to serve), even though it's treated as "satisfied" for
+    /// frontier-continuity purposes. Used by `origin.rs` to mark a real gap
+    /// in the HLS playlist (`#EXT-X-GAP`) rather than pretending it has a
+    /// playable segment.
+    pub fn has_media(&self, seq: Seq) -> bool {
+        self.index.get(&seq).is_some_and(|r| !r.is_empty())
     }
 
     /// Whether the encoder has explicitly given up on `seq` via `/abandon`.
@@ -475,6 +479,20 @@ mod tests {
         s.abandon(&[3]);
         assert!(s.is_abandoned(3));
         assert!(!s.is_abandoned(4));
+    }
+
+    #[test]
+    fn has_media_is_false_for_abandoned_seqs_with_no_bytes() {
+        // `has_any` (frontier purposes) treats an abandoned seq as satisfied
+        // so playout doesn't freeze on it, but there's still no file to
+        // serve from the HLS origin — `has_media` must say so distinctly,
+        // or the playlist would claim a gap has a real segment.
+        let mut s = store(60_000);
+        s.record(0, 1, None);
+        s.abandon(&[2]);
+        assert!(s.has_media(1));
+        assert!(!s.has_media(2), "abandoned seq has no media on disk");
+        assert!(!s.has_media(99), "never-seen seq has no media on disk");
     }
 
     #[test]

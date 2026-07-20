@@ -84,22 +84,44 @@ async fn rendition_playlist(app: &AppState, stream: &str) -> Result<Response, St
         .ok_or(StatusCode::NOT_FOUND)?;
     let store = handle.store.lock().await;
     let seg_secs = store.profile().segment_ms as f32 / 1000.0;
-    let seqs: Vec<Seq> = store.playable_seqs().collect();
-
     let target_duration = seg_secs.ceil() as u32;
-    let media_sequence = seqs.first().copied().unwrap_or(0);
 
     let mut out = String::new();
     let _ = writeln!(out, "#EXTM3U");
     let _ = writeln!(out, "#EXT-X-VERSION:3");
     let _ = writeln!(out, "#EXT-X-TARGETDURATION:{target_duration}");
-    let _ = writeln!(out, "#EXT-X-MEDIA-SEQUENCE:{media_sequence}");
-    for seq in seqs {
-        let _ = writeln!(out, "#EXTINF:{seg_secs:.3},");
-        let _ = writeln!(out, "{seq}.ts");
+    if let (Some(start), Some(end)) = (store.dvr_start_seq(), store.live_seq()) {
+        let _ = writeln!(out, "#EXT-X-MEDIA-SEQUENCE:{start}");
+        out.push_str(&playlist_body(seg_secs, start, end, |s| store.has_media(s)));
     }
 
     Ok(playlist_response(out))
+}
+
+/// Builds the `#EXTINF`/URI entries for one rendition playlist, walking the
+/// *real* contiguous seq range `[start, end]` rather than only the seqs that
+/// happen to have media on disk. This keeps every entry's position in the
+/// list equal to its true seq number (`EXT-X-MEDIA-SEQUENCE + index`) at all
+/// times — which is exactly what hls.js's live-playlist sync uses to tell
+/// "already played" apart from "new" across refreshes. On the flaky OB
+/// uplink this whole system targets, a segment commonly lands *after* later
+/// ones already have (retry succeeds late) rather than being lost outright;
+/// building the list from only the present seqs meant such a segment's
+/// eventual arrival shifted every later entry's implied seq number by one,
+/// which reads to hls.js as its already-buffered segments having silently
+/// changed identity — the "playback jumps around" symptom. A seq with no
+/// media yet (or ever, if abandoned) gets `#EXT-X-GAP` instead, per the HLS
+/// spec extension for "skip this, don't stall on it."
+fn playlist_body(seg_secs: f32, start: Seq, end: Seq, has_media: impl Fn(Seq) -> bool) -> String {
+    let mut out = String::new();
+    for seq in start..=end {
+        if !has_media(seq) {
+            let _ = writeln!(out, "#EXT-X-GAP");
+        }
+        let _ = writeln!(out, "#EXTINF:{seg_secs:.3},");
+        let _ = writeln!(out, "{seq}.ts");
+    }
+    out
 }
 
 async fn segment(
@@ -128,4 +150,81 @@ async fn segment(
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(segment_response(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn every_entry_position_equals_its_true_seq_number() {
+        // seq 12 is missing (still in flight); every later entry must still
+        // land at its real seq, not get shifted down to fill the hole.
+        let present: BTreeSet<Seq> = [10, 11, 13, 14].into_iter().collect();
+        let body = playlist_body(2.0, 10, 14, |s| present.contains(&s));
+        assert_eq!(
+            body,
+            "#EXTINF:2.000,\n\
+             10.ts\n\
+             #EXTINF:2.000,\n\
+             11.ts\n\
+             #EXT-X-GAP\n\
+             #EXTINF:2.000,\n\
+             12.ts\n\
+             #EXTINF:2.000,\n\
+             13.ts\n\
+             #EXTINF:2.000,\n\
+             14.ts\n"
+        );
+    }
+
+    #[test]
+    fn a_late_arrival_only_flips_its_own_entry_and_leaves_every_other_position_untouched() {
+        // This is the actual bug scenario: seq 12 lands late (a retry
+        // succeeding after 13/14 already arrived, normal on a flaky OB
+        // uplink). Before this fix, the playlist only ever listed present
+        // seqs, so 12 showing up shifted 13 and 14 down by one list
+        // position — exactly the identity-shift that confuses hls.js's
+        // playlist-sync into replaying/skipping content ("jumps around").
+        let before: BTreeSet<Seq> = [10, 11, 13, 14].into_iter().collect();
+        let after: BTreeSet<Seq> = [10, 11, 12, 13, 14].into_iter().collect();
+
+        // Compare by *segment slot* (i.e. which EXTINF entry a URI is),
+        // not raw text line number — `#EXT-X-GAP` adds an extra line to
+        // whichever entry it tags, so a raw line-number comparison would
+        // spuriously "fail" even though the segment ordering hls.js cares
+        // about (each EXTINF+URI is one slot) never actually shifted.
+        let uris = |body: &str| -> Vec<String> {
+            body.lines()
+                .filter(|l| l.ends_with(".ts"))
+                .map(String::from)
+                .collect()
+        };
+        let before_uris = uris(&playlist_body(2.0, 10, 14, |s| before.contains(&s)));
+        let after_uris = uris(&playlist_body(2.0, 10, 14, |s| after.contains(&s)));
+
+        let slot_of = |uris: &[String], uri: &str| uris.iter().position(|u| u == uri);
+        assert_eq!(
+            slot_of(&before_uris, "13.ts"),
+            slot_of(&after_uris, "13.ts")
+        );
+        assert_eq!(
+            slot_of(&before_uris, "14.ts"),
+            slot_of(&after_uris, "14.ts")
+        );
+    }
+
+    #[test]
+    fn no_gap_marker_when_every_seq_in_range_has_media() {
+        let body = playlist_body(2.0, 5, 7, |_| true);
+        assert!(!body.contains("GAP"));
+        assert_eq!(body.matches("#EXTINF").count(), 3);
+    }
+
+    #[test]
+    fn single_seq_range_is_one_entry() {
+        let body = playlist_body(2.0, 5, 5, |s| s == 5);
+        assert_eq!(body, "#EXTINF:2.000,\n5.ts\n");
+    }
 }
