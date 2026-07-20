@@ -216,12 +216,26 @@ pub fn plan_uploads(input: &SchedulerInput) -> Vec<UploadAction> {
     // ---- Tier C: Quality upgrades. Only with a comfortable margin and leftover
     // budget, and ONLY forward of the playout head (never < anchor), nearest
     // first. One incremental rung step per segment per tick.
+    //
+    // Also strictly ahead of whatever the engine has already fed to its
+    // decoder (`server.playout.fed_seq`), not just ahead of the audible head
+    // (`anchor`/`position_seq`). The engine feeds its ring many segments
+    // ahead of real-time output to survive slowdowns without an audible
+    // underrun (see `playout.rs` module docs), so a seq's rung is locked in
+    // well before `anchor` ever reaches it — an upgrade upload that only
+    // clears the `anchor` bar can still lose the race to a feed loop that
+    // already grabbed the low rung moments after Tier B first uploaded it.
+    // Gating on `fed_seq` instead means Tier C only ever spends budget on
+    // seqs an upgrade can actually still affect. Falls back to `anchor` when
+    // unknown (stopped, just started/sought, or an older server not yet
+    // sending the field), matching the previous ahead-of-head-only behavior.
     let comfortable = lead_ms >= server.water.high_ms;
     if comfortable && !survival {
+        let already_fed = server.playout.fed_seq.unwrap_or(anchor).max(anchor);
         let cap_segs = (server.water.high_ms / seg_ms).max(1) as u64;
         let end = (anchor + cap_segs).min(inv.encoded_seq);
-        // strictly ahead of the head: start at anchor + 1
-        for s in (anchor + 1)..=end {
+        // strictly ahead of both the head and whatever's already fed
+        for s in (already_fed + 1)..=end {
             if out.len() >= max_actions {
                 break;
             }
@@ -305,6 +319,17 @@ mod tests {
     }
 
     fn server(state: PlayoutState, pos: Option<Seq>, water: WaterLevels) -> ServerState {
+        server_with_fed(state, pos, None, water)
+    }
+
+    /// Like `server`, but also sets `playout.fed_seq` — for tests exercising
+    /// the upgrade tier's fed-boundary gating (see Tier C below).
+    fn server_with_fed(
+        state: PlayoutState,
+        pos: Option<Seq>,
+        fed: Option<Seq>,
+        water: WaterLevels,
+    ) -> ServerState {
         ServerState {
             rev: 1,
             live_seq: Some(50),
@@ -313,6 +338,7 @@ mod tests {
                 state,
                 position_seq: pos,
                 playing_rung: None,
+                fed_seq: fed,
                 device: None,
                 volume: 1.0,
                 detail: None,
@@ -403,6 +429,74 @@ mod tests {
         assert!(upgrades.iter().all(|a| a.seq > 30));
         // Nearest-to-head upgraded first.
         assert_eq!(upgrades.iter().map(|a| a.seq).min(), Some(31));
+    }
+
+    #[test]
+    fn upgrades_never_target_a_seq_already_fed_to_the_decoder() {
+        // Playout head (audible position) at 30, but the engine's decode
+        // pipeline has already fed segments up through 32 into its ring
+        // (the realistic case: it runs many segments ahead of real-time
+        // output — see `playout.rs` module docs). Even though 31/32 are
+        // "ahead of the head" and would have been upgrade candidates under
+        // the old anchor-only gating, their rung is already locked in — an
+        // upgrade upload for them can never change what's heard, so Tier C
+        // must skip straight to 33.
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 10000,
+        };
+        let srv = server_with_fed(PlayoutState::Playing, Some(30), Some(32), water);
+        let cov: Vec<(Seq, Option<RungId>)> = (25..=50).map(|s| (s, Some(0))).collect();
+        let inv = inv_full(0, 50, &cov);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000,
+            headroom: 0.9,
+            max_actions: 20,
+        };
+        let plan = plan_uploads(&input);
+
+        let upgrades: Vec<_> = plan
+            .iter()
+            .filter(|a| a.reason == UploadReason::Upgrade)
+            .collect();
+        assert!(!upgrades.is_empty(), "expected some HD upgrades beyond 32");
+        assert!(
+            upgrades.iter().all(|a| a.seq > 32),
+            "an upgrade landed at or behind the already-fed boundary (32): {upgrades:?}"
+        );
+        assert_eq!(upgrades.iter().map(|a| a.seq).min(), Some(33));
+    }
+
+    #[test]
+    fn upgrades_yield_nothing_when_the_whole_comfortable_window_is_already_fed() {
+        // Same as above, but the engine has fed all the way out to 38 — past
+        // the entire window Tier C would otherwise consider this tick
+        // (anchor=30, high_ms=10000/seg_ms=2000 => cap_segs=5 => window
+        // 31..=35). Nothing in that window can still be upgraded in time, so
+        // Tier C must produce zero upgrade actions rather than wastefully
+        // uploading HD for segments that will never be heard at that rung.
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 10000,
+        };
+        let srv = server_with_fed(PlayoutState::Playing, Some(30), Some(38), water);
+        let cov: Vec<(Seq, Option<RungId>)> = (25..=50).map(|s| (s, Some(0))).collect();
+        let inv = inv_full(0, 50, &cov);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000,
+            headroom: 0.9,
+            max_actions: 20,
+        };
+        let plan = plan_uploads(&input);
+        assert!(plan.iter().all(|a| a.reason != UploadReason::Upgrade));
     }
 
     #[test]

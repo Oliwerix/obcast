@@ -208,6 +208,22 @@ pub struct PlayoutStatus {
     /// producing audio (decode failure/abandoned/stall-timeout).
     #[serde(default)]
     pub playing_rung: Option<RungId>,
+    /// Highest seq the engine has already fed into the decode pipeline —
+    /// its rung locked in per `playing_rung`'s doc comment, even though the
+    /// seq itself may not be audible for many seconds yet (the ring feeds
+    /// far ahead of real-time output). `None` while stopped or just
+    /// started/sought, before anything has been fed at the new position.
+    /// The scheduler's quality-upgrade tier (`scheduler::plan_uploads`)
+    /// treats every seq at or below this as un-upgradeable: an upload that
+    /// lands for it can never change what's actually heard, since the
+    /// decoder already committed to whatever rung was on disk when it was
+    /// fed. Without this, the upgrade tier only knew to stay ahead of
+    /// `position_seq` (the *audible* head), which is many seconds behind
+    /// the *fed* head — so in steady state it kept spending upload budget
+    /// on seqs that were already locked in, and a genuine upgrade almost
+    /// never landed before playout got there first.
+    #[serde(default)]
+    pub fed_seq: Option<Seq>,
     /// Selected hardware output device id, if any.
     pub device: Option<String>,
     /// Linear gain 0.0..=1.0 (or higher for boost).
@@ -300,6 +316,7 @@ impl ServerState {
                 state: PlayoutState::Stopped,
                 position_seq: None,
                 playing_rung: None,
+                fed_seq: None,
                 device: None,
                 volume: 1.0,
                 detail: None,

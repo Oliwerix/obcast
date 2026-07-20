@@ -163,6 +163,22 @@ and the client GUI's on-air quality readout read this field directly rather
 than looking up "best rung for this seq" against `coverage`, which would
 otherwise report a rung the speaker isn't actually playing yet.
 
+`playout.fed_seq` (`Option<Seq>`, `#[serde(default)]`) is the highest seq the
+engine has already fed to its decoder — the same feed-ahead depth that makes
+`playing_rung` necessary, exposed as a boundary rather than a per-segment
+readout. `None` while stopped or just started/sought. The scheduler's Tier C
+(quality upgrades, `scheduler.rs`) uses this — not `position_seq` — as the
+"don't bother upgrading at or behind here" line: an upgrade upload for a seq
+already fed can never change what's heard, since the engine locked in
+whatever rung was on disk the moment it fed that seq. Gating on
+`position_seq` alone let Tier C keep spending its whole per-tick budget on
+segments that were, in practice, already fed by the time the upload landed —
+the engine's feed-ahead depth (`RING_SEGMENTS` in `playout.rs`) is comparable
+to or larger than Tier C's own look-ahead window under the default water
+levels, so in steady state almost none of those uploads could ever actually
+be heard. Falls back to `position_seq` when absent (older server, or
+stopped), preserving the previous ahead-of-head-only behavior.
+
 ### `ServerState` fields that drive the scheduler
 - `playout.state` + `playout.position_seq` — the anchor for all urgency.
   `position_seq` tracks the seq whose audio is actually draining out of the
@@ -172,6 +188,9 @@ otherwise report a rung the speaker isn't actually playing yet.
   to a few seconds; reporting the queue-time position instead of the
   drain-time one used to make the head, and everything derived from it, read
   ahead of what a listener could actually hear.)
+- `playout.fed_seq` — highest seq already fed to the decoder; Tier C
+  (upgrades) never targets a seq at or behind this, since an upgrade upload
+  for it could no longer change what's heard.
 - `frontier_seq` — highest seq contiguously playable from the anchor.
 - `lead_ms` — ms of contiguous audio ahead of the head (drain indicator).
 - `buffered_ms` — ms of contiguous DVR history from `dvr_start_seq` forward,
