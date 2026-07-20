@@ -53,6 +53,7 @@ impl StreamHandle {
             state: self.playout.playout_state(),
             position_seq: self.playout.position(),
             playing_rung: self.playout.playing_rung(),
+            fed_seq: self.playout.fed_seq(),
             device: self.playout.device_name(),
             volume: self.playout.volume(),
             detail: self.playout.detail(),

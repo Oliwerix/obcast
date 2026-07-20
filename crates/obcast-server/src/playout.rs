@@ -223,6 +223,12 @@ pub struct PlayoutHandle {
     /// "unknown" (nothing confirmed draining yet: stopped, just
     /// started/sought, or the ring is genuinely empty). See `playing_rung`.
     playing_rung: AtomicI32,
+    /// Highest seq the engine loop has fed to the decoder (or skipped
+    /// without feeding — either way, its rung is locked in). -1 means
+    /// "nothing fed yet at the current position" (stopped, or just
+    /// started/sought). See `fed_seq()` and `ServerState::PlayoutStatus::fed_seq`
+    /// for why the upgrade scheduler needs this rather than `position_seq`.
+    fed_seq: AtomicI64,
     cmd_tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
@@ -246,6 +252,13 @@ impl PlayoutHandle {
     pub fn playing_rung(&self) -> Option<RungId> {
         let v = self.playing_rung.load(Ordering::Relaxed);
         (v >= 0).then_some(v as RungId)
+    }
+
+    /// Highest seq already fed into the decode pipeline — see the field
+    /// doc comment on `fed_seq` and on `PlayoutStatus::fed_seq`.
+    pub fn fed_seq(&self) -> Option<Seq> {
+        let v = self.fed_seq.load(Ordering::Relaxed);
+        (v >= 0).then_some(v as Seq)
     }
 
     pub fn playout_state(&self) -> PlayoutState {
@@ -319,6 +332,7 @@ impl PlayoutHandle {
     /// never put anything in the ring. See `pending`'s doc comment.
     fn enqueue_pending(&self, seq: Seq, rung: Option<RungId>, samples: usize) {
         self.pending.lock().unwrap().push_back((seq, rung, samples));
+        self.fed_seq.store(seq as i64, Ordering::Relaxed);
     }
 
     /// Called from the realtime output callback after it has drained
@@ -555,6 +569,7 @@ pub fn spawn(
         log,
         pending: std::sync::Mutex::new(VecDeque::new()),
         playing_rung: AtomicI32::new(-1),
+        fed_seq: AtomicI64::new(-1),
         cmd_tx,
     });
 
@@ -771,6 +786,8 @@ fn run_engine(
                 // `drain_pending` sets this for real once audio for it
                 // actually reaches the output callback.
                 handle.playing_rung.store(-1, Ordering::Relaxed);
+                // Nothing fed yet at the new position either.
+                handle.fed_seq.store(-1, Ordering::Relaxed);
                 handle.running.store(true, Ordering::Relaxed);
                 handle.paused.store(false, Ordering::Relaxed);
                 // No audio has actually reached the ring yet; the output
@@ -787,6 +804,7 @@ fn run_engine(
                 handle.running.store(false, Ordering::Relaxed);
                 handle.position_seq.store(-1, Ordering::Relaxed);
                 handle.playing_rung.store(-1, Ordering::Relaxed);
+                handle.fed_seq.store(-1, Ordering::Relaxed);
                 if let Some(old) = session.take() {
                     producer_holder = Some(teardown_decoder_session(old));
                 }
@@ -809,6 +827,7 @@ fn run_engine(
                     .position_seq
                     .store(position as i64, Ordering::Relaxed);
                 handle.playing_rung.store(-1, Ordering::Relaxed);
+                handle.fed_seq.store(-1, Ordering::Relaxed);
                 // A seek is a discontinuity in the byte stream fed to the
                 // decoder, so the old session (mid-decode of the pre-seek
                 // position) must go — restart fresh rather than let stale
