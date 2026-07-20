@@ -13,6 +13,7 @@
 //! addition, not part of the upstream JSON schema; peaks.js ignores unknown
 //! fields, so this remains a valid input to `WaveformData.create()`.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use serde::Serialize;
@@ -56,16 +57,39 @@ pub struct WaveformJson {
     decode_failed: Vec<bool>,
 }
 
-/// Decode every playable segment in `[start, end]` and build one JSON
-/// waveform covering the whole range, at a fixed `points_per_segment` so
-/// every segment — present or missing — occupies the same visual width.
-/// Blocking (spawns `ffmpeg` per segment) — call from a blocking task, not
-/// directly on the async runtime.
-pub fn build(
+/// A snapshot of what `[start, end]` looks like in the DVR index right now:
+/// per seq, the best rung and where its bytes live on disk (or `None` for a
+/// true gap). Cheap, index-only lookups — safe to build while holding the
+/// store lock. See `build_from_index` for why this is split out from the
+/// actual decode work.
+pub fn snapshot_index(
     store: &DvrStore,
-    profile: &StreamProfile,
     start: Seq,
     end: Seq,
+) -> Vec<(Seq, Option<(RungId, PathBuf)>)> {
+    (start..=end)
+        .map(|seq| {
+            let entry = store
+                .best_rung(seq)
+                .map(|rung| (rung, store.segment_path(rung, seq)));
+            (seq, entry)
+        })
+        .collect()
+}
+
+/// Decode every playable segment described by `entries` and build one JSON
+/// waveform covering the whole range, at a fixed `points_per_segment` so
+/// every segment — present or missing — occupies the same visual width.
+/// Blocking (spawns `ffmpeg` per segment): this deliberately takes an owned
+/// snapshot rather than `&DvrStore` so the caller can drop the store lock
+/// before this runs. A multi-minute DVR window means dozens of serial
+/// `ffmpeg` spawns here — holding the store's lock across that would starve
+/// every other store user (segment ingest, the playout engine's per-tick
+/// segment lookup) for the whole decode, which is exactly the kind of stall
+/// this split avoids.
+pub fn build_from_index(
+    profile: &StreamProfile,
+    entries: &[(Seq, Option<(RungId, PathBuf)>)],
     log: &LogSink,
 ) -> WaveformJson {
     let points_per_segment = (profile.segment_ms / POINT_MS).max(1) as usize;
@@ -76,14 +100,15 @@ pub fn build(
     let mut seqs = Vec::new();
     let mut decode_failed = Vec::new();
 
-    for seq in start..=end {
-        let rung = store.best_rung(seq);
-        let (segment_points, failed) = match rung {
+    for (seq, entry) in entries {
+        let seq = *seq;
+        let rung = entry.as_ref().map(|(r, _)| *r);
+        let (segment_points, failed) = match entry {
             // A true gap: no rung was ever recorded for this seq. Not a
             // failure — there's simply nothing to decode.
             None => (vec![(0, 0); points_per_segment], false),
-            Some(r) => {
-                let path = store.segment_path(r, seq);
+            Some((r, path)) => {
+                let r = *r;
                 if !path.exists() {
                     tracing::warn!(
                         seq,
@@ -99,7 +124,7 @@ pub fn build(
                     );
                     (vec![(0, 0); points_per_segment], true)
                 } else {
-                    match decode_mono_i16(&path, DECODE_SAMPLE_RATE) {
+                    match decode_mono_i16(path, DECODE_SAMPLE_RATE) {
                         Some(samples) => (
                             extract_peaks(&samples, samples_per_point as usize, points_per_segment),
                             false,
@@ -146,6 +171,23 @@ pub fn build(
         seqs,
         decode_failed,
     }
+}
+
+/// Convenience wrapper combining `snapshot_index` + `build_from_index` for
+/// callers (tests, mainly) that don't need to control the store lock's
+/// lifetime separately. `api.rs`'s real handler calls the two halves
+/// directly so it can drop the lock between them — see `build_from_index`'s
+/// doc comment.
+#[cfg(test)]
+fn build(
+    store: &DvrStore,
+    profile: &StreamProfile,
+    start: Seq,
+    end: Seq,
+    log: &LogSink,
+) -> WaveformJson {
+    let entries = snapshot_index(store, start, end);
+    build_from_index(profile, &entries, log)
 }
 
 /// Splits `samples` into exactly `target_points` chunks (the last chunk
