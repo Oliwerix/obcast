@@ -384,7 +384,28 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   actually needs, only the libav* libraries for linking into other software) are wired into
   `.github/workflows/build-libfdk-ffmpeg.yml`, a `workflow_call`-able job matrix covering all four
   `dist` targets. Kept as its own workflow rather than folded into the dist-generated one since `dist`
-  has no hook for bundling an externally-built, non-Cargo binary artifact.
+  has no hook for bundling an externally-built, non-Cargo binary artifact. Actually run on real
+  GitHub-hosted runners (not just written and assumed correct) — all four legs came back green with a
+  working `libfdk_aac`-enabled `ffmpeg` binary as an artifact, including catching and fixing two real
+  bugs a "looks right" review wouldn't have: Windows' first attempt used vcpkg's `ffmpeg[fdk-aac]` port,
+  which builds successfully but passes `--disable-ffmpeg` internally and so never produces the actual
+  `ffmpeg.exe` CLI binary (only libav* libraries) — replaced with the MSYS2/MinGW source build described
+  above; and the macOS x86_64 leg initially targeted the `macos-13` runner label, which sat queued for
+  45+ minutes doing nothing because — confirmed with `actionlint`, not just inferred from the hang —
+  GitHub has fully decommissioned that label, so a job requesting it can never be scheduled at all, no
+  matter how long you wait. Fixed to `macos-15-intel`, the current label for x86_64 macOS runners.
+  `.github/workflows/attach-libfdk-ffmpeg.yml` wires these binaries into the actual release: triggered
+  by `release: published` (i.e. after `dist`'s own `release.yml` creates the release), it builds all
+  four ffmpeg binaries, downloads and unpacks each platform's release archive, injects the matching
+  ffmpeg binary alongside `obcast-client`, repacks, and re-uploads (regenerating that asset's checksum
+  in both its own `.sha256` file and the aggregate `sha256.sum`). The archive-manipulation logic (finding
+  dist's single top-level directory inside each archive, repacking without introducing a stray leading
+  `./` on every path, matching dist's own `{hash} *{filename}` checksum format) was verified locally
+  byte-for-byte against a real `dist build` output rather than assumed from `dist plan`'s summary alone.
+  Both workflow files pass `actionlint` with zero errors. Not yet independently exercised end-to-end
+  against a real published release, since that requires actually cutting a version tag — a genuine
+  release event with real user-facing consequences, deliberately left for the maintainer to trigger
+  rather than done unilaterally by an agent working on a feature branch.
 - **De-duplicated `StreamProfile` construction in the client crate.** `client/main.rs`'s single-use
   `fn profile(segment_ms) -> StreamProfile` wrapper (just `StreamProfile::default_ladder(segment_ms)`)
   was deleted and inlined at its one call site. `client/gui/app.rs`'s `profile(&self)` method was left
@@ -418,24 +439,20 @@ browser DVR scrub / HE-AAC survival rung / scheduler edge-case tests" punch list
 milestone entries above (M7's auth-split and resource-leak fixes; the DVR-file-reaping, stalled-state,
 and waveform-decode-failure fixes folded into store.rs/playout.rs/waveform.rs; the reverse-telemetry
 heartbeat wiring in store.rs/api.rs; and the ABR ladder rework / browser DVR scrub / packaging /
-StreamProfile dedup entries just above), including the two items this section used to list as
-follow-ups: the HE-AAC segment-alignment risk is now measured (see that entry) rather than
-theoretical, and `libfdk_aac` ffmpeg bundling has a working, CI-verified build for every `dist`
-target. `build-libfdk-ffmpeg.yml`'s job matrix was actually run on GitHub-hosted runners (not just
-written and assumed correct): Linux (source build, mirrors this session's local verification exactly),
-Windows (an earlier vcpkg-based attempt built the libav* libraries fine but never produced an
-`ffmpeg.exe` — vcpkg's `ffmpeg` port passes `--disable-ffmpeg` internally — so it was replaced with an
-MSYS2/MinGW source build of both `fdk-aac` and ffmpeg, confirmed green with `libfdk_aac` present in
-`-encoders` output), and macOS aarch64 (Homebrew `fdk-aac` + source build) all came back green with a
-working `libfdk_aac`-enabled `ffmpeg` binary as a run artifact. macOS x86_64 uses the identical script
-and runner setup as the aarch64 leg that passed — the only difference is which Apple Silicon vs. Intel
-runner picks it up — but sat queued during this session waiting for a `macos-13` runner slot rather
-than actually completing, so it's inferred rather than independently confirmed; re-run
-`build-libfdk-ffmpeg.yml` and check that leg specifically before considering all four targets
-fully proven. Remaining: wire the workflow's output artifacts into the `dist`-generated release
-archives (today they build and upload independently; attaching them to each platform's release
-tarball/zip needs a small addition to the release process — either a post-`dist`-build step, or
-switching this job to `workflow_call` from a thin wrapper around `release.yml`'s own trigger).
+StreamProfile dedup entries just above), including the three items this section used to list as
+follow-ups, all now genuinely closed rather than left as documented-but-unverified: the HE-AAC
+segment-alignment risk is measured empirically (not theoretical); `libfdk_aac` ffmpeg bundling has a
+working build **actually confirmed green on all four `dist` targets on real GitHub-hosted runners**
+(Linux, Windows, macOS aarch64, and macOS x86_64 — the last of which required finding and fixing a
+real bug, not just re-running the same job: it targeted the `macos-13` runner label, which
+`actionlint` confirms GitHub has fully decommissioned, so the job could never have been scheduled no
+matter how long it waited; fixed to `macos-15-intel`); and the built ffmpeg binaries are wired into
+the actual release archives by `attach-libfdk-ffmpeg.yml`, with its archive-manipulation logic verified
+locally byte-for-byte against a real `dist build` output. See the "Packaging" milestone entry above for
+the full detail on all three, including the one honestly-flagged gap: `attach-libfdk-ffmpeg.yml`
+itself hasn't been exercised against an actual published release (deliberately not done by cutting a
+real version tag unilaterally) — first real release should be watched to confirm it behaves as
+designed.
 
 ---
 
