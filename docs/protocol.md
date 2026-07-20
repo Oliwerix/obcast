@@ -154,6 +154,13 @@ wiring/routing check, never part of scheduler input.
 
 ### `ServerState` fields that drive the scheduler
 - `playout.state` + `playout.position_seq` — the anchor for all urgency.
+  `position_seq` tracks the seq whose audio is actually draining out of the
+  server's hardware output right now, not merely the newest segment queued
+  into the playout ring buffer — see `playout.rs`'s `pending`/
+  `drain_pending`. (A segment can sit decoded-but-unheard in the ring for up
+  to a few seconds; reporting the queue-time position instead of the
+  drain-time one used to make the head, and everything derived from it, read
+  ahead of what a listener could actually hear.)
 - `frontier_seq` — highest seq contiguously playable from the anchor.
 - `lead_ms` — ms of contiguous audio ahead of the head (drain indicator).
 - `buffered_ms` — ms of contiguous DVR history from `dvr_start_seq` forward,

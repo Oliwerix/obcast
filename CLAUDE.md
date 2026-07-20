@@ -216,9 +216,22 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
 - **M4 — DONE (server) / PARTIAL (web listen).** HLS origin (master + per-rung sliding-window
   playlists, best-rung fallback) done. Web has hls.js listen-along, but the scrub bar drives *server*
   playout via the waveform — browser-side DVR scrub of the listen-along player itself is **OPEN**.
-- **M5 — DONE.** Playout to hardware out via `cpal` (dedicated thread, ffmpeg decode, ring buffer,
-  atomics for pos/state/vol/meters), start/stop + seek; head flows into `ServerState` (holds rather
-  than skips on a not-yet-on-disk segment).
+- **M5 — DONE**, plus a correctness fix. Playout to hardware out via `cpal` (dedicated thread, ffmpeg
+  decode, ring buffer, atomics for pos/state/vol/meters), start/stop + seek; head flows into
+  `ServerState` (holds rather than skips on a not-yet-on-disk segment). Fixed: `position_seq` used to
+  advance the instant a segment's decoded PCM was pushed into the ring buffer, not once it was
+  actually drained by the realtime output callback — since a whole segment (up to `ring capacity` =
+  3 segments) can sit queued-but-unheard at a time, the reported head (and everything derived from it:
+  `ServerState.frontier_seq`/`lead_ms`/`coverage`, and downstream the client's on-air-quality/buffer
+  readouts — see the auto-start entry below) could read several seconds ahead of what a listener could
+  actually hear. `playout.rs` now tracks a `pending` FIFO of `(seq, remaining samples)` per queued
+  segment and advances `position_seq` from the output callback as it genuinely drains through them
+  (`PlayoutHandle::drain_pending`, tested via the pure `advance_pending` core). A related, still-open
+  issue found in the same review: the ring buffer itself isn't cleared on `stop`/`seek`, so stale
+  pre-jump audio can still play out for a few seconds before the new position's audio is reached —
+  `position_seq` now truthfully reports whichever seq is actually draining during that window (better
+  than before, which claimed the new position immediately), but the stale-audio playback itself is
+  unfixed.
 - **M6 — DONE**, plus a correctness fix. Control API (REST `status`/`playout` + WS
   status/position/meters) + web remote UI (start/stop/seek, health panel, VU meters, waveform seek).
   Fixed: the shows overview's `live` flag used to mean only "an in-memory `StreamHandle` exists" —
@@ -279,7 +292,11 @@ the boundary where the link can just sustain it), and an on-air quality readout 
 from `ServerState.coverage` while connected and falls back to a same-crate guess — extrapolating the
 playout head's position from elapsed time and looking up what rung *we* sent for that seq in a local
 upload-history map (`SharedState::playing_quality`) — once the link (and thus `ServerState`) goes
-stale, flagged as "(estimated)" in the UI.
+stale, flagged as "(estimated)" in the UI. All three also plot a rolling last-60s history (hand-painted
+line graphs, `gui/meter::sparkline`, sampled once a second independent of the ~30fps repaint) — no
+plotting crate: a dependency scan found no `egui_plot` release compatible with this workspace's egui
+version (its latest, 0.35.0, pins `egui ^0.34`), so this follows the same hand-painted-widget approach
+`level_meter`/`mini_meter` already use rather than fighting that mismatch.
 
 **What's next (priority order, re-ranked after Rust/design review and a follow-up adversarial
 review — correctness/security risks before features):** (1) Auth split, and in particular give

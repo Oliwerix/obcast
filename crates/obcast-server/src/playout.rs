@@ -21,6 +21,7 @@
 //! session, ring buffer, and the stream itself — lives on one dedicated OS
 //! thread (plus its reader thread) and is driven by commands over a channel.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
@@ -191,6 +192,21 @@ pub struct PlayoutHandle {
     /// warn/error status lines to the web remote's log panel without a
     /// circular reference back to `StreamHandle`.
     log: Arc<LogSink>,
+    /// FIFO of `(seq, remaining raw f32 samples not yet drained)` for
+    /// segments currently sitting in the ring buffer, oldest first — pushed
+    /// by the engine loop whenever it queues a segment's decoded PCM (or a
+    /// 0-length entry for a decode failure/abandoned/stall-timeout skip,
+    /// which never puts any audio in the ring at all), drained by the
+    /// realtime output callback as it actually consumes samples. This is
+    /// what lets `position_seq` reflect the segment whose audio is truly
+    /// coming out of the speaker right now rather than the segment most
+    /// recently pushed into the ring — without it, `position_seq` (and
+    /// everything derived from it: `ServerState.frontier_seq`/`lead_ms`/
+    /// `coverage`, plus the client's on-air-quality/buffer readouts) reads
+    /// up to a full ring capacity (3 segments) ahead of what a listener can
+    /// actually hear, since a whole segment gets pushed to the ring well
+    /// before the callback has drained through it.
+    pending: std::sync::Mutex<VecDeque<(Seq, usize)>>,
     cmd_tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
@@ -268,6 +284,59 @@ impl PlayoutHandle {
     fn push_log(&self, level: LogLevel, message: impl Into<String>) {
         self.log.push(level, message);
     }
+
+    /// Called from the engine (decode) loop once it has decided what to do
+    /// about `seq`: `samples` is the raw f32 count just pushed to the ring
+    /// for real audio, or `0` for a decode failure/abandoned/stall-timeout
+    /// skip that never put anything in the ring. See `pending`'s doc comment.
+    fn enqueue_pending(&self, seq: Seq, samples: usize) {
+        self.pending.lock().unwrap().push_back((seq, samples));
+    }
+
+    /// Called from the realtime output callback after it has drained
+    /// `filled` real samples this tick (excluding any zero-padded underrun
+    /// tail — there's no decoded audio behind that padding to attribute to
+    /// a seq). Advances `position_seq` to whichever segment is now at the
+    /// front of what's left un-drained.
+    fn drain_pending(&self, filled: usize) {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(next) = advance_pending(&mut pending, filled) {
+            self.position_seq.store(next as i64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Pure core of `PlayoutHandle::drain_pending`, factored out so it's testable
+/// without a real cpal device/thread: walks `pending`'s front entries given
+/// `filled` real samples just consumed, popping any that are now fully
+/// drained (returning the seq *after* the last one popped — i.e. the new
+/// reported position — or `None` if nothing changed). Zero-length entries
+/// are popped immediately regardless of `filled`, since there's nothing to
+/// wait for — they represent a seq that was skipped without ever producing
+/// audio (decode failure / abandoned / stall-timeout).
+fn advance_pending(pending: &mut VecDeque<(Seq, usize)>, mut filled: usize) -> Option<Seq> {
+    let mut new_position = None;
+    while let Some(front) = pending.front_mut() {
+        if front.1 == 0 {
+            let next = front.0 + 1;
+            pending.pop_front();
+            new_position = Some(next);
+            continue;
+        }
+        if filled == 0 {
+            break;
+        }
+        if front.1 <= filled {
+            filled -= front.1;
+            let next = front.0 + 1;
+            pending.pop_front();
+            new_position = Some(next);
+        } else {
+            front.1 -= filled;
+            filled = 0;
+        }
+    }
+    new_position
 }
 
 /// Once a segment has been neither playable nor confirmed-abandoned for this
@@ -445,6 +514,7 @@ pub fn spawn(
         device_error: RwLock::new(None),
         stall_reason: RwLock::new(None),
         log,
+        pending: std::sync::Mutex::new(VecDeque::new()),
         cmd_tx,
     });
 
@@ -570,6 +640,11 @@ fn run_engine(
                 volume_handle
                     .underrun
                     .store(filled < data.len(), Ordering::Relaxed);
+                // Advance the reported position from what's actually
+                // draining out right now — only `filled` real samples, never
+                // the zero-padded underrun tail below (there's no decoded
+                // audio behind that padding to attribute to any seq).
+                volume_handle.drain_pending(filled);
                 for s in &mut data[..filled] {
                     *s *= gain;
                 }
@@ -764,6 +839,15 @@ fn run_engine(
                             // reader thread clears `underrun` once PCM
                             // actually reaches the ring.
                             *handle.stall_reason.write().unwrap() = None;
+                            // The persistent decoder demuxes one continuous
+                            // stream (see module docs), so there's no exact
+                            // per-segment PCM length to read off the way the
+                            // old per-segment decode had — `segment_samples`
+                            // (the nominal segment duration) stands in for
+                            // `pending`'s purpose of tracking roughly which
+                            // segment is audible right now, not sample-exact
+                            // position.
+                            handle.enqueue_pending(seq, segment_samples);
                             advance = true;
                         }
                         Err(err) => {
@@ -800,6 +884,7 @@ fn run_engine(
                     );
                     *handle.stall_reason.write().unwrap() =
                         Some(format!("segment {seq} was abandoned by the encoder"));
+                    handle.enqueue_pending(seq, 0);
                     advance = true;
                 } else {
                     // Missing, not (yet) abandoned. Wait up to `timeout`
@@ -829,6 +914,7 @@ fn run_engine(
                             "segment {seq} missing for over {}ms, skipped",
                             timeout.as_millis()
                         ));
+                        handle.enqueue_pending(seq, 0);
                         advance = true;
                     }
                 }
@@ -836,9 +922,13 @@ fn run_engine(
                 if advance {
                     current = Some(seq + 1);
                     stall_since = None;
-                    handle
-                        .position_seq
-                        .store((seq + 1) as i64, Ordering::Relaxed);
+                    // `position_seq` no longer advances here — it now
+                    // tracks real drain progress via `pending`/
+                    // `drain_pending`, driven by the output callback (see
+                    // `PlayoutHandle::pending`'s doc comment for why:
+                    // advancing it the instant a segment is fed to the
+                    // decoder would report a position up to a full ring's
+                    // worth ahead of what's actually audible).
                 }
             }
         }
@@ -954,5 +1044,64 @@ mod test_tone_tests {
         let (bounds, _) = build_test_tone_pattern(SR);
         let pause_mid = (2.25 * SR as f64) as u64;
         assert_eq!(test_tone_sample(pause_mid, SR, &bounds), (0.0, 0.0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advance_pending_reports_nothing_drained_yet() {
+        let mut pending = VecDeque::from([(5, 100)]);
+        assert_eq!(advance_pending(&mut pending, 40), None);
+        assert_eq!(pending.front(), Some(&(5, 60)));
+    }
+
+    #[test]
+    fn advance_pending_stays_on_a_segment_until_fully_drained() {
+        // A whole segment (100 samples) was queued at once, well ahead of
+        // playback — this is exactly the bug: without draining-based
+        // tracking, position would jump to 6 the instant it was queued,
+        // not once the audio callback has actually consumed it.
+        let mut pending = VecDeque::from([(5, 100)]);
+        assert_eq!(advance_pending(&mut pending, 60), None);
+        assert_eq!(advance_pending(&mut pending, 39), None);
+        assert_eq!(advance_pending(&mut pending, 1), Some(6));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn advance_pending_can_cross_multiple_segments_in_one_callback() {
+        let mut pending = VecDeque::from([(5, 10), (6, 10), (7, 10)]);
+        // One callback drains enough for segments 5 and 6, and part of 7.
+        assert_eq!(advance_pending(&mut pending, 25), Some(7));
+        assert_eq!(pending.front(), Some(&(7, 5)));
+    }
+
+    #[test]
+    fn advance_pending_pops_zero_length_entries_immediately_without_needing_filled() {
+        // A decode failure/abandoned/stall-timeout skip never puts audio in
+        // the ring, so it must not wait on `filled` samples to be reported
+        // as passed — even with 0 filled this callback, it advances.
+        let mut pending = VecDeque::from([(5, 0), (6, 0), (7, 10)]);
+        assert_eq!(advance_pending(&mut pending, 0), Some(7));
+        assert_eq!(pending.front(), Some(&(7, 10)));
+    }
+
+    #[test]
+    fn advance_pending_ignores_the_zero_padded_underrun_tail() {
+        // Only real drained samples (`filled`) move the position — a caller
+        // must never pass the full underrun-padded buffer length, or a gap
+        // would silently skip ahead past audio that hasn't played yet.
+        let mut pending = VecDeque::from([(5, 100)]);
+        assert_eq!(advance_pending(&mut pending, 0), None);
+        assert_eq!(pending.front(), Some(&(5, 100)));
+    }
+
+    #[test]
+    fn advance_pending_on_an_empty_queue_reports_nothing() {
+        let mut pending: VecDeque<(Seq, usize)> = VecDeque::new();
+        assert_eq!(advance_pending(&mut pending, 50), None);
     }
 }
