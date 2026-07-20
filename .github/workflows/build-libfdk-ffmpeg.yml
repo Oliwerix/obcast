@@ -71,19 +71,40 @@ jobs:
           if-no-files-found: error
 
   windows:
+    # A MinGW-built ffmpeg.exe is a standalone external tool encode.rs shells
+    # out to as a subprocess — its toolchain doesn't need to match
+    # obcast-client's own x86_64-pc-windows-msvc build (only that binary is
+    # linked/compiled by Cargo). vcpkg's ffmpeg port was tried first and
+    # rejected: it builds the libav* libraries with the fdk-aac feature fine,
+    # but passes --disable-ffmpeg internally, so it never produces the
+    # ffmpeg.exe CLI binary this needs — see build-libfdk-ffmpeg-windows.sh.
     runs-on: windows-latest
     outputs:
       artifact-name: ${{ steps.name.outputs.name }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build ffmpeg with libfdk_aac (vcpkg)
-        run: ./scripts/build-libfdk-ffmpeg.ps1 -InstallDir "$PWD/ffmpeg-install"
-        shell: pwsh
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-yasm
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-pkg-config
+            autoconf
+            automake
+            libtool
+            git
+      - name: Build ffmpeg with libfdk_aac
+        shell: msys2 {0}
+        run: ./scripts/build-libfdk-ffmpeg-windows.sh "$(pwd -W)/ffmpeg-install"
       - id: name
-        run: echo "name=libfdk-ffmpeg-x86_64-pc-windows-msvc" >> $env:GITHUB_OUTPUT
-        shell: pwsh
+        run: echo "name=libfdk-ffmpeg-x86_64-pc-windows-msvc" >> "$GITHUB_OUTPUT"
+        shell: msys2 {0}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.name.outputs.name }}
-          path: ffmpeg-install/ffmpeg.exe
+          path: ffmpeg-install/bin/ffmpeg.exe
           if-no-files-found: error
