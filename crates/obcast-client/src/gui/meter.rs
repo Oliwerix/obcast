@@ -228,6 +228,45 @@ pub fn level_meter(
     .inner
 }
 
+/// A minimal rolling line graph: `values`, oldest first, evenly spaced left
+/// to right (the caller is responsible for sampling on a fixed cadence — the
+/// widget has no notion of real time, it just draws however many points it's
+/// handed across the available width). Used for the Link panel's last-60s
+/// buffer/bandwidth/quality history. Deliberately plain (no axes, no fill,
+/// no external plotting crate) — this codebase already hand-paints its
+/// meters (see `level_meter` above) rather than pulling in a charting
+/// dependency, and a dependency scan turned up no `egui_plot` release
+/// compatible with this workspace's egui version.
+pub fn sparkline(
+    ui: &mut egui::Ui,
+    values: &std::collections::VecDeque<f32>,
+    y_min: f32,
+    y_max: f32,
+    size: Vec2,
+    color: Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, TRACK);
+
+    let n = values.len();
+    if n >= 2 && y_max > y_min {
+        let frac_y = |v: f32| ((v - y_min) / (y_max - y_min)).clamp(0.0, 1.0);
+        let point_at = |i: usize, v: f32| {
+            let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
+            let y = rect.bottom() - frac_y(v) * rect.height();
+            egui::pos2(x, y)
+        };
+        let mut prev = point_at(0, values[0]);
+        for (i, &v) in values.iter().enumerate().skip(1) {
+            let cur = point_at(i, v);
+            painter.line_segment([prev, cur], Stroke::new(1.5, color));
+            prev = cur;
+        }
+    }
+    response
+}
+
 /// Compact horizontal peak meter for a channel-bank row — enough to spot
 /// which of e.g. 32 inputs actually has signal on it, without the full
 /// dual-scale ruler. Deliberately not zone-coloured (green/yellow/red) —

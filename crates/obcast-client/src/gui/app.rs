@@ -6,8 +6,9 @@
 //!    ffmpeg's stdin. The GUI only ever talks to it over an unbounded
 //!    channel — never blocks a frame on network or process I/O.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tokio::io::AsyncWriteExt;
@@ -75,7 +76,24 @@ struct ObcastApp {
     live: bool,
     /// Whether the operator log panel (bottom of the window) is open.
     show_log: bool,
+
+    /// Last-`HISTORY_LEN` samples (oldest first) for the Link panel's
+    /// rolling graphs, sampled at `HISTORY_SAMPLE_INTERVAL` regardless of
+    /// the ~30fps repaint rate — see `link_panel`.
+    buffer_history: VecDeque<f32>,
+    bandwidth_history: VecDeque<f32>,
+    /// Rung id as a plain float; only sampled while something is actually
+    /// playing (skipped, not zero-filled, while stopped/unknown).
+    quality_history: VecDeque<f32>,
+    history_sampled_at: Option<Instant>,
 }
+
+/// How far back the Link panel's rolling graphs look.
+const HISTORY_WINDOW: Duration = Duration::from_secs(60);
+/// How often a new point is sampled — independent of the GUI's ~30fps
+/// repaint, so the graphs don't fill up with 1800 near-identical points.
+const HISTORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const HISTORY_LEN: usize = (HISTORY_WINDOW.as_secs() / HISTORY_SAMPLE_INTERVAL.as_secs()) as usize;
 
 impl ObcastApp {
     fn new(rt: tokio::runtime::Runtime, cfg: AppConfig) -> Self {
@@ -108,6 +126,10 @@ impl ObcastApp {
             cfg,
             live: false,
             show_log: false,
+            buffer_history: VecDeque::new(),
+            bandwidth_history: VecDeque::new(),
+            quality_history: VecDeque::new(),
+            history_sampled_at: None,
         }
     }
 
@@ -618,8 +640,9 @@ impl ObcastApp {
         // Quality on air: ground truth while connected, a best-effort guess
         // from our own upload history while the link's gone quiet — see
         // `SharedState::playing_quality`.
+        let quality = self.shared.playing_quality(self.cfg.segment_ms);
         ui.label("Quality on air");
-        match self.shared.playing_quality(self.cfg.segment_ms) {
+        match quality {
             Some(q) => {
                 let name = self
                     .profile()
@@ -642,6 +665,61 @@ impl ObcastApp {
                 ui.label("(not playing)");
             }
         }
+
+        // Sample the rolling history at a fixed cadence, independent of the
+        // ~30fps repaint (see `HISTORY_SAMPLE_INTERVAL`), then render it —
+        // all three share the "last 60s" framing the buffer/bandwidth/
+        // quality readouts above are snapshots of.
+        let now = Instant::now();
+        if self
+            .history_sampled_at
+            .is_none_or(|t| now.duration_since(t) >= HISTORY_SAMPLE_INTERVAL)
+        {
+            self.history_sampled_at = Some(now);
+            push_capped(
+                &mut self.buffer_history,
+                buffer_ms as f32 / 1000.0,
+                HISTORY_LEN,
+            );
+            push_capped(&mut self.bandwidth_history, bandwidth_pct, HISTORY_LEN);
+            if let Some(q) = quality {
+                push_capped(&mut self.quality_history, q.rung as f32, HISTORY_LEN);
+            }
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("Last 60s").small());
+
+        ui.label(egui::RichText::new("Buffer (s)").small());
+        meter::sparkline(
+            ui,
+            &self.buffer_history,
+            0.0,
+            (buffer_target_ms as f32 / 1000.0).max(1.0),
+            egui::vec2(200.0, 44.0),
+            buffer_color,
+        );
+
+        ui.label(egui::RichText::new("Bandwidth (% of link)").small());
+        meter::sparkline(
+            ui,
+            &self.bandwidth_history,
+            0.0,
+            150.0,
+            egui::vec2(200.0, 44.0),
+            egui::Color32::from_rgb(0x5b, 0x8f, 0xc9),
+        );
+
+        let top_rung = self.profile().top_rung().max(1) as f32;
+        ui.label(egui::RichText::new("Quality (rung, low→high)").small());
+        meter::sparkline(
+            ui,
+            &self.quality_history,
+            0.0,
+            top_rung,
+            egui::vec2(200.0, 44.0),
+            egui::Color32::from_rgb(0xc9, 0x8f, 0x5b),
+        );
     }
 
     /// Scrollable operator status/error log — see `SharedState::recent_log`.
@@ -776,6 +854,14 @@ fn channel_label(ch: u16, total: u16) -> String {
         (0, 2) => "1 (L)".to_string(),
         (1, 2) => "2 (R)".to_string(),
         _ => format!("{}", ch + 1),
+    }
+}
+
+/// Append a Link-panel history sample, dropping the oldest once past `cap`.
+fn push_capped(history: &mut VecDeque<f32>, value: f32, cap: usize) {
+    history.push_back(value);
+    while history.len() > cap {
+        history.pop_front();
     }
 }
 
