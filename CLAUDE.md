@@ -409,17 +409,22 @@ and waveform-decode-failure fixes folded into store.rs/playout.rs/waveform.rs; t
 heartbeat wiring in store.rs/api.rs; and the ABR ladder rework / browser DVR scrub / packaging /
 StreamProfile dedup entries just above), including the two items this section used to list as
 follow-ups: the HE-AAC segment-alignment risk is now measured (see that entry) rather than
-theoretical, and `libfdk_aac` ffmpeg bundling has a working build script + CI job matrix
-(`build-libfdk-ffmpeg.yml`) covering all four `dist` targets rather than being deferred. Remaining:
-(1) wire `build-libfdk-ffmpeg.yml`'s output artifacts into the `dist`-generated release archives (today
-they build and upload independently; attaching them to each platform's release tarball/zip needs a
-small addition to the release process — either a post-`dist`-build step, or switching this job to
-`workflow_call` from a thin wrapper around `release.yml`'s own trigger). (2) Confirm on real
-GitHub-hosted `macos-latest`/`windows-latest` runners that `build-libfdk-ffmpeg.yml`'s macOS
-(Homebrew `fdk-aac` + source build) and Windows (vcpkg `ffmpeg[fdk-aac]`) legs actually succeed — the
-Linux leg mirrors this session's locally-verified recipe exactly, but the other two platforms'
-package availability/build behavior could only be confirmed by an actual CI run, not from this
-sandboxed environment alone.
+theoretical, and `libfdk_aac` ffmpeg bundling has a working, CI-verified build for every `dist`
+target. `build-libfdk-ffmpeg.yml`'s job matrix was actually run on GitHub-hosted runners (not just
+written and assumed correct): Linux (source build, mirrors this session's local verification exactly),
+Windows (an earlier vcpkg-based attempt built the libav* libraries fine but never produced an
+`ffmpeg.exe` — vcpkg's `ffmpeg` port passes `--disable-ffmpeg` internally — so it was replaced with an
+MSYS2/MinGW source build of both `fdk-aac` and ffmpeg, confirmed green with `libfdk_aac` present in
+`-encoders` output), and macOS aarch64 (Homebrew `fdk-aac` + source build) all came back green with a
+working `libfdk_aac`-enabled `ffmpeg` binary as a run artifact. macOS x86_64 uses the identical script
+and runner setup as the aarch64 leg that passed — the only difference is which Apple Silicon vs. Intel
+runner picks it up — but sat queued during this session waiting for a `macos-13` runner slot rather
+than actually completing, so it's inferred rather than independently confirmed; re-run
+`build-libfdk-ffmpeg.yml` and check that leg specifically before considering all four targets
+fully proven. Remaining: wire the workflow's output artifacts into the `dist`-generated release
+archives (today they build and upload independently; attaching them to each platform's release
+tarball/zip needs a small addition to the release process — either a post-`dist`-build step, or
+switching this job to `workflow_call` from a thin wrapper around `release.yml`'s own trigger).
 
 ---
 
