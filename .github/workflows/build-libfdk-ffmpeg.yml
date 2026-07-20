@@ -1,0 +1,84 @@
+# Builds the libfdk_aac-enabled ffmpeg bundled alongside the obcast-client
+# release binary (see scripts/build-libfdk-ffmpeg.sh/.ps1 and CLAUDE.md §8
+# "packaging"). Separate from the dist-generated .github/workflows/release.yml
+# (don't hand-edit that one — see dist-workspace.toml) since dist doesn't
+# have a hook for bundling an externally-built, non-Cargo binary artifact;
+# this job produces the ffmpeg binaries as its own artifacts, which the
+# release process attaches to each platform's archive.
+name: Build libfdk_aac ffmpeg
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      linux-artifact:
+        value: ${{ jobs.linux.outputs.artifact-name }}
+      macos-artifact:
+        value: ${{ jobs.macos.outputs.artifact-name }}
+      windows-artifact:
+        value: ${{ jobs.windows.outputs.artifact-name }}
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ steps.name.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential yasm nasm pkg-config libfdk-aac-dev
+      - name: Build ffmpeg with libfdk_aac
+        run: ./scripts/build-libfdk-ffmpeg.sh "$PWD/ffmpeg-install"
+      - id: name
+        run: echo "name=libfdk-ffmpeg-x86_64-unknown-linux-gnu" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: ffmpeg-install/bin/ffmpeg
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      artifact-name: ${{ steps.name.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: brew install fdk-aac yasm nasm pkg-config
+      - name: Build ffmpeg with libfdk_aac
+        run: ./scripts/build-libfdk-ffmpeg.sh "$PWD/ffmpeg-install"
+      - id: name
+        run: echo "name=libfdk-ffmpeg-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: ffmpeg-install/bin/ffmpeg
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    outputs:
+      artifact-name: ${{ steps.name.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ffmpeg with libfdk_aac (vcpkg)
+        run: ./scripts/build-libfdk-ffmpeg.ps1 -InstallDir "$PWD/ffmpeg-install"
+        shell: pwsh
+      - id: name
+        run: echo "name=libfdk-ffmpeg-x86_64-pc-windows-msvc" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: ffmpeg-install/ffmpeg.exe
+          if-no-files-found: error

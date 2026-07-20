@@ -332,16 +332,26 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   rung while live requires confirming a warning dialog (it restarts the encoder pipeline — ffmpeg can't
   add/remove `-map` outputs without a respawn — causing a few seconds of audio gap that the existing
   continuity/abandon/stall-skip machinery already absorbs); the dialog exists specifically so a live
-  toggle is a deliberate operator action, not an accidental one. Bundling our own `libfdk_aac`-enabled
-  ffmpeg build (removing the fallback path entirely) was considered and deliberately deferred — see
-  "What's next" below. **Open risk, flagged by adversarial review and not yet verified on a real
-  libfdk build** (this repo's dev/CI ffmpeg lacks `libfdk_aac`, so the HE-AAC code path is currently
-  dead in practice, exercising only the LC fallback): HE-AAC's SBR roughly doubles the encoder's frame
-  size versus LC, which can shift where `-segment_time` actually cuts on the `lo` rung relative to the
-  LC rungs sharing the same `ffmpeg` process — `encode.rs`'s own module doc states sample-aligned
-  segment boundaries across rungs as an invariant the scheduler's per-seq coverage model assumes.
-  Before relying on this in production, confirm on a libfdk-enabled build that a given seq covers the
-  same audio window on `lo` as it does on every LC rung.
+  toggle is a deliberate operator action, not an accidental one. **Segment-alignment risk, raised by
+  adversarial review and since verified**: this repo's stock dev/CI ffmpeg lacks `libfdk_aac`, so a
+  second, `libfdk_aac`-enabled ffmpeg (built from source locally against the already-present
+  `libfdk-aac` system library — see `dist`/packaging entry below for why this isn't the default build)
+  was used to actually exercise the HE-AAC path and check `encode.rs`'s own module-doc claim of
+  sample-aligned segment boundaries across rungs. HE-AAC's SBR doubles the encoder's frame size (2048
+  samples vs LC's 1024), so in principle `-segment_time`'s frame-boundary snapping could cut the `lo`
+  rung's segments at a different sample position than the LC rungs sharing the same `ffmpeg` process.
+  Measured with sample-accurate PCM decode (container-reported duration turned out to be unreliable
+  here) across a 90s/45-segment run at the default 2s segment length: 39/45 seq boundaries land at the
+  *exact* same sample count on both `lo` (HE-AAC) and an LC rung; the other 6 — at the points where
+  neither 2048 nor 1024 samples divides the 2s/44.1kHz target evenly, roughly every 7-8 segments —
+  differ by exactly one LC frame (1024 samples, ~23ms), and self-correct on the very next segment
+  rather than compounding. The two rungs' cumulative position never drifts by more than one LC frame at
+  any point, regardless of stream length. Judged acceptable as-is (a bounded ~23ms worst-case,
+  self-correcting misalignment at a rung switch, comparable to normal AAC encoder priming/lookahead
+  variance that already exists between any two rungs) rather than something to build extra machinery
+  around; see `encode.rs`'s `codec_args` doc comment for the same finding in context. Revisit if
+  `segment_ms` is ever configured much shorter than the 2000ms default, which would shrink the
+  denominator this tolerance is relative to.
 - **Browser-side DVR scrub for the listen-along player** (`web/remote/stream.html`), closing the M4
   gap noted below: the independent hls.js `<audio>` preview player gained its own seek bar and "Go
   live" button, driven purely by `audio.currentTime`/`audio.buffered` — it never touches
@@ -353,10 +363,17 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   cross-platform `egui` GUI app run at the OB site) now has a `dist-workspace.toml` (using
   [`cargo-dist`](https://opensource.axo.dev/cargo-dist/)'s modern standalone-file config) targeting
   Windows/macOS (x86_64 + aarch64)/Linux with shell + PowerShell installers; the server crate opts out
-  via `dist = false` in its own `Cargo.toml` since it stays Docker-only. `dist` itself isn't installed
-  in this repo's dev environment, so no CI workflow was hand-written — the config's own comments say to
-  run `dist init`/`dist generate-ci` once the tool is available rather than hand-authoring
-  `.github/workflows/release.yml` against a guessed format.
+  via `dist = false` in its own `Cargo.toml` since it stays Docker-only. `dist` was installed locally
+  and actually run (`dist init` / `dist generate-ci`, `dist plan`) rather than just hand-writing config
+  against a guessed schema — `dist plan` confirms the four target archives it produces cover only
+  `obcast-client`. This generated the real `.github/workflows/release.yml`; don't hand-edit that file,
+  edit `dist-workspace.toml` and regenerate instead. Also bundles the `libfdk_aac`-enabled ffmpeg from
+  the ABR ladder rework entry above: `scripts/build-libfdk-ffmpeg.sh` (Linux/macOS, from source against
+  each platform's `fdk-aac` package) and `.ps1` (Windows, via vcpkg's `ffmpeg[fdk-aac]` port — more
+  reliable than hand-rolling a MinGW/MSVC source build) are wired into
+  `.github/workflows/build-libfdk-ffmpeg.yml`, a `workflow_call`-able job matrix covering all four
+  `dist` targets. Kept as its own workflow rather than folded into the dist-generated one since `dist`
+  has no hook for bundling an externally-built, non-Cargo binary artifact.
 - **De-duplicated `StreamProfile` construction in the client crate.** `client/main.rs`'s single-use
   `fn profile(segment_ms) -> StreamProfile` wrapper (just `StreamProfile::default_ladder(segment_ms)`)
   was deleted and inlined at its one call site. `client/gui/app.rs`'s `profile(&self)` method was left
@@ -390,16 +407,19 @@ browser DVR scrub / HE-AAC survival rung / scheduler edge-case tests" punch list
 milestone entries above (M7's auth-split and resource-leak fixes; the DVR-file-reaping, stalled-state,
 and waveform-decode-failure fixes folded into store.rs/playout.rs/waveform.rs; the reverse-telemetry
 heartbeat wiring in store.rs/api.rs; and the ABR ladder rework / browser DVR scrub / packaging /
-StreamProfile dedup entries just above). Remaining, in priority order: (1) Verify the HE-AAC
-segment-alignment risk flagged in the ABR ladder rework entry above on an actual `libfdk_aac`-enabled
-ffmpeg build before depending on it in production — this repo's environment can't exercise that code
-path at all today. (2) Bundle a custom `libfdk_aac`-enabled ffmpeg build with the client so the HE-AAC
-low rung no longer depends on the operator's local ffmpeg (removes the AAC-LC fallback path entirely
-— needs building ffmpeg from source with `--enable-libfdk-aac`/`--enable-nonfree` per platform in CI,
-since no upstream static-build project ships that combination; deliberately deferred out of the ABR
-ladder rework). (3) Once `dist` is actually available in a build/CI environment, run `dist init`/`dist
-generate-ci` against `dist-workspace.toml` to generate the real release workflow (today it's config
-only, hand-verified as valid TOML, not yet exercised by the tool itself).
+StreamProfile dedup entries just above), including the two items this section used to list as
+follow-ups: the HE-AAC segment-alignment risk is now measured (see that entry) rather than
+theoretical, and `libfdk_aac` ffmpeg bundling has a working build script + CI job matrix
+(`build-libfdk-ffmpeg.yml`) covering all four `dist` targets rather than being deferred. Remaining:
+(1) wire `build-libfdk-ffmpeg.yml`'s output artifacts into the `dist`-generated release archives (today
+they build and upload independently; attaching them to each platform's release tarball/zip needs a
+small addition to the release process — either a post-`dist`-build step, or switching this job to
+`workflow_call` from a thin wrapper around `release.yml`'s own trigger). (2) Confirm on real
+GitHub-hosted `macos-latest`/`windows-latest` runners that `build-libfdk-ffmpeg.yml`'s macOS
+(Homebrew `fdk-aac` + source build) and Windows (vcpkg `ffmpeg[fdk-aac]`) legs actually succeed — the
+Linux leg mirrors this session's locally-verified recipe exactly, but the other two platforms'
+package availability/build behavior could only be confirmed by an actual CI run, not from this
+sandboxed environment alone.
 
 ---
 

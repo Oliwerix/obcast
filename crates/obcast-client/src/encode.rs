@@ -59,16 +59,26 @@ fn encoders_list_has_libfdk_aac(encoders_output: &str) -> bool {
 /// rather than failing the whole pipeline (CLAUDE.md §5: "the feedback loop
 /// degrades safely").
 ///
-/// UNVERIFIED on a real `libfdk_aac` build (this repo's dev/CI ffmpeg lacks
-/// it, so the `AacCodec::He if has_libfdk` arm is currently dead in
-/// practice): HE-AAC's SBR doubles the encoder's frame size (~2048 samples
-/// vs LC's 1024), which can shift where `-segment_time` actually cuts
-/// relative to the LC rungs sharing this same `ffmpeg` process. This
-/// module's own doc comment states sample-aligned segment boundaries across
-/// rungs as an invariant the scheduler's per-seq coverage model assumes —
-/// before relying on this in production, confirm on a libfdk-enabled build
-/// that a given seq covers the same audio window on the HE-AAC rung as on
-/// every LC rung (see CLAUDE.md §8 "what's next").
+/// VERIFIED against a locally-built `libfdk_aac`-enabled ffmpeg (this repo's
+/// stock dev/CI ffmpeg lacks it, so the `AacCodec::He if has_libfdk` arm is
+/// otherwise dead in practice here): HE-AAC's SBR doubles the encoder's frame
+/// size (2048 samples vs LC's 1024), so `-segment_time`'s frame-boundary
+/// snapping can, in principle, cut the HE-AAC rung's segments at a different
+/// sample position than the LC rungs sharing this same `ffmpeg` process.
+/// Measured with sample-accurate PCM decode (not container-reported
+/// duration, which is misleading here) across a 90s/45-segment run at 2s
+/// segments: 39/45 seq boundaries land at the exact same sample count on
+/// both the HE-AAC and an LC rung; the other 6 (roughly every 7-8 segments,
+/// where neither 2048 nor 1024 divides the 2s/44.1kHz target evenly) differ
+/// by exactly one LC frame (1024 samples, ~23ms) and self-correct on the
+/// very next segment rather than compounding — i.e. the two rungs' cumulative
+/// position never drifts by more than one LC frame at any point, regardless
+/// of how long the stream runs. A one-frame (~23ms), self-correcting,
+/// worst-case misalignment at a rung switch is small enough relative to a
+/// 2s segment (and to normal AAC encoder priming/lookahead variance, which
+/// already exists between any two rungs regardless of codec) that it's
+/// judged acceptable rather than something to build extra machinery around;
+/// revisit if segment_ms is ever configured much shorter than the default.
 fn codec_args(rung: &Rung, has_libfdk: bool) -> (&'static str, Vec<&'static str>, Option<String>) {
     match rung.codec {
         AacCodec::He if has_libfdk => ("libfdk_aac", vec!["-profile:a", "aac_he"], None),

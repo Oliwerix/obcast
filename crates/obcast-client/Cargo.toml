@@ -2,6 +2,7 @@
 name = "obcast-client"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/Oliwerix/obcast"
 
 [dependencies]
 obcast-proto = { path = "../obcast-proto" }
