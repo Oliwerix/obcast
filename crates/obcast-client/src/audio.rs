@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use obcast_proto::meter::{Ppm, Vu};
+use obcast_proto::meter::{Peak, Ppm, Vu};
 use tokio::sync::mpsc as tokio_mpsc;
 
 /// The encoder always receives L/R PCM regardless of the source device's
@@ -116,6 +116,11 @@ pub struct AudioHandle {
     ppm_l_bits: AtomicU32,
     vu_r_bits: AtomicU32,
     ppm_r_bits: AtomicU32,
+    /// True digital sample peak (see `obcast_proto::meter::Peak`) — the
+    /// alternate reading the operator can switch the flying peak marker to
+    /// instead of the IEC PPM ballistic above.
+    peak_l_bits: AtomicU32,
+    peak_r_bits: AtomicU32,
     clip_l: AtomicBool,
     clip_r: AtomicBool,
 
@@ -204,6 +209,7 @@ impl AudioHandle {
     /// IEC 60268-17 VU is the slow loudness reading, the IEC 60268-10 PPM the
     /// fast peak reading; both are computed sample-accurately on the audio
     /// thread, so these are already dB — no conversion needed at the call site.
+    /// See also `peaks_db()` for the alternate true-digital-peak reading.
     pub fn meters(&self) -> ((f32, f32), (f32, f32)) {
         let l = (
             f32::from_bits(self.vu_l_bits.load(Ordering::Relaxed)),
@@ -214,6 +220,15 @@ impl AudioHandle {
             f32::from_bits(self.ppm_r_bits.load(Ordering::Relaxed)),
         );
         (l, r)
+    }
+
+    /// True digital sample peak in dBFS for L/R (`obcast_proto::meter::Peak`) —
+    /// the alternate flying-peak reading alongside the IEC PPM in `meters()`.
+    pub fn peaks_db(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.peak_l_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.peak_r_bits.load(Ordering::Relaxed)),
+        )
     }
 
     pub fn take_clip_l(&self) -> bool {
@@ -251,6 +266,8 @@ pub fn spawn(pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>) -> Arc<AudioHandle> 
         ppm_l_bits: AtomicU32::new((-100.0f32).to_bits()),
         vu_r_bits: AtomicU32::new((-100.0f32).to_bits()),
         ppm_r_bits: AtomicU32::new((-100.0f32).to_bits()),
+        peak_l_bits: AtomicU32::new((-100.0f32).to_bits()),
+        peak_r_bits: AtomicU32::new((-100.0f32).to_bits()),
         clip_l: AtomicBool::new(false),
         clip_r: AtomicBool::new(false),
         channel_peaks: RwLock::new(Vec::new()),
@@ -407,6 +424,8 @@ struct MeterState {
     ppm_l: Ppm,
     vu_r: Vu,
     ppm_r: Ppm,
+    peak_l: Peak,
+    peak_r: Peak,
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
 }
@@ -418,6 +437,8 @@ impl MeterState {
             ppm_l: Ppm::new(),
             vu_r: Vu::new(),
             ppm_r: Ppm::new(),
+            peak_l: Peak::new(),
+            peak_r: Peak::new(),
             scratch_l: Vec::new(),
             scratch_r: Vec::new(),
         }
@@ -492,8 +513,10 @@ fn process_block(
     // sample-accurately (they step internally), then publish dBFS readings.
     meters.vu_l.process(&meters.scratch_l, sample_rate);
     meters.ppm_l.process(&meters.scratch_l, sample_rate);
+    meters.peak_l.process(&meters.scratch_l, sample_rate);
     meters.vu_r.process(&meters.scratch_r, sample_rate);
     meters.ppm_r.process(&meters.scratch_r, sample_rate);
+    meters.peak_r.process(&meters.scratch_r, sample_rate);
 
     handle
         .vu_l_bits
@@ -502,11 +525,17 @@ fn process_block(
         .ppm_l_bits
         .store(meters.ppm_l.value_db().to_bits(), Ordering::Relaxed);
     handle
+        .peak_l_bits
+        .store(meters.peak_l.value_db().to_bits(), Ordering::Relaxed);
+    handle
         .vu_r_bits
         .store(meters.vu_r.value_db().to_bits(), Ordering::Relaxed);
     handle
         .ppm_r_bits
         .store(meters.ppm_r.value_db().to_bits(), Ordering::Relaxed);
+    handle
+        .peak_r_bits
+        .store(meters.peak_r.value_db().to_bits(), Ordering::Relaxed);
 
     if handle.live.load(Ordering::Relaxed) {
         let _ = pcm_tx.send(out);

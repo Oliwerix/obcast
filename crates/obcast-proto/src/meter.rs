@@ -130,6 +130,58 @@ impl Default for Ppm {
     }
 }
 
+/// True digital sample peak, with a "flying" hold/decay so it reads like a
+/// meter needle rather than jumping straight back to the signal on every
+/// sample. Unlike [`Ppm`], which is deliberately *not* instantaneous (its
+/// 5 ms integration time is part of the IEC standard), this catches the
+/// exact dBFS ceiling with zero attack — the alternate reading operators can
+/// switch a meter's flying peak marker to when they want the raw digital
+/// peak instead of the broadcast-standard PPM. Decays on the same -20 dB in
+/// 1.5 s ballistic as `Ppm` so swapping between the two only changes what
+/// the needle catches, not how it falls.
+#[derive(Debug, Clone, Copy)]
+pub struct Peak {
+    env: f32,
+}
+
+impl Peak {
+    const DECAY_TAU_SECS: f32 = 0.650;
+
+    pub fn new() -> Self {
+        Self { env: 0.0 }
+    }
+
+    /// Runs one audio block through the ballistic, sample by sample, and
+    /// returns the resulting envelope (linear).
+    pub fn process(&mut self, samples: &[f32], sample_rate: u32) -> f32 {
+        let dt = 1.0 / sample_rate.max(1) as f32;
+        let alpha_decay = 1.0 - (-dt / Self::DECAY_TAU_SECS).exp();
+        for &s in samples {
+            let target = s.abs();
+            if target >= self.env {
+                self.env = target;
+            } else {
+                self.env += (target - self.env) * alpha_decay;
+            }
+        }
+        self.env
+    }
+
+    pub fn value_linear(&self) -> f32 {
+        self.env
+    }
+
+    pub fn value_db(&self) -> f32 {
+        linear_to_dbfs(self.env)
+    }
+}
+
+impl Default for Peak {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +250,40 @@ mod tests {
         vu.process(&burst, SR);
         ppm.process(&burst, SR);
         assert!(ppm.value_linear() > vu.value_linear());
+    }
+
+    #[test]
+    fn peak_catches_a_single_sample_instantly() {
+        // Zero attack: even a single full-scale sample must be caught, unlike
+        // Ppm's 5 ms integration time which would still be reading well
+        // below full scale after just one sample.
+        let mut peak = Peak::new();
+        peak.process(&[1.0], SR);
+        assert!(peak.value_linear() > 0.999, "env={}", peak.value_linear());
+    }
+
+    #[test]
+    fn peak_decays_about_20db_in_1_5s() {
+        let mut peak = Peak::new();
+        peak.process(&full_scale(SR as usize / 10), SR);
+        assert!(peak.value_db() > -0.5, "db={}", peak.value_db());
+        peak.process(&silence((SR as f32 * 1.5) as usize), SR);
+        assert!(
+            (peak.value_db() - (-20.0)).abs() < 1.0,
+            "db={}",
+            peak.value_db()
+        );
+    }
+
+    #[test]
+    fn peak_catches_higher_than_ppm_on_a_short_burst() {
+        // Peak's zero attack must read the true burst level; Ppm's 5 ms
+        // integration time reads ~2 dB below it by definition.
+        let mut peak = Peak::new();
+        let mut ppm = Ppm::new();
+        let burst = full_scale((SR as f32 * 0.005) as usize);
+        peak.process(&burst, SR);
+        ppm.process(&burst, SR);
+        assert!(peak.value_linear() > ppm.value_linear());
     }
 }
