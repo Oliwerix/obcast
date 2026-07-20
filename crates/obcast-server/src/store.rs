@@ -348,6 +348,7 @@ mod tests {
             device: None,
             volume: 1.0,
             detail: None,
+            test_tone: false,
         }
     }
 
@@ -358,6 +359,7 @@ mod tests {
             device: None,
             volume: 1.0,
             detail: Some(detail.into()),
+            test_tone: false,
         }
     }
 
@@ -405,6 +407,7 @@ mod tests {
             device: None,
             volume: 1.0,
             detail: None,
+            test_tone: false,
         };
         let state = s.build_server_state(playing);
         assert_eq!(state.frontier_seq, Some(10));
@@ -434,6 +437,7 @@ mod tests {
             device: None,
             volume: 1.0,
             detail: None,
+            test_tone: false,
         };
         let state = s.build_server_state(playing.clone());
         assert_eq!(state.frontier_seq, Some(1)); // stops at the gap (seq 2)
