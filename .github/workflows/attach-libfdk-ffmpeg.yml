@@ -50,6 +50,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      # This job never runs actions/checkout (it only moves release
+      # assets around, no repo files needed) — but `gh release`/`gh api`
+      # normally infer the target repo by shelling out to `git remote`,
+      # which fails with no local .git at all. GH_REPO makes gh skip that
+      # git-repo inference and use the given owner/repo directly.
+      GH_REPO: ${{ github.repository }}
       TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     strategy:
       matrix:
