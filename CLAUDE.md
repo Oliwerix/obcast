@@ -674,6 +674,25 @@ controls past the window's right edge instead of just crowding them. Rewritten w
 natural size, and the left side gets only whatever width remains, eliding overflow text with "…"
 instead of growing past it — the controls now always stay on-screen regardless of message length.
 
+**Fixed: seeking on the web remote played the new position, then audibly jumped back to the old
+one.** Reported directly: "seek to a specific point... it starts playing from there but jumps back
+to the point it was before." `Start`/`Seek` (`playout.rs`) only ever tore down and restarted the
+ffmpeg decoder session — the shared cpal output ring buffer (`RING_SEGMENTS = 8`, up to ~16s at the
+default 2s segments) and the `pending` seq-tracking queue that `drain_pending`/`position_seq` walk
+were never cleared. Audio already decoded for the pre-jump position was still sitting in the ring
+and kept draining out after the jump, so playout briefly reached the new position and then fell
+back to that stale backlog — `drain_pending` reading `pending`'s leftover pre-seek entries dragged
+`position_seq` back down with it the whole time it drained, which is exactly the "jumps back"
+symptom (this is also the ring-buffer gap called out as still-open in the M5 entry above — this
+closes it). Fixed with `flush_ring_and_pending`: `pending` is cleared directly (plain mutex,
+reachable from the engine command thread), but the ring's consumer half lives only inside the
+real-time cpal output callback closure, so it can't be touched directly from there — the command
+loop instead bumps a `flush_generation` counter, the callback clears the ring (`consumer.clear()`)
+on its next invocation and acks via `flushed_generation`, and the command loop waits briefly
+(bounded to 200ms, so a stalled/paused device can't hang command processing) before letting the
+freshly spawned decoder session start writing — otherwise a flush racing a few milliseconds late
+could wipe the new session's first samples along with the stale ones.
+
 ---
 
 ## 9. Conventions
