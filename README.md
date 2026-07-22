@@ -16,9 +16,13 @@ played — low quality first to avoid dropout, higher quality as the link allows
 - **`obcast-server`** — ingest, DVR buffer, HLS origin, hardware playout (`cpal`),
   and the control API (REST + WebSocket).
 - **`obcast-client`** — encoder: `ffmpeg` ABR capture/encode, disk ring buffer, and
-  the adaptive uploader that drives the scheduler. CLI only; no GUI yet.
-- **`web/remote`** — a small static control page (start/stop/seek the server's
-  hardware output, watch health/meters, listen along via `hls.js`).
+  the adaptive uploader that drives the scheduler, behind an `egui` GUI (device/
+  channel picker, gain, level + LUFS meters, per-rung buffer/link graphs) by
+  default. `--headless` runs the original CLI-only path for unattended use.
+- **`web/remote`** — static control pages, no build step (`index.html` shows the
+  overview list, `stream.html` is per-show control): start/stop/seek the
+  server's hardware output, watch health/meters, listen along via `hls.js`
+  with DVR scrub, and a quality-colored waveform via `peaks.js`.
 
 See **[`docs/getting-started.md`](docs/getting-started.md)** to run it end to end,
 and **[`docs/protocol.md`](docs/protocol.md)** for the full wire protocol.
@@ -27,12 +31,14 @@ and **[`docs/protocol.md`](docs/protocol.md)** for the full wire protocol.
 
 ```
 cargo run -p obcast-server &
-cargo run -p obcast-client -- --server http://127.0.0.1:8080 --stream myshow
+cargo run -p obcast-client -- --stream myshow --headless
 ```
 
 The client defaults to a synthetic test tone, so this works without a microphone.
-Then open `http://127.0.0.1:8080/remote/?stream=myshow` to control playout and
-listen, or point a player at `http://127.0.0.1:8080/hls/myshow/master.m3u8`.
+Drop `--headless` to launch the GUI instead, which adds a device/channel picker,
+level meters, and live buffer/link graphs. Then open
+`http://127.0.0.1:8080/remote/?stream=myshow` to control playout and listen, or
+point a player at `http://127.0.0.1:8080/hls/myshow/master.m3u8`.
 
 ## Dev
 
