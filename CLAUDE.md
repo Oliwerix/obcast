@@ -532,6 +532,39 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   high-quality pick. All pre-existing tests were updated to pass `preferred_rung: low_rung()`
   (recovering the previous always-low-rung live-edge behavior) and pass unchanged, confirming the
   fix is additive rather than a behavior change for callers that don't set a preference.
+- **Fixed: "Default quality" was still a no-op for the whole pre-roll phase — before the playhead
+  is ever initialized.** The fix above made Tier B (live edge) honor `preferred_rung`, but only
+  once `server.playout.state` is `Playing`/`Paused`/`Stalled` *and* there's already a real gap
+  between the anchor and the live edge (the normal "playing with a healthy buffer" shape the fix's
+  tests all used). Reported directly: start the client with quality set to "mid" and the very first
+  segments still go out at the lowest rung. Root cause: `anchor()` falls back to the live edge
+  itself while `server.playout.state` is `Stopped` (no position has ever been set — true right
+  after starting the encoder, and for the whole time a stream is buffering toward
+  `auto_start_buffer_ms`, see the "encoder-requested auto-start" entry below). With the anchor
+  pinned to the tip, Tier A's "secure `target_ms` of lead ahead of the anchor" walk resolves, every
+  tick, to "the one segment just encoded" — there's no pre-existing buffer ahead of the live edge
+  for a healthy link to ever separate from — so continuity claimed literally every newly-produced
+  segment, always at the low rung (its unconditional, deliberate behavior whenever a real playout
+  head is being defended). Tier B's identical newest-window scan then found nothing left to do.
+  Net effect: for as long as a stream stays stopped — which is the entire pre-roll window
+  auto-start is built around — every segment banked into the DVR was low quality regardless of the
+  operator's pick, and by the time playout actually started (at `dvr_start_seq`, i.e. the *oldest*
+  end of that buffer), Tier C's one-rung-per-tick ratcheting meant re-upgrading minutes of
+  already-low backlog instead of it having been recorded correctly the first time. Fixed by adding
+  a `has_active_head` check (`Playing | Paused | Stalled`) inside Tier A itself: with an active head,
+  behavior is unchanged (always low, unconditionally — the existing
+  `continuity_ignores_preferred_rung_even_with_ample_budget` test still passes untouched); without
+  one, continuity now tries `preferred_rung` first (same affordability/availability check Tier B
+  uses) and only falls back to `low` — still bursting past the tick budget, same as its ordinary
+  no-gap guarantee — when the preferred rung doesn't fit or isn't encoded yet. This keeps the
+  dropout guarantee intact for the one case it still matters while stopped: the web remote's
+  "start" button defaults to `position: live` (`stream.html`), so an operator hitting start with no
+  explicit scrub position can snap straight to the tip at any moment, and a low-rung fallback must
+  still be there when they do. Three new `scheduler.rs` tests cover the stopped/uninitialized case
+  directly: continuity banks the preferred rung with ample bandwidth, falls back to low when it's
+  unaffordable, and falls back to low when it hasn't been encoded locally yet — mirroring the three
+  Tier B tests above but for `PlayoutState::Stopped, position_seq: None` instead of a healthy
+  in-progress buffer.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
@@ -648,6 +681,40 @@ also calls peaks.js's own `view.fitToContainer()`, since per its docs it does no
 resizes on its own). True continuous (non-jumping) scroll is possible but would mean disabling
 peaks.js's autoScroll and driving `view.updateWaveform()` every animation frame ourselves — left
 as a follow-up if the 25%-edge jump still isn't smooth enough in practice.
+
+**Fixed: after a reconnect, the buffer sat flat at a small margin for tens of seconds before growing,
+instead of proactively rebuilding.** Reported directly: after a deliberate network drop and
+reconnect, the server-reported buffer drained to ~15s (didn't run dry, good) but then *held* at
+~15s for ~30s — neither draining further nor growing — before finally starting to climb, even
+though the reconnected link had ample spare bandwidth the whole time. Root cause was in
+`scheduler.rs`'s Tier A (continuity): it only walked the contiguous frontier forward from the
+playout head until securing `water.target_ms` (a small, fixed 12s by default) — not `water.high_ms`
+(20s, the threshold that separately gates when Tier C is allowed to start upgrading quality). Tier B
+(live edge) only ever touches its own newest-`target_ms` tail near the encoder's live edge. Nothing
+filled the region in between — exactly the backlog a network outage creates, since the encoder kept
+producing segments locally the whole time it couldn't upload them — regardless of how much idle
+bandwidth was sitting unused (continuity uploads are explicitly burst/budget-exempt, so budget was
+never the constraint). That backlog only got touched once the anchor's own real-time playback
+advance happened to walk the near-anchor window into it, which is what produced the "flat for ~30s,
+then climbing" symptom — and once it did start catching up, the now-uncapped-by-budget continuity
+burst could catch up fast, which is also what produced a related report (immediately prior in this
+same investigation) of the buffer appearing to "suddenly dump the whole thing into HD" once `high_ms`
+was finally crossed. Fixed by extending Tier A's stopping point from `target_ms` to `high_ms`:
+continuity now spends its budget-exempt priority rebuilding the *entire* resilience margin — not
+just a small dropout-safety sliver — before Tier C ever runs, on the reasoning that a link that just
+dropped can drop again, so depth is worth more than quality until the margin is back. No new config
+surface was needed: `water.high_ms` already meant exactly "how much buffer before quality resumes,"
+it just wasn't being filled that far. An operator wanting a deep standing buffer rebuilt before
+quality resumes (e.g. "get back to 300s before touching HD") just configures a larger `high_ms`.
+`scheduler.rs`'s `far_behind_head_only_fills_near_anchor_and_near_live_edge_not_the_middle` test
+(which had asserted the *old*, buggy "middle region left untouched all the way out to `high_ms`"
+behavior as correct) was replaced with
+`far_behind_head_rebuilds_to_high_ms_and_still_fills_the_live_edge`, plus a new end-to-end
+regression, `after_reconnect_rebuilds_the_full_margin_before_any_upgrade_across_ticks`, simulating
+the real per-tick loop (16 actions/tick, matching `uploader.rs`) across many ticks with a 300s
+`high_ms` and a deep post-outage backlog, asserting zero upgrades fire until the full margin is
+rebuilt and that the rebuild genuinely takes multiple ticks rather than completing in one. `docs/
+protocol.md` §5 updated in the same change.
 
 **What's next.** Everything from the previous "auth split / resource leak / DVR reaping / stalled
 playout state / waveform decode failures / reverse telemetry / packaging / StreamProfile dedup /
