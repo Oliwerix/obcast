@@ -86,6 +86,11 @@ struct ObcastApp {
     pending_rung_toggle: Option<(RungId, bool)>,
     /// Whether the operator log panel (bottom of the window) is open.
     show_log: bool,
+    /// `SharedState::log_seq()` value at the moment the operator last
+    /// dismissed the status bar's infobar summary of the latest log line.
+    /// The infobar stays hidden until a genuinely new line pushes the
+    /// counter past this — see `status_bar`.
+    dismissed_log_seq: u64,
     /// "All Input Channels" bank source data — resampled once/sec rather
     /// than every repaint (see `sample_channel_peaks`). `channel_peaks_display`
     /// eases toward `channel_peaks_target` every frame so the bars still
@@ -107,7 +112,33 @@ struct ObcastApp {
     /// (skipped, not zero-filled, otherwise) — see `link_panel`.
     buffer_quality_history: VecDeque<f32>,
     history_sampled_at: Option<Instant>,
+
+    /// When the app started — an arbitrary but stable zero point for the
+    /// connection-fail flash's continuous blink phase (see `flash_color`).
+    created_at: Instant,
+    /// Whether either selected input was clipping as of the last frame —
+    /// used to detect the rising edge of a fresh clip, since the underlying
+    /// `AudioHandle::clip_l`/`clip_r` flags are a latch that stays set until
+    /// the operator clears it by clicking a level meter (`meter_panel`), not
+    /// a one-shot event. Without edge detection an unreset clip would keep
+    /// restarting the flash sequence every frame.
+    was_clipping: bool,
+    /// `Some(t)` while a clip-flash sequence is running (started at `t`);
+    /// cleared once `CLIP_FLASH_COUNT` on/off cycles have elapsed. See
+    /// `flash_color`.
+    clip_flash_started_at: Option<Instant>,
 }
+
+/// How many full on/off blinks a fresh input clip flashes the window
+/// border.
+const CLIP_FLASH_COUNT: u32 = 4;
+/// Duration of each on or off half-cycle of a border flash (clip or
+/// connection-fail).
+const FLASH_HALF_PERIOD: Duration = Duration::from_millis(200);
+/// `link_panel`'s "Buffer" estimate, below which a connection failure
+/// flashes red instead of yellow — the point past which dropout is close
+/// enough to demand more urgency than a plain heads-up.
+const FLASH_BUFFER_THRESHOLD_MS: u32 = 45_000;
 
 /// How far back the Link panel's rolling graphs look.
 const HISTORY_WINDOW: Duration = Duration::from_secs(60);
@@ -148,6 +179,7 @@ impl ObcastApp {
             live: false,
             pending_rung_toggle: None,
             show_log: false,
+            dismissed_log_seq: 0,
             channel_peaks_target: Vec::new(),
             channel_peaks_display: Vec::new(),
             channel_peaks_sampled_at: None,
@@ -156,6 +188,9 @@ impl ObcastApp {
             quality_history: VecDeque::new(),
             buffer_quality_history: VecDeque::new(),
             history_sampled_at: None,
+            created_at: Instant::now(),
+            was_clipping: false,
+            clip_flash_started_at: None,
         }
     }
 
@@ -275,14 +310,20 @@ impl ObcastApp {
             )
         });
 
-        let log_entry = self.shared.latest_log().map(|entry| {
-            (
-                log_level_color(entry.level),
-                format!("{} {}", log_level_tag(entry.level), entry.message),
-            )
-        });
+        let log_seq = self.shared.log_seq();
+        // Hidden once dismissed (see `dismissed_log_seq`'s doc) until a
+        // genuinely new line is pushed and bumps the counter past it.
+        let log_entry = (log_seq > self.dismissed_log_seq)
+            .then(|| self.shared.latest_log())
+            .flatten()
+            .map(|entry| {
+                (
+                    log_level_color(entry.level),
+                    format!("{} {}", log_level_tag(entry.level), entry.message),
+                )
+            });
 
-        egui::Sides::new().shrink_left().truncate().show(
+        let (dismiss_clicked, _) = egui::Sides::new().shrink_left().truncate().show(
             ui,
             |ui| {
                 ui.heading("OBCast Encoder");
@@ -294,10 +335,20 @@ impl ObcastApp {
                     ui.separator();
                     ui.label(uploaded_label);
                 }
+                let mut dismiss = false;
                 if let Some((color, text)) = log_entry {
                     ui.separator();
-                    ui.colored_label(color, text);
+                    let resp = ui
+                        .add(
+                            egui::Label::new(egui::RichText::new(text).color(color))
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Click to dismiss");
+                    if resp.clicked() {
+                        dismiss = true;
+                    }
                 }
+                dismiss
             },
             |ui| {
                 let log_text = if self.show_log { "Log ▼" } else { "Log ▲" };
@@ -329,6 +380,9 @@ impl ObcastApp {
                 }
             },
         );
+        if dismiss_clicked {
+            self.dismissed_log_seq = log_seq;
+        }
     }
 
     fn device_panel(&mut self, ui: &mut egui::Ui) {
@@ -423,114 +477,8 @@ impl ObcastApp {
             ui.label("no device open");
         }
 
-        ui.separator();
-        ui.heading("Channel Map");
-        ui.label("Pick which of this device's channels feed L/R — handy for a multichannel snake where the mic isn't on channel 1/2.");
-        let channels = self.audio.device_channels();
-
-        let mut mono = self.audio.mono();
-        if ui
-            .checkbox(&mut mono, "Mono (duplicate one source channel to L+R)")
-            .changed()
-        {
-            self.audio.set_mono(mono);
-            self.cfg.mono = mono;
-            self.persist_config();
-        }
-
-        let mut left = self.audio.left_channel();
-        let mut right = self.audio.right_channel();
-        ui.horizontal(|ui| {
-            ui.label(if mono {
-                "Source channel:"
-            } else {
-                "Left channel:"
-            });
-            egui::ComboBox::from_id_salt("left_ch")
-                .selected_text(channel_label(left, channels))
-                .show_ui(ui, |ui| {
-                    for ch in 0..channels.max(1) {
-                        ui.selectable_value(&mut left, ch, channel_label(ch, channels));
-                    }
-                });
-        });
-        if !mono {
-            ui.horizontal(|ui| {
-                ui.label("Right channel: ");
-                egui::ComboBox::from_id_salt("right_ch")
-                    .selected_text(channel_label(right, channels))
-                    .show_ui(ui, |ui| {
-                        for ch in 0..channels.max(1) {
-                            ui.selectable_value(&mut right, ch, channel_label(ch, channels));
-                        }
-                    });
-            });
-        }
-        if left != self.audio.left_channel() {
-            self.audio.set_left_channel(left);
-            self.cfg.left_channel = left;
-            self.persist_config();
-        }
-        if right != self.audio.right_channel() {
-            self.audio.set_right_channel(right);
-            self.cfg.right_channel = right;
-            self.persist_config();
-        }
-
-        ui.separator();
-        ui.heading("Gain");
-        let mut gain = self.audio.gain_db();
-        let resp = ui.add(
-            egui::Slider::new(&mut gain, -24.0..=24.0)
-                .suffix(" dB")
-                .text("input gain"),
-        );
-        if resp.changed() {
-            self.audio.set_gain_db(gain);
-            self.cfg.gain_db = gain;
-        }
-        if resp.drag_stopped() {
-            self.persist_config();
-        }
-        if ui.button("Reset gain to 0 dB").clicked() {
-            self.audio.set_gain_db(0.0);
-            self.cfg.gain_db = 0.0;
-            self.persist_config();
-        }
-
-        ui.separator();
-        ui.heading("All Input Channels");
-        ui.label(
-            "Every channel this device offers — find which one has signal, then assign it above.",
-        );
-        self.sample_channel_peaks();
-        egui::ScrollArea::vertical()
-            .max_height(240.0)
-            .show(ui, |ui| {
-                let peaks = self.channel_peaks_display.clone();
-                for (i, peak) in peaks.iter().enumerate() {
-                    let ch = i as u16;
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{:>3}", ch + 1));
-                        mini_meter(ui, *peak, egui::vec2(150.0, 12.0));
-                        ui.label(format!("{:>5.1} dB", meter::linear_to_dbfs(*peak)));
-                        if ui.small_button("→ L").clicked() {
-                            self.audio.set_left_channel(ch);
-                            self.cfg.left_channel = ch;
-                            self.persist_config();
-                        }
-                        if !self.audio.mono() && ui.small_button("→ R").clicked() {
-                            self.audio.set_right_channel(ch);
-                            self.cfg.right_channel = ch;
-                            self.persist_config();
-                        }
-                    });
-                }
-                if peaks.is_empty() {
-                    ui.label("(open a device to see its channels)");
-                }
-            });
-
+        // Stream Target now sits where "Channel Map" used to (see
+        // `channel_map_panel` below for why that section was folded away).
         ui.separator();
         ui.heading("Stream Target");
         ui.add_enabled_ui(!self.live, |ui| {
@@ -584,6 +532,30 @@ impl ObcastApp {
             ui.small("(target settings lock while live; stop to change them)");
         }
 
+        ui.separator();
+        ui.heading("Gain");
+        let mut gain = self.audio.gain_db();
+        let resp = ui.add(
+            egui::Slider::new(&mut gain, -24.0..=24.0)
+                .suffix(" dB")
+                .text("input gain"),
+        );
+        if resp.changed() {
+            self.audio.set_gain_db(gain);
+            self.cfg.gain_db = gain;
+        }
+        if resp.drag_stopped() {
+            self.persist_config();
+        }
+        if ui.button("Reset gain to 0 dB").clicked() {
+            self.audio.set_gain_db(0.0);
+            self.cfg.gain_db = 0.0;
+            self.persist_config();
+        }
+
+        ui.separator();
+        self.channel_map_panel(ui);
+
         // Unlike the rest of "Stream Target" above, rung selection stays
         // interactive while live — toggling one restarts the pipeline (see
         // `apply_rung_toggle`), but that's confirmed via a modal rather than
@@ -591,6 +563,78 @@ impl ObcastApp {
         ui.separator();
         ui.heading("Rungs");
         self.rungs_panel(ui);
+    }
+
+    /// Mono toggle + every channel this device offers, each with L/R
+    /// assignment buttons that also show the current assignment (a
+    /// `selectable_label`, highlighted when that channel is the one already
+    /// feeding L or R). Replaces the old separate "Channel Map" section,
+    /// whose L/R dropdowns were pure duplication of what these per-channel
+    /// buttons already do — mono (the one bit of that section's behavior
+    /// these buttons can't express on their own) moved here instead.
+    /// Collapsible (collapsed by default) so a routine session can shrink it
+    /// down to just the assigned channel numbers, shown right in the header,
+    /// once L/R are dialed in.
+    fn channel_map_panel(&mut self, ui: &mut egui::Ui) {
+        let mono = self.audio.mono();
+        let left = self.audio.left_channel();
+        let right = self.audio.right_channel();
+        let header = if mono {
+            format!("All Input Channels — source: {}", left + 1)
+        } else {
+            format!("All Input Channels — L: {}  R: {}", left + 1, right + 1)
+        };
+
+        egui::CollapsingHeader::new(header)
+            .id_salt("all_input_channels")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    "Every channel this device offers — find which one has signal, then \
+                     click L/R to assign it.",
+                );
+
+                let mut mono = self.audio.mono();
+                if ui
+                    .checkbox(&mut mono, "Mono (duplicate one source channel to L+R)")
+                    .changed()
+                {
+                    self.audio.set_mono(mono);
+                    self.cfg.mono = mono;
+                    self.persist_config();
+                }
+
+                self.sample_channel_peaks();
+                let left = self.audio.left_channel();
+                let right = self.audio.right_channel();
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        let peaks = self.channel_peaks_display.clone();
+                        for (i, peak) in peaks.iter().enumerate() {
+                            let ch = i as u16;
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{:>3}", ch + 1));
+                                mini_meter(ui, *peak, egui::vec2(150.0, 12.0));
+                                ui.label(format!("{:>5.1} dB", meter::linear_to_dbfs(*peak)));
+                                let left_label = if mono { "Source" } else { "L" };
+                                if ui.selectable_label(left == ch, left_label).clicked() {
+                                    self.audio.set_left_channel(ch);
+                                    self.cfg.left_channel = ch;
+                                    self.persist_config();
+                                }
+                                if !mono && ui.selectable_label(right == ch, "R").clicked() {
+                                    self.audio.set_right_channel(ch);
+                                    self.cfg.right_channel = ch;
+                                    self.persist_config();
+                                }
+                            });
+                        }
+                        if peaks.is_empty() {
+                            ui.label("(open a device to see its channels)");
+                        }
+                    });
+            });
     }
 
     /// Per-rung enable/disable checkboxes plus the "Default quality"
@@ -1088,6 +1132,85 @@ impl ObcastApp {
                 }
             });
     }
+
+    /// Extrapolated buffer depth (ms) and whether the link is currently down
+    /// (`age >= STALE_AFTER`) — the same numbers `link_panel`'s "Buffer"
+    /// readout is built from, factored out here so the connection-fail
+    /// flash agrees with it rather than a second, potentially-drifting copy
+    /// of the same formula.
+    fn buffer_estimate(&self) -> Option<(u32, bool)> {
+        let (state, age) = self.shared.server_snapshot()?;
+        let stopped = state.playout.state == PlayoutState::Stopped;
+        let raw_buffer_ms = if stopped {
+            state.buffered_ms
+        } else {
+            state.lead_ms
+        };
+        let age_ms = age.as_millis().min(u32::MAX as u128) as u32;
+        let buffer_ms = raw_buffer_ms.saturating_sub(age_ms);
+        Some((buffer_ms, age >= crate::shared::STALE_AFTER))
+    }
+
+    /// The window-border flash color for this frame, if any. A fresh clip on
+    /// the selected inputs (edge-detected — see `was_clipping`) takes
+    /// priority and flashes `CLIP_FLASH_COUNT` times, since it's a discrete
+    /// event that would otherwise get masked by an ongoing link outage.
+    /// Once that's done (or never started), a currently-down link flashes
+    /// continuously for as long as the outage lasts — yellow while `Buffer`
+    /// still has `FLASH_BUFFER_THRESHOLD_MS` of headroom, red once it's
+    /// below that and dropout is close.
+    fn flash_color(&mut self, now: Instant) -> Option<egui::Color32> {
+        let clipping = self.audio.take_clip_l() || self.audio.take_clip_r();
+        if clipping && !self.was_clipping {
+            self.clip_flash_started_at = Some(now);
+        }
+        self.was_clipping = clipping;
+
+        if let Some(started) = self.clip_flash_started_at {
+            let elapsed = now.duration_since(started).as_secs_f32();
+            let half_period = FLASH_HALF_PERIOD.as_secs_f32();
+            let half_periods_elapsed = (elapsed / half_period) as u32;
+            if half_periods_elapsed < CLIP_FLASH_COUNT * 2 {
+                let on = half_periods_elapsed.is_multiple_of(2);
+                return on.then_some(egui::Color32::from_rgb(0xff, 0x40, 0x40));
+            }
+            self.clip_flash_started_at = None;
+        }
+
+        let (buffer_ms, link_down) = self.buffer_estimate()?;
+        if !link_down {
+            return None;
+        }
+        let color = if buffer_ms >= FLASH_BUFFER_THRESHOLD_MS {
+            egui::Color32::from_rgb(0xe8, 0xc5, 0x2a)
+        } else {
+            egui::Color32::from_rgb(0xe2, 0x3d, 0x3d)
+        };
+        let elapsed = now.duration_since(self.created_at).as_secs_f32();
+        let half_periods_elapsed = (elapsed / FLASH_HALF_PERIOD.as_secs_f32()) as u64;
+        half_periods_elapsed.is_multiple_of(2).then_some(color)
+    }
+
+    /// Paints the blinking border (see `flash_color`) over everything else,
+    /// on the foreground layer, so it's visible regardless of which panel
+    /// has focus.
+    fn draw_flash_overlay(&mut self, ui: &mut egui::Ui) {
+        let now = Instant::now();
+        let Some(color) = self.flash_color(now) else {
+            return;
+        };
+        let rect = ui.max_rect();
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("flash_overlay"),
+        ));
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(10.0, color),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 impl eframe::App for ObcastApp {
@@ -1135,6 +1258,8 @@ impl eframe::App for ObcastApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.meter_panel(ui);
         });
+
+        self.draw_flash_overlay(ui);
     }
 }
 
@@ -1184,14 +1309,6 @@ fn log_level_tag(level: LogLevel) -> &'static str {
         LogLevel::Error => "ERROR",
         LogLevel::Warn => "WARN ",
         LogLevel::Info => "INFO ",
-    }
-}
-
-fn channel_label(ch: u16, total: u16) -> String {
-    match (ch, total) {
-        (0, 2) => "1 (L)".to_string(),
-        (1, 2) => "2 (R)".to_string(),
-        _ => format!("{}", ch + 1),
     }
 }
 
