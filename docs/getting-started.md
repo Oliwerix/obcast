@@ -28,6 +28,7 @@ Config is via environment variables, all optional:
 | `OBCAST_CONTROL_TOKEN`   | unset          | if set, `POST /api/{stream}/playout` requires `X-Auth` (separate credential from ingest's) |
 | `OBCAST_WEB_REMOTE_DIR`  | `web/remote`   | static files served at `/remote`            |
 | `OBCAST_DVR_WINDOW_MS`   | `300000` (5 min) | how much history the DVR keeps before evicting; `0` disables eviction (unbounded — retains every segment for the life of the stream, unbounded disk use) |
+| `OBCAST_PLAYOUT_RING_SEGMENTS` | `4`      | how many segments deep the playout engine decodes ahead of real-time output; higher = more resilience to a transient decode/disk slowdown at the cost of more ingest-to-audible latency |
 
 Each `{stream}` name is created lazily on first ingest — there's no separate
 "create a stream" step. Read-only routes (`status`/`waveform`/`ws`/HLS
