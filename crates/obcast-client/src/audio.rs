@@ -475,6 +475,10 @@ struct MeterState {
     loudness: Loudness,
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
+    /// Set once the callback has tried to raise its own OS thread priority
+    /// (see `elevate_audio_thread_priority`) — checked on the first call
+    /// only, since it's a syscall we don't want to repeat every block.
+    priority_elevated: bool,
 }
 
 impl MeterState {
@@ -489,7 +493,29 @@ impl MeterState {
             loudness: Loudness::new(OUT_CHANNELS, sample_rate),
             scratch_l: Vec::new(),
             scratch_r: Vec::new(),
+            priority_elevated: false,
         }
+    }
+}
+
+/// Raises the *calling* OS thread to the platform's highest scheduling
+/// priority. Must be called from the real cpal callback thread itself (not
+/// the engine thread that builds the stream) — `cpal` creates that thread
+/// internally, so there's no `JoinHandle` to set this on ahead of time; the
+/// callback's first invocation is the earliest point we're actually running
+/// on it. Best-effort: an unprivileged process can't raise its priority on
+/// Linux without `CAP_SYS_NICE` (the same permission wrinkle pro-audio apps
+/// like JACK solve with an `/etc/security/limits.d` audio-group entry, not
+/// something this binary can grant itself), so failure is logged once and
+/// capture keeps running at normal priority rather than treating it as
+/// fatal.
+fn elevate_audio_thread_priority() {
+    use thread_priority::{set_current_thread_priority, ThreadPriority};
+    if let Err(err) = set_current_thread_priority(ThreadPriority::Max) {
+        tracing::warn!(
+            ?err,
+            "failed to raise capture thread priority, continuing at normal priority"
+        );
     }
 }
 
@@ -504,6 +530,11 @@ fn process_block(
     pcm_tx: &tokio_mpsc::UnboundedSender<Vec<f32>>,
     meters: &mut MeterState,
 ) {
+    if !meters.priority_elevated {
+        meters.priority_elevated = true;
+        elevate_audio_thread_priority();
+    }
+
     if channels == 0 {
         return;
     }
