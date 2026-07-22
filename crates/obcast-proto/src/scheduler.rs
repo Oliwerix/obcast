@@ -229,11 +229,23 @@ pub fn plan_uploads(input: &SchedulerInput) -> Vec<UploadAction> {
     // seqs an upgrade can actually still affect. Falls back to `anchor` when
     // unknown (stopped, just started/sought, or an older server not yet
     // sending the field), matching the previous ahead-of-head-only behavior.
+    //
+    // The window's far boundary must track `already_fed`, not `anchor`: an
+    // earlier version capped it at `anchor + cap_segs`, which goes empty
+    // (`already_fed + 1 > anchor + cap_segs`) whenever the engine's real
+    // feed-ahead depth exceeds the `high_ms`-sized window — which it does in
+    // practice, since feed-ahead is sized by the playout ring (an
+    // independent constant), not by `high_ms`. That produced zero upgrade
+    // actions forever once steady-state feed-ahead outran the window, even
+    // with tens of seconds of un-upgraded buffer sitting past it (observed
+    // live: fed_seq 13 segments ahead of anchor vs. a 10-segment window).
+    // Anchoring the window to start right after `already_fed` instead means
+    // it always covers real, still-upgradeable segments.
     let comfortable = lead_ms >= server.water.high_ms;
     if comfortable && !survival {
         let already_fed = server.playout.fed_seq.unwrap_or(anchor).max(anchor);
         let cap_segs = (server.water.high_ms / seg_ms).max(1) as u64;
-        let end = (anchor + cap_segs).min(inv.encoded_seq);
+        let end = (already_fed + cap_segs).min(inv.encoded_seq);
         // strictly ahead of both the head and whatever's already fed
         for s in (already_fed + 1)..=end {
             if out.len() >= max_actions {
@@ -473,13 +485,16 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_yield_nothing_when_the_whole_comfortable_window_is_already_fed() {
-        // Same as above, but the engine has fed all the way out to 38 — past
-        // the entire window Tier C would otherwise consider this tick
-        // (anchor=30, high_ms=10000/seg_ms=2000 => cap_segs=5 => window
-        // 31..=35). Nothing in that window can still be upgraded in time, so
-        // Tier C must produce zero upgrade actions rather than wastefully
-        // uploading HD for segments that will never be heard at that rung.
+    fn upgrades_still_happen_when_feed_ahead_outruns_the_anchor_relative_window() {
+        // Same as above, but the engine has fed all the way out to 38 —
+        // past `anchor + cap_segs` (30 + 5 = 35), which used to be the
+        // window's fixed far boundary. That was a real, reproduced-live bug:
+        // once the engine's feed-ahead depth exceeds a `high_ms`-sized
+        // window measured from `anchor`, the window (`already_fed+1..=end`)
+        // goes empty and Tier C produces zero upgrades forever, even with
+        // plenty of un-upgraded buffer (39..=50 here) still sitting past the
+        // feed boundary. The window's far boundary must instead track
+        // `already_fed` (38 + 5 = 43), so upgrades resume starting at 39.
         let water = WaterLevels {
             low_ms: 4000,
             target_ms: 8000,
@@ -497,7 +512,23 @@ mod tests {
             max_actions: 20,
         };
         let plan = plan_uploads(&input);
-        assert!(plan.iter().all(|a| a.reason != UploadReason::Upgrade));
+        let upgrades: Vec<_> = plan
+            .iter()
+            .filter(|a| a.reason == UploadReason::Upgrade)
+            .collect();
+        assert!(
+            !upgrades.is_empty(),
+            "expected upgrades past the feed boundary (38), got none"
+        );
+        assert!(
+            upgrades.iter().all(|a| a.seq > 38),
+            "an upgrade landed at or behind the already-fed boundary (38): {upgrades:?}"
+        );
+        assert_eq!(upgrades.iter().map(|a| a.seq).min(), Some(39));
+        assert!(
+            upgrades.iter().all(|a| a.seq <= 43),
+            "upgrade window should stay capped at already_fed + cap_segs (43): {upgrades:?}"
+        );
     }
 
     #[test]

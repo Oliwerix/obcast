@@ -441,6 +441,24 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   `upgrades_yield_nothing_when_the_whole_comfortable_window_is_already_fed`) exercising both the partial-
   overlap and fully-overlapping-window cases. `docs/protocol.md` updated in the same change (wire-compat
   rule, §9).
+- **Fixed a live regression from the fix above: upgrades stopped firing at all once a real 60s buffer
+  built up, despite ample bandwidth.** Reported directly against a running server/client pair (`test02`
+  stream): `/api/{stream}/status` showed `lead_ms: 60000` (comfortably over `water.high_ms: 20000`, so
+  Tier C should have been active) yet every seq in `coverage` sat at `best_rung: 0` — never upgraded.
+  Root cause: the previous fix gated Tier C's candidate range on `already_fed = max(anchor, fed_seq)` but
+  left the range's *far* boundary at `anchor + cap_segs` (`cap_segs = high_ms / seg_ms`) — a boundary
+  measured from `anchor`, not from `already_fed`. Observed live, `fed_seq` (248) ran 13 segments ahead of
+  `anchor` (235) — deeper than the assumption baked into the old "Two more fixes" entry's `RING_SEGMENTS =
+  8` estimate — while `cap_segs` was only 10, so the range became `(already_fed+1)..=end` =
+  `249..=245`: empty, permanently, since both boundaries advance together in steady state. Tier C produced
+  zero upgrade actions every tick no matter how much buffer or bandwidth was available, because the window
+  it was allowed to consider had already collapsed to nothing. Fixed by anchoring the far boundary to
+  `already_fed` too (`end = already_fed + cap_segs`), so the window always starts right after whatever's
+  already locked in rather than potentially behind it. `scheduler.rs`'s
+  `upgrades_yield_nothing_when_the_whole_comfortable_window_is_already_fed` test encoded the *buggy*
+  behavior as correct ("nothing in that window can still be upgraded in time") — replaced with
+  `upgrades_still_happen_when_feed_ahead_outruns_the_anchor_relative_window`, asserting upgrades resume
+  starting right after the feed boundary instead of asserting silence.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
