@@ -100,6 +100,7 @@
   </div>
   <div class="row">
     <span id="playout-pill" class="pill stopped">stopped</span>
+    <span id="onair-quality" class="la-quality" title="ABR rung actually reaching the hardware output right now (ground truth, not a live DVR-index lookup — see LinkHealth::current_rung)"><i></i><span id="onair-quality-label">—</span></span>
     <span id="playout-reason" class="note" style="margin:0;"></span>
   </div>
   <div class="row" style="margin-top:10px;">
@@ -396,6 +397,7 @@ function applyStatus(status) {
   document.getElementById('playout-reason').textContent = computeReason(status);
   updateTransportButtons(status);
   updatePlayoutTime(status);
+  updateOnAirQuality(status);
 
   document.getElementById('pos-seq').textContent = s.playout.position_seq ?? '—';
   document.getElementById('live-seq').textContent = s.live_seq ?? '—';
@@ -405,10 +407,31 @@ function applyStatus(status) {
   linkPill.textContent = status.link.connected ? 'up' : 'down';
   linkPill.className = 'pill ' + (status.link.connected ? 'up' : 'down');
   document.getElementById('seg-age').textContent = status.link.last_segment_age_ms + ' ms';
-  document.getElementById('cur-rung').textContent = status.link.current_rung ?? '—';
+  document.getElementById('cur-rung').textContent = rungLabel(status.link.current_rung);
   document.getElementById('gaps').textContent = status.link.gaps;
 
   updateTestToneUi(!!s.playout.test_tone);
+}
+
+// Human-readable rung name, falling back to the raw id if it's outside the
+// known default ladder (e.g. a custom ABR profile) rather than showing nothing.
+function rungLabel(rung) {
+  if (rung === null || rung === undefined) return '—';
+  return RUNG_NAMES[rung] ?? `rung ${rung}`;
+}
+
+// "Quality on air" — the ABR rung actually reaching the hardware output right
+// now (LinkHealth::current_rung), shown as a colored dot + label next to the
+// playout pill so it's glanceable rather than buried in the health table.
+// `null` covers stopped/just-started/sought/skipped-without-audio (see the
+// field's doc comment in control.rs), same as the listen-along quality chip's
+// gap treatment.
+function updateOnAirQuality(status) {
+  const rung = status.link.current_rung;
+  const dot = document.querySelector('#onair-quality i');
+  const label = document.getElementById('onair-quality-label');
+  dot.style.background = colorForRung(rung, false);
+  label.textContent = rungLabel(rung);
 }
 
 // The pill's own 'error'/'stalled' classes already exist for server-reported
@@ -659,6 +682,10 @@ let waveformPointMs = null; // ms per waveform point, known once the first paylo
 // status scale (critical/serious/warning/good) — a deliberate fit since rung
 // quality really is a state (dropout risk), not an arbitrary series identity.
 const RUNG_COLORS = { 0: '#d03b3b', 1: '#ec835a', 2: '#fab219', 3: '#0ca30c' };
+// Matches StreamProfile::default_ladder's rung ids/names (obcast-proto/src/state.rs).
+// This page already hardcodes the 4-rung default ladder elsewhere (RUNG_COLORS
+// above, the waveform legend), so this follows the same assumption.
+const RUNG_NAMES = ['lo', 'mid', 'hi', 'hd'];
 const GAP_COLOR = '#3a3f47';
 // A flat line here is an artifact of a decode failure, not necessarily real
 // silence — kept visually distinct from both a genuine gap and rung colors
@@ -1016,10 +1043,9 @@ function setLaState(state, label) {
   laStatePill.className = 'pill ' + state;
 }
 
-// Map an hls.js level index to lo/mid/hi/hd naming + the waveform's
-// RUNG_COLORS, ranking levels by bitrate so the label stays meaningful for
-// any rung count.
-const LA_RUNG_NAMES = ['lo', 'mid', 'hi', 'hd'];
+// Map an hls.js level index to lo/mid/hi/hd naming (shared RUNG_NAMES) + the
+// waveform's RUNG_COLORS, ranking levels by bitrate so the label stays
+// meaningful for any rung count.
 function setLaQuality(idx) {
   if (idx == null || idx < 0 || !laLevels.length || !laLevels[idx]) {
     laQualityDot.style.background = GAP_COLOR;
@@ -1032,10 +1058,10 @@ function setLaQuality(idx) {
   const rank = ranked.findIndex(x => x.i === idx);
   const rung = ranked.length <= 1
     ? 0
-    : Math.round((rank / (ranked.length - 1)) * (LA_RUNG_NAMES.length - 1));
+    : Math.round((rank / (ranked.length - 1)) * (RUNG_NAMES.length - 1));
   const kbps = Math.round((laLevels[idx].bitrate || 0) / 1000);
   laQualityDot.style.background = RUNG_COLORS[rung] ?? '#8a8f98';
-  laQualityLabel.textContent = kbps ? `${LA_RUNG_NAMES[rung]} · ${kbps}k` : LA_RUNG_NAMES[rung];
+  laQualityLabel.textContent = kbps ? `${RUNG_NAMES[rung]} · ${kbps}k` : RUNG_NAMES[rung];
 }
 
 function updateMuteBtn() {
