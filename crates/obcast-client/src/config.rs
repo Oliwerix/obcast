@@ -76,6 +76,20 @@ pub struct AppConfig {
     /// `StreamProfile::nearest_enabled_or_low` if this rung has since been
     /// disabled.
     pub default_rung: RungId,
+
+    /// Whether an input clip on the selected channels logs a warning and
+    /// flashes the window border (see `gui::app::ObcastApp::check_clip_alarm`).
+    /// The meter's own "CLIP" indication is unaffected by this — it always
+    /// shows regardless.
+    pub clip_warning_enabled: bool,
+    /// Whether a sustained low input level logs a warning and flashes the
+    /// window border (see `check_low_level_alarm`). Off by default since,
+    /// unlike clipping, a quiet input is often intentional (a pause between
+    /// segments, a muted source) rather than a fault.
+    pub low_level_warning_enabled: bool,
+    /// VU level (dBFS-relative, same scale as the Levels panel's readout)
+    /// below which, sustained for 5s, the low-level warning fires.
+    pub low_level_threshold_db: f32,
 }
 
 impl Default for AppConfig {
@@ -97,6 +111,9 @@ impl Default for AppConfig {
             auto_start_buffer_secs: 300,
             enabled_rungs: all_rung_ids(),
             default_rung: 0,
+            clip_warning_enabled: true,
+            low_level_warning_enabled: false,
+            low_level_threshold_db: -40.0,
         }
     }
 }
