@@ -719,7 +719,9 @@ function makeServerPlayer() {
   }
 
   function tick() {
-    if (playing) emitter?.emit('player.timeupdate', currentTimeSecs());
+    const t = currentTimeSecs();
+    if (playing) emitter?.emit('player.timeupdate', t);
+    syncZoomviewScroll(t);
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
@@ -781,23 +783,30 @@ function makeServerPlayer() {
 }
 const serverPlayer = makeServerPlayer();
 
-// peaks.js's own autoScroll (zoomview `autoScrollOffset`, default 100px)
-// re-anchors the playhead a fixed number of *pixels* in from the left edge
-// the instant it comes within that many pixels of the right edge. On a wide
-// container (this one is full page width) 100px is a small fraction of the
-// view, so the visible behaviour is "the playhead crawls most of the way
-// across, waits at the right edge, then snaps back to near the start" —
-// most of a full-width jump, not the smooth or centered scroll it looks
-// like it should be. Scaling the offset to a fraction of the *view's own
-// width* instead keeps the relative jump distance constant regardless of
-// container size: trigger 25% of the width from the right border, land 25%
-// from the left, every time.
-const AUTO_SCROLL_EDGE_FRACTION = 0.25;
-function applyAutoScrollOffset() {
+// peaks.js's own autoScroll (zoomview `autoScrollOffset`) only recomputes the
+// visible frame once the playhead crosses a threshold near the right edge,
+// then re-anchors it near the left edge in one step — a discrete jump no
+// matter how the offset is sized (even scaled to a fraction of the view's
+// width, it's still a sudden reposition, just a smaller one). Driven
+// manually here instead, every animation frame (from `tick()` above, via
+// `syncZoomviewScroll`): once the playhead reaches `SCROLL_PIN_FRACTION` of
+// the view's width, the frame offset is recomputed on *every* frame to hold
+// it exactly there, so the waveform scrolls continuously underneath the
+// playhead rather than jumping when a threshold is crossed. Before the
+// playhead first reaches that point (e.g. right after a seek well behind
+// live), the requested offset comes out negative, `updateWaveform` clamps it
+// to 0, and the view simply doesn't scroll yet — the playhead just moves
+// across the still frame, same as it always did. `updateWaveform` also
+// clamps to the data's actual pixel range at the other end, so this
+// naturally stops scrolling once the live edge is reached rather than
+// needing special-casing here.
+const SCROLL_PIN_FRACTION = 0.25;
+function syncZoomviewScroll(timeSecs) {
   if (!peaksInstance) return;
   const view = peaksInstance.views.getView('zoomview');
   if (!view) return;
-  view.enableAutoScroll(true, { offset: Math.round(view.getWidth() * AUTO_SCROLL_EDGE_FRACTION) });
+  const pinPixels = view.getWidth() * SCROLL_PIN_FRACTION;
+  view.updateWaveform(Math.round(view.timeToPixels(timeSecs) - pinPixels), false);
 }
 
 function initWaveform(json) {
@@ -806,7 +815,7 @@ function initWaveform(json) {
       container: document.getElementById('zoomview-container'),
       waveformColor: GAP_COLOR,
       playheadColor: '#e6e6e6',
-      autoScroll: true,
+      autoScroll: false,
     },
     player: serverPlayer,
     waveformData: { json },
@@ -816,7 +825,6 @@ function initWaveform(json) {
     serverPlayer.setWaveformBase(json.seqs[0]);
     serverPlayer.setDuration((json.length * pointMs(json)) / 1000);
     applySegmentColors(json);
-    applyAutoScrollOffset();
   });
 }
 
@@ -958,10 +966,11 @@ applyWaveform();
 setInterval(applyWaveform, 5000);
 
 // The zoomview container is full page width (`width: 100%`), so a window
-// resize changes the view's pixel width and both peaks.js's own layout
-// (`fitToContainer`, per its docs — it does not track container resizes on
-// its own) and the width-relative autoScroll offset above need recomputing
-// against the new size, not just once at load.
+// resize changes the view's pixel width and peaks.js's own layout needs
+// recomputing against it (`fitToContainer` — per its docs, it does not track
+// container resizes on its own); `syncZoomviewScroll`'s pin point is a
+// fraction of that width too, so re-running it right away avoids one stale
+// frame at the old size before the next animation-frame tick corrects it.
 let zoomviewResizeTimer = null;
 new ResizeObserver(() => {
   clearTimeout(zoomviewResizeTimer);
@@ -969,7 +978,7 @@ new ResizeObserver(() => {
     if (!peaksInstance) return;
     const view = peaksInstance.views.getView('zoomview');
     if (view) view.fitToContainer();
-    applyAutoScrollOffset();
+    syncZoomviewScroll(serverPlayer.getCurrentTime());
   }, 200);
 }).observe(document.getElementById('zoomview-container'));
 

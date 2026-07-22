@@ -636,18 +636,24 @@ eviction trims). The two drift out of step the same way the position anchor used
 drawn. Fixed by deriving `durationSecs` directly from the loaded waveform's own point count
 (`json.length * pointMs(json)`) via a new `serverPlayer.setDuration()`, called everywhere the
 waveform data changes, instead of from `status`. (2) `#zoomview-container`'s height went from
-100px to 220px — just a bigger card. (3) peaks.js's own `autoScroll` re-anchors the playhead a
-fixed 100px (its default `autoScrollOffset`) from the left edge the instant it comes within 100px
-of the right edge; on this card's full-page-width container that reads as "crawls most of the way
-across, waits at the right edge, then snaps most of the way back" rather than anything smooth or
-centered. `applyAutoScrollOffset()` now sets the offset to 25% of the view's actual pixel width
-(`view.enableAutoScroll(true, { offset })`) instead of the fixed default, so the jump always
-triggers 25% of the width from the right border and lands 25% from the left, regardless of
-container size — re-applied on load and on a debounced `ResizeObserver` of the container (which
+100px to 220px — just a bigger card. (3) peaks.js's own `autoScroll` only recomputes the visible
+frame once the playhead crosses a threshold near the right edge, then re-anchors it near the left
+in one step — a discrete jump no matter how the threshold (`autoScrollOffset`) is sized; a first
+pass scaled it to 25% of the view's width instead of peaks.js's fixed 100px default, which shrank
+the jump but a live operator report ("the waveform is still jumping") confirmed a smaller jump is
+still a jump. Replaced with manual continuous scrolling: `autoScroll: false` in the zoomview config,
+and a new `syncZoomviewScroll(timeSecs)` called every animation frame from the existing `tick()`
+loop (the same one that already drives the playhead's own smooth interpolation, see the "smooth,
+continuous playhead" entry above). Once the playhead reaches `SCROLL_PIN_FRACTION` (0.25) of the
+view's width, the frame offset is recomputed on every frame to hold it exactly there
+(`view.updateWaveform(timeToPixels(time) - pinPixels, false)`), so the waveform scrolls
+continuously underneath the pinned playhead instead of jumping — before the playhead first reaches
+that point (e.g. right after a seek well behind live), the computed offset comes out negative,
+`updateWaveform` clamps it to 0, and the view just doesn't scroll yet, same as always. It also
+clamps at the far end to the data's real pixel range, so scrolling naturally stops at the live edge
+with no special-casing needed here. Re-run on a debounced `ResizeObserver` of the container (which
 also calls peaks.js's own `view.fitToContainer()`, since per its docs it does not track container
-resizes on its own). True continuous (non-jumping) scroll is possible but would mean disabling
-peaks.js's autoScroll and driving `view.updateWaveform()` every animation frame ourselves — left
-as a follow-up if the 25%-edge jump still isn't smooth enough in practice.
+resizes on its own), since the pin point is a fraction of the view's width.
 
 **What's next.** Everything from the previous "auth split / resource leak / DVR reaping / stalled
 playout state / waveform decode failures / reverse telemetry / packaging / StreamProfile dedup /
