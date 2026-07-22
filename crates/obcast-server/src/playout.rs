@@ -510,13 +510,18 @@ fn spawn_decoder_session(
     let child = std::process::Command::new("ffmpeg")
         .arg("-hide_banner")
         .arg("-loglevel")
-        .arg("error")
+        .arg("fatal")
         // Each segment is encoded with -reset_timestamps 1, so splicing many
         // of them onto one long-lived demuxer's stdin produces small backward
-        // DTS steps at segment boundaries; +genpts regenerates monotonic
-        // PTS/DTS from decoded frame durations to stop libavformat's muxer
-        // sanity check from spamming stderr. Cosmetic only — nothing in this
-        // pipeline reads ffmpeg's own timestamps.
+        // DTS steps at segment boundaries; +genpts asks libavformat to
+        // regenerate monotonic PTS/DTS from decoded frame durations, but the
+        // muxer's own "non monotonically increasing dts" sanity check still
+        // logs at AV_LOG_ERROR when genpts doesn't fully avoid a step (seen
+        // live spamming stderr the whole time a stream played, despite
+        // genpts) — and "-loglevel error" doesn't filter error-level
+        // messages, only ones more verbose than that. Dropped to "fatal" to
+        // actually silence it. Cosmetic only — nothing in this pipeline reads
+        // ffmpeg's own timestamps.
         .arg("-fflags")
         .arg("+genpts")
         .arg("-f")
