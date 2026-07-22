@@ -273,7 +273,9 @@ document.getElementById('btn-golive').onclick = () => post(`/api/${stream}/playo
 function currentSecsBehindLive() {
   const s = lastStatus?.server;
   if (!s || s.live_seq == null || s.playout.position_seq == null) return null;
-  return Math.max(0, (s.live_seq - s.playout.position_seq) * segmentMs / 1000);
+  const subMs = s.playout.position_ms_into_segment ?? 0;
+  const behindMs = (s.live_seq - s.playout.position_seq) * segmentMs - subMs;
+  return Math.max(0, behindMs / 1000);
 }
 function seekRelative(deltaSecs) {
   const cur = currentSecsBehindLive() ?? 0;
@@ -353,7 +355,8 @@ function updatePlayoutTime(status) {
     behindEl.textContent = '—';
     return;
   }
-  const elapsedSecs = Math.max(0, (s.playout.position_seq - s.dvr_start_seq) * segmentMs / 1000);
+  const subMs = s.playout.position_ms_into_segment ?? 0;
+  const elapsedSecs = Math.max(0, ((s.playout.position_seq - s.dvr_start_seq) * segmentMs + subMs) / 1000);
   posEl.textContent = fmtTime(elapsedSecs);
   const behind = currentSecsBehindLive();
   behindEl.textContent = behind == null ? '—' : (behind < 1 ? 'at live edge' : `${Math.round(behind)}s behind live`);
@@ -641,47 +644,86 @@ function colorForRung(rung, failed) {
   return (rung === null || rung === undefined) ? GAP_COLOR : (RUNG_COLORS[rung] ?? '#8a8f98');
 }
 
+// The playhead's time axis is anchored to the *waveform's own* first seq
+// (`waveformBaseSeq`, set by `applyWaveform`/`trimEvictedSegments` below)
+// rather than to `status.dvr_start_seq`. Those two used to be assumed
+// interchangeable, but they're refreshed independently — status arrives over
+// the WS on every state change, the waveform JSON is only re-fetched every
+// 5s (plus an immediate client-side trim on eviction, see below) — so a DVR
+// eviction between waveform refreshes used to leave the playhead computed
+// against a start seq the currently-displayed waveform data didn't share,
+// drifting the cursor away from the color segment it was actually over.
+// Anchoring both to the same value keeps them exact by construction.
 function makeServerPlayer() {
-  let currentTime = 0;
+  // Wall-clock interpolation: `anchorMs`/`anchorWallClock` are the last
+  // authoritative elapsed-ms reading and the `performance.now()` it arrived
+  // at. While playing, `currentTimeSecs()` extrapolates forward from that
+  // anchor instead of waiting for the next server update, and a rAF loop
+  // emits it every frame — this is what makes the playhead (and peaks.js's
+  // autoScroll, which is driven purely by emitted 'player.timeupdate' calls)
+  // move smoothly instead of jumping once per `status`/`position` event.
+  let anchorMs = 0;
+  let anchorWallClock = null;
   let playing = false;
   let durationSecs = 0;
-  let dvrStartSeq = null;
+  let waveformBaseSeq = null;
+  let lastLiveSeq = null;
   let segMs = 2000;
   let emitter = null;
+
+  function currentTimeSecs() {
+    if (anchorWallClock == null) return 0;
+    let elapsedMs = anchorMs;
+    if (playing) elapsedMs += performance.now() - anchorWallClock;
+    return Math.max(0, Math.min(durationSecs, elapsedMs / 1000));
+  }
+
+  function tick() {
+    if (playing) emitter?.emit('player.timeupdate', currentTimeSecs());
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
   return {
     // -- required peaks.js adapter methods (doc/customizing.md "Player" interface) --
     init(eventEmitter) { emitter = eventEmitter; return Promise.resolve(); },
     destroy() {},
     play() { post(`/api/${stream}/playout`, { cmd: 'resume' }); return Promise.resolve(); },
     pause() { post(`/api/${stream}/playout`, { cmd: 'pause' }); },
+    // `time` is in the waveform's own coordinate frame (seconds from
+    // `waveformBaseSeq`), same frame `currentTimeSecs()` reports in — convert
+    // to "ms behind live" using the latest known live edge so a click lands
+    // on the exact sample the user clicked, not rounded to a whole segment.
     seek(time) {
-      const secsBehindLive = Math.max(0, Math.round(durationSecs - time));
-      post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: secsBehindLive } });
+      if (waveformBaseSeq == null || lastLiveSeq == null) return;
+      const clickedMs = Math.max(0, time * 1000);
+      const liveEndMs = (lastLiveSeq - waveformBaseSeq + 1) * segMs;
+      const behindMs = Math.max(0, Math.round(liveEndMs - clickedMs));
+      post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'millis_behind_live', value: behindMs } });
     },
     isPlaying() { return playing; },
     isSeeking() { return false; },
-    getCurrentTime() { return currentTime; },
+    getCurrentTime() { return currentTimeSecs(); },
     getDuration() { return durationSecs; },
     setSource() { return Promise.resolve(); }, // no real media source to swap
-    // -- internal: fed by connectWs()'s status handler, not part of the adapter contract --
+    // -- internal: fed by connectWs()'s status handler / applyWaveform(), not part of the adapter contract --
     updateFromStatus(s) {
       if (s.live_seq != null && s.dvr_start_seq != null) {
-        dvrStartSeq = s.dvr_start_seq;
+        lastLiveSeq = s.live_seq;
         durationSecs = ((s.live_seq - s.dvr_start_seq + 1) * segMs) / 1000;
       }
-      if (s.playout.position_seq != null && dvrStartSeq != null) {
-        const newTime = ((s.playout.position_seq - dvrStartSeq) * segMs) / 1000;
-        if (Math.abs(newTime - currentTime) > 0.001) {
-          currentTime = newTime;
-          emitter?.emit('player.timeupdate', currentTime);
-        }
+      if (s.playout.position_seq != null && waveformBaseSeq != null) {
+        const subMs = s.playout.position_ms_into_segment ?? 0;
+        anchorMs = (s.playout.position_seq - waveformBaseSeq) * segMs + subMs;
+        anchorWallClock = performance.now();
       }
       const wasPlaying = playing;
       playing = s.playout.state === 'playing';
-      if (playing && !wasPlaying) emitter?.emit('player.playing', currentTime);
-      if (!playing && wasPlaying) emitter?.emit('player.pause', currentTime);
+      if (playing && !wasPlaying) emitter?.emit('player.playing', currentTimeSecs());
+      if (!playing && wasPlaying) emitter?.emit('player.pause', currentTimeSecs());
     },
     setSegmentMs(ms) { segMs = ms; },
+    setWaveformBase(seq) { waveformBaseSeq = seq; },
   };
 }
 const serverPlayer = makeServerPlayer();
@@ -699,6 +741,7 @@ function initWaveform(json) {
   }, (err, instance) => {
     if (err) { console.error('peaks.js init failed', err); return; }
     peaksInstance = instance;
+    serverPlayer.setWaveformBase(json.seqs[0]);
     applySegmentColors(json);
   });
 }
@@ -744,12 +787,17 @@ function applySegmentColors(json) {
   }
 }
 
+// Cached so `trimEvictedSegments` (below) can prune it client-side between
+// full re-fetches without re-decoding anything server-side.
+let currentWaveformJson = null;
+
 async function applyWaveform() {
   const resp = await fetch(`/api/${stream}/waveform`);
   if (!resp.ok) return;
   const json = await resp.json();
   if (json.length === 0) return;
 
+  currentWaveformJson = json;
   waveformPointMs = pointMs(json);
   segmentMs = waveformPointMs * pointsPerSegment(json);
   serverPlayer.setSegmentMs(segmentMs);
@@ -757,11 +805,50 @@ async function applyWaveform() {
   if (!peaksInstance) {
     initWaveform(json);
   } else {
+    serverPlayer.setWaveformBase(json.seqs[0]);
     peaksInstance.setSource({ waveformData: { json } }, (err) => {
       if (err) { console.error('waveform refresh failed', err); return; }
       applySegmentColors(json);
     });
   }
+}
+
+/// Slices `json`'s parallel arrays (data/rungs/seqs/decode_failed) down to
+/// just the points at `newStartSeq` or later. `data` is [min,max] pairs, so
+/// it's sliced at `2*index` rather than `index`.
+function sliceWaveformFrom(json, index) {
+  return {
+    ...json,
+    data: json.data.slice(index * 2),
+    rungs: json.rungs.slice(index),
+    seqs: json.seqs.slice(index),
+    decode_failed: json.decode_failed ? json.decode_failed.slice(index) : undefined,
+    length: json.length - index,
+  };
+}
+
+// Runs the DVR store's eviction (see CLAUDE.md §8, `store.rs::evict_old`)
+// forward onto the already-loaded waveform, client-side, the moment
+// `status`'s `dvr_start_seq` reports it — rather than waiting for the next
+// 5s `applyWaveform()` timer poll (which re-decodes the *entire* DVR window
+// via ffmpeg server-side; see `waveform.rs`'s module docs on why that isn't
+// cheap enough to do every time the head moves). A plain array slice here is
+// free by comparison, and it's what makes an evicted segment's waveform
+// disappear from the overview promptly instead of lingering for up to 5s.
+function trimEvictedSegments(newStartSeq) {
+  if (!peaksInstance || !currentWaveformJson) return;
+  const seqs = currentWaveformJson.seqs;
+  let i = 0;
+  while (i < seqs.length && seqs[i] < newStartSeq) i++;
+  if (i === 0 || i >= seqs.length) return;
+
+  const trimmed = sliceWaveformFrom(currentWaveformJson, i);
+  currentWaveformJson = trimmed;
+  serverPlayer.setWaveformBase(trimmed.seqs[0]);
+  peaksInstance.setSource({ waveformData: { json: trimmed } }, (err) => {
+    if (err) { console.error('waveform trim failed', err); return; }
+    applySegmentColors(trimmed);
+  });
 }
 
 function connectWs() {
@@ -774,6 +861,7 @@ function connectWs() {
     if (msg.type === 'status') {
       applyStatus(msg);
       serverPlayer.updateFromStatus(msg.server);
+      if (msg.server.dvr_start_seq != null) trimEvictedSegments(msg.server.dvr_start_seq);
       // Only seed the panel from the backlog once; after that, live entries
       // arrive one at a time via the 'log' event below.
       if (!logInitialized) {

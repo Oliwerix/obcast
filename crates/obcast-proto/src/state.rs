@@ -224,6 +224,18 @@ pub struct PlayoutStatus {
     /// never landed before playout got there first.
     #[serde(default)]
     pub fed_seq: Option<Seq>,
+    /// Milliseconds already drained into the segment at `position_seq`,
+    /// against that segment's *nominal* `segment_ms` duration (not
+    /// sample-exact — encoded segments aren't always precisely `segment_ms`
+    /// long) — see `PlayoutHandle::ms_into_current_segment`. Lets the web
+    /// remote move the playhead continuously between whole-segment
+    /// advances instead of jumping in `segment_ms`-sized steps, and is what
+    /// a sub-segment seek (`PlayoutPosition::MillisBehindLive`) lands on:
+    /// the skipped intra-segment offset shows up here immediately rather
+    /// than the seek looking like it snapped to the segment's start.
+    /// `0` when stopped or nothing has been fed at the current position yet.
+    #[serde(default)]
+    pub position_ms_into_segment: u32,
     /// Selected hardware output device id, if any.
     pub device: Option<String>,
     /// Linear gain 0.0..=1.0 (or higher for boost).
@@ -317,6 +329,7 @@ impl ServerState {
                 position_seq: None,
                 playing_rung: None,
                 fed_seq: None,
+                position_ms_into_segment: 0,
                 device: None,
                 volume: 1.0,
                 detail: None,

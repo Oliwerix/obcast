@@ -463,6 +463,51 @@ plotting crate: a dependency scan found no `egui_plot` release compatible with t
 version (its latest, 0.35.0, pins `egui ^0.34`), so this follows the same hand-painted-widget approach
 `level_meter`/`mini_meter` already use rather than fighting that mismatch.
 
+**Web remote playhead accuracy, sub-segment seeking, and waveform improvements.** Prompted by an
+operator report that the web remote's playhead position visibly disagreed with the waveform, jumped
+around instead of scrolling smoothly, and could only seek to whole-`segment_ms` boundaries. Four
+changes, all landing together since they share one root cause (the playhead only ever moved in whole-
+segment steps):
+- **Sub-segment position, server-side.** `PlayoutHandle::pending`'s per-entry remaining-sample count
+  (already tracked for `drain_pending`'s sample-accurate `position_seq`, see the M5 fix above) already
+  implicitly encodes how far into the current segment playout has drained — it just wasn't exposed. New
+  `PlayoutHandle::ms_into_current_segment()` (pure core factored out as `elapsed_ms_from_remaining`, unit
+  tested) converts it to ms against the segment's nominal duration, surfaced as
+  `PlayoutStatus::position_ms_into_segment` (`#[serde(default)]`, so it degrades to the old
+  whole-segment behavior against an older peer).
+- **Sub-segment seeking**, answering "is this possible?": yes. New `PlayoutPosition::MillisBehindLive`
+  resolves (`api.rs::resolve_millis_behind_live`, unit tested) to a target segment plus an intra-segment
+  ms offset, deliberately anchored to the *end* of the live segment (true "now") rather than
+  `SecondsBehindLive`'s "start of the live segment" convention — see its doc comment in
+  `docs/protocol.md` for why the two scales disagree by up to one `segment_ms` at the same numeric
+  value. The offset reaches the playout engine as `EngineCommand::Start`/`Seek`'s new `skip_ms` field;
+  `spawn_decoder_session`'s reader thread silently drops that many leading interleaved samples once, and
+  the first `pending` entry after the seek starts its remaining-sample count already short by that
+  amount — which is also what makes `position_ms_into_segment` read the skip as already-elapsed rather
+  than the seek looking like it snapped to the segment's start. Unit tested (`skip_samples`,
+  `elapsed_ms_from_remaining`'s truncated-entry case).
+- **Fixed the position/waveform mismatch.** The web remote's playhead time was computed from
+  `status.dvr_start_seq`, while the waveform's own x-axis started at whatever seq its last independent
+  fetch happened to return — two values refreshed on different schedules (every WS push vs. every 5s),
+  so a DVR eviction between waveform polls left the cursor computed against a start seq the currently-
+  displayed waveform didn't share. Now anchored to the waveform JSON's own `seqs[0]`
+  (`serverPlayer.setWaveformBase`), so both are exact by construction.
+- **Smooth, continuous playhead and waveform scrolling.** `stream.html`'s `serverPlayer` used to emit
+  peaks.js's `player.timeupdate` only when a `status` push moved `position_seq` by a whole segment,
+  which is also what drove peaks.js's `autoScroll` — visibly jumping once every ~2s. It now anchors an
+  elapsed-ms reading (`position_seq` + `position_ms_into_segment`) to a wall-clock timestamp on every
+  authoritative update and interpolates forward from that anchor once per animation frame while playing,
+  self-correcting on the next update — smooth motion between the same ~2s authoritative ticks rather
+  than needing a higher-frequency feed.
+- **Evicted segments now disappear from the waveform promptly.** The waveform endpoint already
+  defaults to the current DVR window, so eviction was already reflected — just only on the next 5s poll
+  (each of which re-decodes the whole range via `ffmpeg` server-side, not cheap enough to do more often
+  — see `waveform.rs`'s module docs on the lock-holding fix that was specifically about avoiding that
+  cost on every tick). `stream.html` now also prunes the already-loaded waveform client-side the moment
+  a `status` push reports `dvr_start_seq` advancing (`trimEvictedSegments`, a plain array slice, no
+  server round trip), so an evicted segment's color disappears within one WS push instead of lingering
+  for up to 5s.
+
 **What's next.** Everything from the previous "auth split / resource leak / DVR reaping / stalled
 playout state / waveform decode failures / reverse telemetry / packaging / StreamProfile dedup /
 browser DVR scrub / HE-AAC survival rung / scheduler edge-case tests" punch list is now DONE — see the

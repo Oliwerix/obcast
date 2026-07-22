@@ -339,6 +339,7 @@ mod tests {
                 position_seq: pos,
                 playing_rung: None,
                 fed_seq: fed,
+                position_ms_into_segment: 0,
                 device: None,
                 volume: 1.0,
                 detail: None,

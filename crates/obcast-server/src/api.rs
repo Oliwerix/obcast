@@ -57,7 +57,16 @@ fn check_control_auth(expected: Option<&str>, headers: &HeaderMap) -> Result<(),
     }
 }
 
-async fn resolve_position(handle: &StreamHandle, pos: PlayoutPosition) -> Result<Seq, ApiError> {
+/// Resolves a `PlayoutPosition` against the current DVR window, returning
+/// the target segment plus an intra-segment offset (in ms) to skip past
+/// before that segment's audio starts draining — nonzero only for
+/// `MillisBehindLive`'s sub-segment precision; every other variant lands
+/// exactly on a segment boundary. See `resolve_millis_behind_live` for the
+/// pure math this delegates to.
+async fn resolve_position(
+    handle: &StreamHandle,
+    pos: PlayoutPosition,
+) -> Result<(Seq, u32), ApiError> {
     let store = handle.store.lock().await;
     let live = store
         .live_seq()
@@ -65,14 +74,37 @@ async fn resolve_position(handle: &StreamHandle, pos: PlayoutPosition) -> Result
     let start = store.dvr_start_seq().unwrap_or(live);
     let seg_ms = store.profile().segment_ms.max(1);
 
-    let target = match pos {
-        PlayoutPosition::Live => live,
-        PlayoutPosition::Seq(s) => s,
+    let (target, skip_ms) = match pos {
+        PlayoutPosition::Live => (live, 0),
+        PlayoutPosition::Seq(s) => (s, 0),
         PlayoutPosition::SecondsBehindLive(secs) => {
-            live.saturating_sub((secs * 1000 / seg_ms) as u64)
+            (live.saturating_sub((secs * 1000 / seg_ms) as u64), 0)
+        }
+        PlayoutPosition::MillisBehindLive(ms) => {
+            resolve_millis_behind_live(start, live, seg_ms, ms)
         }
     };
-    Ok(target.clamp(start, live))
+    Ok((target.clamp(start, live), skip_ms))
+}
+
+/// Pure core of `MillisBehindLive` resolution: maps "N ms behind the live
+/// edge" onto a `(segment, intra-segment ms offset)` pair, treating the DVR
+/// window as one continuous timeline where `start`'s segment begins at 0 and
+/// `live`'s segment nominally ends at `(live - start + 1) * seg_ms` (i.e. the
+/// live segment counts as a full nominal segment even if still filling in).
+/// Clamped into `[start, live]` with `skip_ms = 0` at either edge, matching
+/// `SecondsBehindLive`'s existing clamp-to-window behavior.
+fn resolve_millis_behind_live(start: Seq, live: Seq, seg_ms: u32, ms: u64) -> (Seq, u32) {
+    let span_ms = (live - start + 1) * seg_ms as u64;
+    let instant_ms = span_ms.saturating_sub(ms);
+    let seg_ms = seg_ms as u64;
+    let offset_segs = instant_ms / seg_ms;
+    let skip_ms = (instant_ms % seg_ms) as u32;
+    if offset_segs > live - start {
+        (live, 0)
+    } else {
+        (start + offset_segs, skip_ms)
+    }
 }
 
 pub async fn set_playout(
@@ -86,19 +118,28 @@ pub async fn set_playout(
 
     match cmd {
         PlayoutCommand::Start { position } => {
-            let seq = resolve_position(&handle, position).await?;
-            handle.playout.send(EngineCommand::Start { position: seq });
+            let (seq, skip_ms) = resolve_position(&handle, position).await?;
+            handle.playout.send(EngineCommand::Start {
+                position: seq,
+                skip_ms,
+            });
         }
         PlayoutCommand::Stop => handle.playout.send(EngineCommand::Stop),
         PlayoutCommand::Pause => handle.playout.send(EngineCommand::Pause),
         PlayoutCommand::Resume => handle.playout.send(EngineCommand::Resume),
         PlayoutCommand::Seek { position } => {
-            let seq = resolve_position(&handle, position).await?;
-            handle.playout.send(EngineCommand::Seek { position: seq });
+            let (seq, skip_ms) = resolve_position(&handle, position).await?;
+            handle.playout.send(EngineCommand::Seek {
+                position: seq,
+                skip_ms,
+            });
         }
         PlayoutCommand::GoLive => {
-            let seq = resolve_position(&handle, PlayoutPosition::Live).await?;
-            handle.playout.send(EngineCommand::Seek { position: seq });
+            let (seq, skip_ms) = resolve_position(&handle, PlayoutPosition::Live).await?;
+            handle.playout.send(EngineCommand::Seek {
+                position: seq,
+                skip_ms,
+            });
         }
         PlayoutCommand::SetVolume { gain } => {
             handle.playout.send(EngineCommand::SetVolume { gain })
@@ -347,4 +388,49 @@ pub async fn waveform_handler(
     result
         .map(Json)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn millis_behind_live_zero_lands_exactly_on_the_live_edge() {
+        assert_eq!(resolve_millis_behind_live(0, 10, 2000, 0), (10, 0));
+    }
+
+    #[test]
+    fn millis_behind_live_mid_segment_offset_within_the_live_segment() {
+        // 500ms behind live, with a 2000ms segment: still within the live
+        // segment (10), 1500ms into it.
+        assert_eq!(resolve_millis_behind_live(0, 10, 2000, 500), (10, 1500));
+    }
+
+    #[test]
+    fn millis_behind_live_exact_segment_boundary_has_no_skip() {
+        // Exactly one segment's duration (2000ms) behind the live edge is
+        // exactly the *start* of the live segment itself — segment 10 spans
+        // [20000, 22000) in this window, and 2000ms back from its end (22000)
+        // is 20000, its own start.
+        assert_eq!(resolve_millis_behind_live(0, 10, 2000, 2000), (10, 0));
+    }
+
+    #[test]
+    fn millis_behind_live_partway_into_an_earlier_segment() {
+        // 2500ms behind live: 500ms past segment 10's start, i.e. inside
+        // segment 9 (which spans [18000, 20000)), 1500ms into it.
+        assert_eq!(resolve_millis_behind_live(0, 10, 2000, 2500), (9, 1500));
+    }
+
+    #[test]
+    fn millis_behind_live_beyond_the_dvr_window_clamps_to_start() {
+        assert_eq!(resolve_millis_behind_live(5, 10, 2000, 1_000_000), (5, 0));
+    }
+
+    #[test]
+    fn millis_behind_live_single_segment_window() {
+        assert_eq!(resolve_millis_behind_live(7, 7, 2000, 0), (7, 0));
+        assert_eq!(resolve_millis_behind_live(7, 7, 2000, 500), (7, 1500));
+        assert_eq!(resolve_millis_behind_live(7, 7, 2000, 5000), (7, 0));
+    }
 }
