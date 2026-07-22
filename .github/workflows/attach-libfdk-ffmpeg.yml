@@ -12,26 +12,65 @@
 # built, non-Cargo binary into its archives. Runs after the fact, against
 # the already-published release, rather than trying to race dist's own
 # build-and-publish job.
+#
+# Triggers on `workflow_run` (Release workflow completing), not `release:
+# published` — found broken against the very first real release (v0.1.1):
+# dist's `host` job creates the GitHub Release using the default
+# GITHUB_TOKEN, and GitHub Actions never lets an event produced by that
+# token start another workflow (the standard anti-recursion guard), so
+# `release: published` silently never fired. `workflow_run` isn't subject
+# to that restriction since it's driven by the run's own completion, not a
+# synthetic event the run created. Also accepts `workflow_dispatch` with an
+# explicit tag, both as a manual escape hatch and to backfill a release
+# (like v0.1.1) that shipped before this fix existed.
 name: Attach libfdk_aac ffmpeg to release
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach ffmpeg binaries to (e.g. v0.1.1)"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
   build-ffmpeg:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
     uses: ./.github/workflows/build-libfdk-ffmpeg.yml
 
   attach:
     needs: build-ffmpeg
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ github.event.release.tag_name }}
+      # This job never runs actions/checkout (it only moves release
+      # assets around, no repo files needed) — but `gh release`/`gh api`
+      # normally infer the target repo by shelling out to `git remote`,
+      # which fails with no local .git at all. GH_REPO makes gh skip that
+      # git-repo inference and use the given owner/repo directly.
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     strategy:
+      # Each leg patches a different, independent release asset — one
+      # platform failing shouldn't cancel the others mid-upload (seen
+      # backfilling v0.1.1: the Windows leg's failure killed 3 in-flight
+      # uploads that would otherwise have succeeded).
+      fail-fast: false
+      # The per-asset archive upload is independent per leg, but the last
+      # step's read-modify-write of the single shared sha256.sum asset
+      # isn't: seen backfilling v0.1.1, two legs' clobber-uploads landed
+      # close enough together that one leg's upload hit a 404 on an asset
+      # ID a sibling had just deleted out from under it. Each leg here
+      # only takes ~15s, so serializing costs nothing worth avoiding the
+      # race for.
+      max-parallel: 1
       matrix:
         include:
           # ffmpeg_artifact names must stay in sync with the literal names
@@ -77,15 +116,19 @@ jobs:
       - name: Inject the libfdk_aac ffmpeg binary alongside obcast-client
         run: |
           set -euo pipefail
-          # dist archives wrap contents in a single top-level directory
-          # (e.g. obcast-client-x86_64-unknown-linux-gnu/) — find it rather
-          # than hardcoding the exact name dist happens to choose. Verified
-          # locally against a real `dist build` output before this workflow
-          # was written, not just assumed.
+          # dist's .tar.xz archives wrap contents in a single top-level
+          # directory (e.g. obcast-client-x86_64-unknown-linux-gnu/) —
+          # find it rather than hardcoding the exact name dist happens to
+          # choose. Its .zip archives (Windows) are flat with no wrapping
+          # directory at all — found the hard way, backfilling v0.1.1,
+          # when the tar.xz-only assumption below made this step fail on
+          # the Windows leg specifically.
           root="$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1)"
           if [ -z "$root" ]; then
-            echo "::error::couldn't find the archive's top-level directory" >&2
-            exit 1
+            root="extracted"
+            echo "flat=true" >> "$GITHUB_ENV"
+          else
+            echo "flat=false" >> "$GITHUB_ENV"
           fi
           cp "ffmpeg-bin/${{ matrix.ffmpeg_name }}" "$root/${{ matrix.ffmpeg_name }}"
           chmod +x "$root/${{ matrix.ffmpeg_name }}" 2>/dev/null || true
@@ -95,7 +138,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            (cd extracted && zip -qr "../$asset" "$root_name")
+            if [ "$flat" = "true" ]; then
+              (cd extracted && zip -qr "../$asset" .)
+            else
+              (cd extracted && zip -qr "../$asset" "$root_name")
+            fi
           else
             # Pass the directory name explicitly (not `.`) so entries match
             # dist's own archives exactly (no leading `./` on every path) —
@@ -117,7 +164,14 @@ jobs:
           gh release download "$TAG" --pattern "sha256.sum" --dir . --clobber || true
           if [ -f sha256.sum ]; then
             new_line="$(sha256sum "$asset")"
-            grep -v " \*$asset\$" sha256.sum > sha256.sum.new || true
+            # Match any line ending in this exact asset name, not just
+            # dist's own `{hash} *{name}` format — a rerun (this step ran
+            # 4 times backfilling v0.1.1 chasing other bugs) finds its own
+            # previous pass's line in plain `sha256sum` format (`{hash}
+            # {name}`, two spaces, no asterisk), which the asterisk-only
+            # pattern silently failed to match and remove, leaving a
+            # stale duplicate instead of replacing it.
+            grep -v -- "$asset\$" sha256.sum > sha256.sum.new || true
             echo "$new_line" >> sha256.sum.new
             mv sha256.sum.new sha256.sum
             gh release upload "$TAG" sha256.sum --clobber

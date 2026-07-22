@@ -1,6 +1,6 @@
 [package]
 name = "obcast-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # The server ships as a Docker image (repo-root Dockerfile), not a dist
