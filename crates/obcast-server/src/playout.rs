@@ -511,6 +511,14 @@ fn spawn_decoder_session(
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
+        // Each segment is encoded with -reset_timestamps 1, so splicing many
+        // of them onto one long-lived demuxer's stdin produces small backward
+        // DTS steps at segment boundaries; +genpts regenerates monotonic
+        // PTS/DTS from decoded frame durations to stop libavformat's muxer
+        // sanity check from spamming stderr. Cosmetic only — nothing in this
+        // pipeline reads ffmpeg's own timestamps.
+        .arg("-fflags")
+        .arg("+genpts")
         .arg("-f")
         .arg("mpegts")
         .arg("-i")
