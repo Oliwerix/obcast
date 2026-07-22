@@ -231,11 +231,17 @@ async fn main() {
     // How many segments deep the playout engine decodes ahead of real-time
     // output (see `playout.rs::run_engine`'s `ring_segments`) — trades
     // resilience to a transient decode/disk slowdown against ingest-to-
-    // audible latency. Default 4 (8s at the 2s default segment length).
+    // audible latency. Default 8 (16s at the 2s default segment length) —
+    // this was briefly dropped to 4 to cut latency, but that reintroduced
+    // exactly the spurious "buffer underrun" stalls (audio genuinely on disk
+    // the whole time, just not decoded far enough ahead to survive a
+    // transient hiccup) that motivated raising it to 8 in the first place;
+    // see `playout.rs`'s ring-sizing comment. An operator who wants the
+    // lower-latency tradeoff can still opt in via the env var below.
     let playout_ring_segments: usize = std::env::var("OBCAST_PLAYOUT_RING_SEGMENTS")
         .ok()
         .map(|v| v.parse().expect("invalid OBCAST_PLAYOUT_RING_SEGMENTS"))
-        .unwrap_or(4);
+        .unwrap_or(8);
     let server_cfg = config::ServerConfig::load();
 
     let app_state = Arc::new(AppState {

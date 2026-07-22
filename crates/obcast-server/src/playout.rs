@@ -854,7 +854,11 @@ fn run_engine(
     // (`ring_segments` here, threaded in from `main.rs`) trading resilience
     // to that kind of hiccup, and ingest-to-audible latency, against each
     // other — a shallower ring means less headroom but faster time-to-air;
-    // default is 4 segments (8s at the 2s default).
+    // default is 8 segments (16s at the 2s default). A brief attempt at
+    // defaulting this to 4 (8s) for lower latency reintroduced the exact
+    // spurious-underrun symptom described above, confirmed live — restored
+    // to 8 as the default; an operator can still opt into the lower-latency,
+    // lower-headroom tradeoff via the env var.
     let segment_samples = (segment_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
     let ring = HeapRb::<f32>::new(segment_samples * ring_segments.max(1));
     let (producer, mut consumer) = ring.split();

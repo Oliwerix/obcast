@@ -176,7 +176,7 @@ whatever rung was on disk the moment it fed that seq. Gating on
 `position_seq` alone let Tier C keep spending its whole per-tick budget on
 segments that were, in practice, already fed by the time the upload landed —
 the engine's feed-ahead depth (`ring_segments` in `playout.rs`, configurable
-via `OBCAST_PLAYOUT_RING_SEGMENTS`, default 4) is comparable
+via `OBCAST_PLAYOUT_RING_SEGMENTS`, default 8) is comparable
 to or larger than Tier C's own look-ahead window under the default water
 levels, so in steady state almost none of those uploads could ever actually
 be heard. Falls back to `position_seq` when absent (older server, or
