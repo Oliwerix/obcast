@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::response::Redirect;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use obcast_proto::control::{LogEntry, LogLevel};
@@ -251,6 +252,7 @@ async fn main() {
     });
 
     let app = Router::new()
+        .route("/", get(|| async { Redirect::temporary("/remote/") }))
         .route("/ingest/:stream/segment", post(ingest::upload_segment))
         .route("/ingest/:stream/abandon", post(ingest::abandon))
         .route("/ingest/:stream/heartbeat", post(ingest::heartbeat))
