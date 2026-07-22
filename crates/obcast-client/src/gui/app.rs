@@ -838,7 +838,7 @@ impl ObcastApp {
     fn link_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Link");
 
-        let Some(state) = self.shared.server.try_lock().map(|g| g.clone()).ok() else {
+        let Some((state, age)) = self.shared.server_snapshot() else {
             ui.label("(no link yet)");
             return;
         };
@@ -848,11 +848,24 @@ impl ObcastApp {
         // playing, the lead ahead of the playout head, i.e. the safety
         // margin a network outage eats into first.
         let stopped = state.playout.state == PlayoutState::Stopped;
-        let buffer_ms = if stopped {
+        let raw_buffer_ms = if stopped {
             state.buffered_ms
         } else {
             state.lead_ms
         };
+        // Both `lead_ms` and `buffered_ms` only shrink from here in real
+        // time once nothing new is arriving: while playing, playout keeps
+        // consuming the lead with no upload replenishing it; while stopped,
+        // the server's DVR window keeps evicting its oldest end while the
+        // live edge sits frozen (no segments to extend it). So if the link
+        // (and thus a fresh `ServerState`) has gone quiet, extrapolate that
+        // drain from how long ago we last heard rather than freezing at the
+        // last number reported — a stale connection would otherwise show a
+        // deceptively healthy buffer through an outage. In normal operation
+        // `age` stays near zero (state refreshes every tick), so this is a
+        // no-op then and only kicks in once the feed actually stalls.
+        let age_ms = age.as_millis().min(u32::MAX as u128) as u32;
+        let buffer_ms = raw_buffer_ms.saturating_sub(age_ms);
         let buffer_target_ms = if stopped && self.cfg.auto_start {
             (self.cfg.auto_start_buffer_secs * 1000).max(1)
         } else {
@@ -866,11 +879,18 @@ impl ObcastApp {
         } else {
             egui::Color32::from_rgb(0x35, 0xc7, 0x5f)
         };
+        let buffer_stale = age >= crate::shared::STALE_AFTER;
         let buffer_text = if stopped && self.cfg.auto_start {
             format!(
                 "{:.0}s / {:.0}s buffered (auto-start pending)",
                 buffer_ms as f32 / 1000.0,
                 buffer_target_ms as f32 / 1000.0
+            )
+        } else if buffer_stale {
+            format!(
+                "{:.1} s (estimated — link down {:.0}s)",
+                buffer_ms as f32 / 1000.0,
+                age.as_secs_f32()
             )
         } else {
             format!("{:.1} s", buffer_ms as f32 / 1000.0)
@@ -925,42 +945,50 @@ impl ObcastApp {
             }
         }
 
-        // Buffer quality: of the segments the server currently reports
-        // coverage for ahead of the playout head (`ServerState::coverage` —
-        // "where the quality holes are", CLAUDE.md §1), what fraction sit at
-        // the top rung right now. 100% = the whole outstanding buffer is HD;
-        // 0% = none of it is — the rest may still be playable at a lower
-        // rung (that's `Buffer`/continuity's job to guarantee), this is
-        // purely a quality readout. Gaps (`best_rung == None`) don't count
-        // toward either the numerator or denominator — a missing segment is
-        // a continuity problem, not a quality one.
+        // Buffer quality: the segments the server currently reports coverage
+        // for ahead of the playout head (`ServerState::coverage` — "where
+        // the quality holes are", CLAUDE.md §1), broken down by which rung
+        // each one is actually held at — stacked so every enabled rung's
+        // share is visible at once and the segments together always sum to
+        // the full covered fraction. Gaps (`best_rung == None`) don't count
+        // toward any segment — a missing segment is a continuity problem,
+        // not a quality one (that's `Buffer`/continuity's job above).
+        let rungs = self.profile().rungs.clone();
         let top_rung = self.profile().top_rung();
         let covered: Vec<_> = state.coverage.iter().filter_map(|c| c.best_rung).collect();
-        let buffer_quality_pct = if covered.is_empty() {
+        let top_rung_pct = if covered.is_empty() {
             None
         } else {
             let hd = covered.iter().filter(|&&r| r == top_rung).count();
             Some(hd as f32 / covered.len() as f32 * 100.0)
         };
-        ui.label("Buffer quality (HD)");
-        match buffer_quality_pct {
-            Some(pct) => {
-                let color = if pct < 33.0 {
-                    egui::Color32::from_rgb(0xe2, 0x3d, 0x3d)
-                } else if pct < 67.0 {
-                    egui::Color32::from_rgb(0xe8, 0xc5, 0x2a)
-                } else {
-                    egui::Color32::from_rgb(0x35, 0xc7, 0x5f)
-                };
-                ui.add(
-                    egui::ProgressBar::new((pct / 100.0).clamp(0.0, 1.0))
-                        .fill(color)
-                        .text(format!("{pct:.0}% HD")),
-                );
-            }
-            None => {
-                ui.label("(no buffer coverage yet)");
-            }
+        ui.label("Buffer quality (by rung)");
+        if covered.is_empty() {
+            ui.label("(no buffer coverage yet)");
+        } else {
+            let total = covered.len() as f32;
+            let segments: Vec<(f32, egui::Color32)> = rungs
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let count = covered.iter().filter(|&&cr| cr == r.id).count();
+                    (count as f32 / total, meter::rung_color(i, rungs.len()))
+                })
+                .collect();
+            meter::stacked_bar(ui, &segments, egui::vec2(200.0, 18.0));
+            ui.horizontal_wrapped(|ui| {
+                for (i, r) in rungs.iter().enumerate() {
+                    let count = covered.iter().filter(|&&cr| cr == r.id).count();
+                    if count == 0 {
+                        continue;
+                    }
+                    let pct = count as f32 / total * 100.0;
+                    ui.colored_label(
+                        meter::rung_color(i, rungs.len()),
+                        format!("{} {pct:.0}%", r.name),
+                    );
+                }
+            });
         }
 
         // Sample the rolling history at a fixed cadence, independent of the
@@ -982,7 +1010,7 @@ impl ObcastApp {
             if let Some(q) = quality {
                 push_capped(&mut self.quality_history, q.rung as f32, HISTORY_LEN);
             }
-            if let Some(pct) = buffer_quality_pct {
+            if let Some(pct) = top_rung_pct {
                 push_capped(&mut self.buffer_quality_history, pct, HISTORY_LEN);
             }
         }
@@ -1021,7 +1049,7 @@ impl ObcastApp {
             egui::Color32::from_rgb(0xc9, 0x8f, 0x5b),
         );
 
-        ui.label(egui::RichText::new("Buffer quality (% HD)").small());
+        ui.label(egui::RichText::new("Buffer quality trend (% at top rung)").small());
         meter::sparkline(
             ui,
             &self.buffer_quality_history,

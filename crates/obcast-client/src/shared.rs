@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 /// otherwise pins the encoder on arbitrarily old data forever — there was
 /// previously no staleness check at all. Matches the server's own
 /// link-down window (`STALE_AFTER` in `obcast-server/src/api.rs`).
-const STALE_AFTER: Duration = Duration::from_secs(5);
+pub(crate) const STALE_AFTER: Duration = Duration::from_secs(5);
 
 /// Cap on retained client-side log lines — enough operator history for a
 /// session (device errors, upload/abandon warnings, ffmpeg pipeline
@@ -152,6 +152,25 @@ impl SharedState {
         } else {
             ServerState::unknown()
         }
+    }
+
+    /// The held `ServerState` together with how long it's been since
+    /// `update()` last refreshed it. Lets callers extrapolate values that
+    /// should keep moving in real time even once the feed itself has gone
+    /// quiet — e.g. the Link panel's buffer graph, which should show the
+    /// buffer/lead draining as playout consumes it (or the server's DVR
+    /// window evicts its oldest end) with nothing coming in to replenish
+    /// it, rather than freezing at the last number the server happened to
+    /// report. `None` only on lock contention (never blocks).
+    pub fn server_snapshot(&self) -> Option<(ServerState, Duration)> {
+        let state = self.server.try_lock().ok()?.clone();
+        let age = self
+            .server_updated_at
+            .try_lock()
+            .ok()?
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
+        Some((state, age))
     }
 
     pub fn note_upload(&self, seq: u64, throughput_kbps: u32) {

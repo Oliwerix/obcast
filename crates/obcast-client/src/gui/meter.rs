@@ -267,6 +267,44 @@ pub fn sparkline(
     response
 }
 
+/// A single horizontal 100%-stacked bar: `segments` are `(fraction, color)`
+/// pairs drawn left to right in order, so a caller whose fractions sum to
+/// 1.0 (e.g. one entry per ABR rung, low->high) gets a bar that always
+/// reads as "the whole buffer, broken down by what's actually in it" rather
+/// than a single collapsed number. Fractions aren't required to sum to
+/// exactly 1.0 — leftover width is simply left as track colour (e.g. while
+/// coverage is still filling in).
+pub fn stacked_bar(ui: &mut egui::Ui, segments: &[(f32, Color32)], size: Vec2) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, TRACK);
+
+    let mut x = rect.left();
+    for &(frac, color) in segments {
+        let w = frac.clamp(0.0, 1.0) * rect.width();
+        if w > 0.5 {
+            let seg_rect =
+                Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(w, rect.height()));
+            painter.rect_filled(seg_rect, 0.0, color);
+        }
+        x += w;
+    }
+    response
+}
+
+/// Colour for rung `index` of `count` total, low->high, as a point on a
+/// red -> yellow -> green hue ramp — the same low/mid/high quality colours
+/// used elsewhere in this panel (`buffer_color`, VU zones), generalized to
+/// however many rungs are actually enabled rather than a fixed three-way
+/// split.
+pub fn rung_color(index: usize, count: usize) -> Color32 {
+    if count <= 1 {
+        return GREEN;
+    }
+    let t = index as f32 / (count - 1) as f32; // 0.0 (lowest rung) -> 1.0 (highest)
+    egui::ecolor::Hsva::new(t * 0.34, 0.65, 0.85, 1.0).into()
+}
+
 /// Compact horizontal peak meter for a channel-bank row — enough to spot
 /// which of e.g. 32 inputs actually has signal on it, without the full
 /// dual-scale ruler. Deliberately not zone-coloured (green/yellow/red) —
