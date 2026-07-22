@@ -48,6 +48,7 @@ Headers:
   X-Auth: <ingest token>
   X-Rendition: <rung id>          # lowest currently-enabled rung = survival rung
   X-Seq: <u64>                    # canonical clock; idempotent on (rung, seq)
+  X-New-Session: true             # only on the first upload of a new encoder session
   Content-Type: audio/mp2t
 Body: <segment bytes>
 ```
@@ -62,6 +63,39 @@ fresh feedback, so when the link works the encoder needs no extra round trips.
 POST /ingest/{stream}/abandon      Body: { "seqs": [u64, ...] }
 ```
 Tells the server to stop waiting on permanent gaps so playout can skip them.
+
+### Session continuity (stream restart / name reuse)
+`Seq` is a single, ever-climbing number per stream *name* on the server, but
+ffmpeg always numbers a fresh encode process's own files from 0 (see
+`encode.rs`) — every encoder-process restart, whether an explicit operator
+Stop→Go-Live or the internal respawn behind a live rung toggle, needs to
+reconcile those two facts before its first upload.
+
+- **Default: append.** The client reads the last-known `ServerState.live_seq`
+  (delivered by the state feed before any of its own uploads land) and adds
+  `live_seq + 1` as an offset on top of its own 0-based local file numbers
+  before sending `X-Seq`, so the server just sees `Seq` keep climbing —
+  exactly as if nothing happened. This is what makes a quick restart or a
+  live rung toggle transparent: the DVR and playout head are untouched.
+- **`ServerState.stale_session`** is `true` once the stream has gone at least
+  `OBCAST_STALE_RESET_MS` (default 5 min) without an ingested segment. A
+  client reading `true` at go-live time uses offset 0 instead — a genuinely
+  new broadcast's `Seq` starts fresh, matching `stream.html`'s assumption
+  that elapsed time is `position_seq * segment_ms` from a `Seq`-0 origin.
+- **The server only actually resets** (wiping the old DVR index and on-disk
+  segments for that name, in place — the stream keeps its existing
+  `StreamHandle`, so SSE/WS subscribers don't need to reconnect) when an
+  upload arrives with **both** `X-New-Session` set **and** the stream already
+  past the stale window. Requiring both matters: the marker alone (a quick
+  restart, well under the window) must not discard a live broadcast's
+  buffer, and the window alone can't tell a real restart apart from the same
+  encoder process recovering after a long-but-survivable outage — which is
+  exactly the scenario this system exists to ride out without loss. See
+  `should_reset_for_new_session` in `obcast-server/src/ingest.rs`.
+- A client that skips `X-New-Session` entirely (or an older client) always
+  gets append behaviour, never an automatic reset — the operator's existing
+  `DELETE /api/shows/{name}` remains the explicit, unconditional way to
+  clear a show.
 
 ---
 
@@ -217,6 +251,10 @@ segment's start.
 - `water` = `{ low_ms, target_ms, high_ms }` — survival / target / upgrade gates.
 - `coverage[]` — best rung per seq for a bounded window ahead of the anchor, so
   the encoder sees exactly where HD is missing without guessing.
+- `stale_session` — whether this stream has gone without an ingested segment
+  for at least `OBCAST_STALE_RESET_MS`; used only at go-live time to pick a
+  `Seq` offset (append vs. restart at 0) — see "Session continuity" above.
+  Not otherwise consulted by `plan_uploads`.
 
 ---
 

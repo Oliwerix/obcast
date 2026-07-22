@@ -649,6 +649,38 @@ resizes on its own). True continuous (non-jumping) scroll is possible but would 
 peaks.js's autoScroll and driving `view.updateWaveform()` every animation frame ourselves — left
 as a follow-up if the 25%-edge jump still isn't smooth enough in practice.
 
+**Stream restart / name reuse.** Previously undefined and genuinely broken: `AppState`'s per-name
+`DvrStore` lives for the life of the server process with no session boundary, while ffmpeg always
+numbers a fresh encode process's own files from 0 (`encode.rs`, deliberate — see the ABR ladder
+rework entry above). So any encoder-process restart under an unchanged stream name — an explicit
+Stop→Go-Live, *or* a live rung toggle, which reuses that exact same respawn path — re-uploaded
+seq 0.. while the store's `live_seq` was still parked wherever the old session left off; `evict_old`'s
+window floor is computed from that old high-water mark, so the new session's segments were recorded
+and then evicted on the very next tick, before playout could ever reach them — dead air that would
+only self-heal once the new seq counter climbed back past the old `live_seq` (hours, at the default
+2s/segment). Fixed with two pieces, deliberately kept independent: (1) **client-side seq stitching**
+— `uploader.rs::resolve_seq_offset` reads the last-known `ServerState.live_seq` before its first
+upload and adds `live_seq + 1` as an offset on top of its own 0-based local file numbers, so the wire
+`Seq` just keeps climbing across a restart or rung toggle instead of colliding with it; `LocalInventory`
+is shifted into this wire-seq space in `uploader::run` and shifted back only to look up the on-disk
+file path, so `plan_uploads`/`stalled_continuity_seq` (`obcast-proto`) are untouched. (2) **server-side
+stale reset** — a new `ServerState.stale_session` flag (true once `OBCAST_STALE_RESET_MS`, default 5
+min, has passed with no ingested segment) tells the client to use offset 0 instead for a genuinely new
+broadcast; a new `X-New-Session` header (sent only until the client's first upload actually succeeds)
+tells the server this really is a fresh encoder session, not the same one recovering from an outage.
+The server only wipes a stream's DVR index and on-disk segments (in place — same `StreamHandle`, so
+SSE/WS/control subscribers don't need to reconnect, unlike `DELETE /api/shows/{name}`) when **both**
+conditions hold (`ingest.rs::should_reset_for_new_session`): the marker alone (a quick restart, or a
+rung toggle, always well under the stale window) must not discard a live broadcast's buffer, and the
+window alone can't tell a real restart apart from the same encoder process's backlog draining after a
+long-but-survivable outage — which is exactly the scenario this whole system exists to ride out
+without loss, so a pure timeout was explicitly rejected during design (a >5min real outage would have
+had its DVR history wiped the moment it reconnected, the opposite of "an outage causes delay, not
+loss"). An unmodified/older client that never sends `X-New-Session` always gets append behaviour and
+never an automatic reset; `DELETE /api/shows/{name}` remains the explicit, unconditional way to clear
+a show regardless. See `docs/protocol.md` §2–3 "Session continuity" for the wire contract and
+`OBCAST_STALE_RESET_MS` in `docs/getting-started.md`.
+
 **What's next.** Everything from the previous "auth split / resource leak / DVR reaping / stalled
 playout state / waveform decode failures / reverse telemetry / packaging / StreamProfile dedup /
 browser DVR scrub / HE-AAC survival rung / scheduler edge-case tests" punch list is now DONE — see the

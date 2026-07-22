@@ -401,6 +401,7 @@ mod tests {
             water,
             coverage: vec![],
             buffered_ms: 0,
+            stale_session: false,
         }
     }
 
