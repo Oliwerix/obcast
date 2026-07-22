@@ -116,11 +116,16 @@ struct ObcastApp {
     /// When the app started — an arbitrary but stable zero point for the
     /// connection-fail flash's continuous blink phase (see `flash_color`).
     created_at: Instant,
-    /// When the clip alarm (see `check_clip_alarm`) last fired. `None`
-    /// whenever the clip latch (`AudioHandle::clip_l`/`clip_r`) is currently
-    /// clear — a fresh clip after that always alarms immediately rather
-    /// than possibly landing inside a stale `ALARM_REPEAT_INTERVAL` window
-    /// left over from before the operator reset it.
+    /// `AudioHandle::clip_edge_seq()` value as of the last time
+    /// `check_clip_alarm` looked — a genuinely new clip (the counter having
+    /// moved on) is what triggers an alarm, never a merely-still-set sticky
+    /// `clip_l`/`clip_r` flag (which only clears on an explicit operator
+    /// reset and would otherwise look identical to a fresh clip forever).
+    last_seen_clip_edge: u64,
+    /// When the clip alarm last fired — a genuinely new clip edge only
+    /// re-alarms once this is at least `ALARM_REPEAT_INTERVAL` in the past,
+    /// which just rate-limits a burst of rapid distinct clips (e.g. hard
+    /// distortion) rather than gating on elapsed time by itself.
     last_clip_alarm_at: Option<Instant>,
     /// When the input level (the louder of the two selected channels' VU
     /// readings) most recently dropped below
@@ -189,6 +194,7 @@ impl ObcastApp {
         if !cfg.device_name.is_empty() {
             audio.open(&cfg.audio_host, &cfg.device_name);
         }
+        let last_seen_clip_edge = audio.clip_edge_seq();
 
         Self {
             _rt: rt,
@@ -213,6 +219,7 @@ impl ObcastApp {
             buffer_quality_history: VecDeque::new(),
             history_sampled_at: None,
             created_at: Instant::now(),
+            last_seen_clip_edge,
             last_clip_alarm_at: None,
             low_level_since: None,
             last_low_level_alarm_at: None,
@@ -915,8 +922,9 @@ impl ObcastApp {
         if ui
             .checkbox(&mut self.cfg.clip_warning_enabled, "Clip warning")
             .on_hover_text(format!(
-                "Log and flash the window border when the selected inputs clip, repeating \
-                 every {repeat_secs}s until the meter's clip indication is cleared.",
+                "Log and flash the window border whenever the selected inputs clip, at most \
+                 once every {repeat_secs}s. The meter's own clip indication is separate and \
+                 stays lit until you click a meter to clear it.",
             ))
             .changed()
         {
@@ -1232,35 +1240,43 @@ impl ObcastApp {
         Some((buffer_ms, age >= crate::shared::STALE_AFTER))
     }
 
-    /// Checks the selected inputs' clip latch and, if
-    /// `AppConfig::clip_warning_enabled`, fires an alarm on a fresh clip and
-    /// again every `ALARM_REPEAT_INTERVAL` for as long as the latch stays
-    /// set. The latch (`AudioHandle::clip_l`/`clip_r`) only clears when the
-    /// operator clicks a level meter (`meter_panel`) — that same click also
-    /// resets `last_clip_alarm_at`, so a *new* clip right after a reset
-    /// alarms immediately instead of possibly landing inside a stale
-    /// window. This only drives the log/flash side of things — the meter's
-    /// own "CLIP" indication is untouched.
+    /// Checks for a genuinely new clip (`AudioHandle::clip_edge_seq`'s
+    /// counter having moved on since we last looked) and, if
+    /// `AppConfig::clip_warning_enabled`, fires an alarm — rate-limited to
+    /// at most once per `ALARM_REPEAT_INTERVAL` so a burst of rapid
+    /// distinct clips (e.g. hard distortion) doesn't flash-storm.
+    /// Deliberately *not* driven by the sticky `clip_l`/`clip_r` latch
+    /// itself: that only clears when the operator clicks a level meter
+    /// (`meter_panel`), so using it here would keep re-alarming forever
+    /// every `ALARM_REPEAT_INTERVAL` even without any new clipping, for as
+    /// long as the operator happened not to have clicked to clear it yet —
+    /// this only drives the log/flash side of things, and the meter's own
+    /// "CLIP" indication (from that same latch) is untouched either way.
     fn check_clip_alarm(&mut self, now: Instant) {
-        let clipping = self.audio.take_clip_l() || self.audio.take_clip_r();
-        if !clipping {
-            self.last_clip_alarm_at = None;
+        let edge_seq = self.audio.clip_edge_seq();
+        if !self.cfg.clip_warning_enabled {
+            self.last_seen_clip_edge = edge_seq;
             return;
         }
-        if !self.cfg.clip_warning_enabled {
+        if edge_seq == self.last_seen_clip_edge {
             return;
         }
         let due = self
             .last_clip_alarm_at
             .is_none_or(|t| now.duration_since(t) >= ALARM_REPEAT_INTERVAL);
-        if due {
-            self.last_clip_alarm_at = Some(now);
-            self.fire_alarm(
-                now,
-                "Input clip detected on the selected channel(s)",
-                egui::Color32::from_rgb(0xff, 0x40, 0x40),
-            );
+        if !due {
+            // Leave `last_seen_clip_edge` behind so this edge is still
+            // "new" once the rate limit clears, rather than silently
+            // dropping it.
+            return;
         }
+        self.last_seen_clip_edge = edge_seq;
+        self.last_clip_alarm_at = Some(now);
+        self.fire_alarm(
+            now,
+            "Input clip detected on the selected channel(s)",
+            egui::Color32::from_rgb(0xff, 0x40, 0x40),
+        );
     }
 
     /// Checks whether the louder of the two selected inputs' VU readings has

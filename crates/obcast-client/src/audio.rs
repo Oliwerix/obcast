@@ -12,7 +12,7 @@
 //! same pattern as the server's playout engine
 //! (`obcast-server/src/playout.rs`).
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, RwLock};
 
@@ -124,6 +124,21 @@ pub struct AudioHandle {
     peak_r_bits: AtomicU32,
     clip_l: AtomicBool,
     clip_r: AtomicBool,
+    /// Monotonic count of clip *edges* (a transition from not-clipping to
+    /// clipping across processed audio blocks) — unlike `clip_l`/`clip_r`
+    /// above, this never resets on its own or via `reset_clips()`, so a GUI
+    /// polling at its own cadence can always tell "a genuinely new clip
+    /// happened since I last checked" apart from "the sticky LED flag is
+    /// still set from an old clip that was never acknowledged" by comparing
+    /// against a remembered value rather than reading a snapshot that could
+    /// have already reset itself between polls. See `clip_edge_seq()`.
+    clip_edge_seq: AtomicU64,
+    /// Internal-only: whether the block most recently processed contained a
+    /// clipping sample — compared against the current block's result to
+    /// detect the edge that bumps `clip_edge_seq`. Not exposed; the public
+    /// clip signals are `clip_l`/`clip_r` (sticky) and `clip_edge_seq`
+    /// (edge count).
+    clip_block_active: AtomicBool,
 
     /// ITU-R BS.1770-4 / EBU R128 K-weighted programme loudness (LUFS),
     /// combined across L/R — see `obcast_proto::loudness::Loudness`. Unlike
@@ -256,6 +271,13 @@ impl AudioHandle {
         self.clip_r.store(false, Ordering::Relaxed);
     }
 
+    /// See the `clip_edge_seq` field doc: a monotonic count of clip edges,
+    /// for a caller that needs to detect a genuinely new clip rather than a
+    /// still-set sticky flag.
+    pub fn clip_edge_seq(&self) -> u64 {
+        self.clip_edge_seq.load(Ordering::Relaxed)
+    }
+
     /// ITU-R BS.1770-4 K-weighted programme loudness in LUFS:
     /// `(momentary, short_term, integrated)`. Momentary covers the last
     /// 400 ms, short-term the last 3 s (both ungated); integrated is the
@@ -307,6 +329,8 @@ pub fn spawn(pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>) -> Arc<AudioHandle> 
         peak_r_bits: AtomicU32::new((-100.0f32).to_bits()),
         clip_l: AtomicBool::new(false),
         clip_r: AtomicBool::new(false),
+        clip_edge_seq: AtomicU64::new(0),
+        clip_block_active: AtomicBool::new(false),
         momentary_lufs_bits: AtomicU32::new((-100.0f32).to_bits()),
         short_term_lufs_bits: AtomicU32::new((-100.0f32).to_bits()),
         integrated_lufs_bits: AtomicU32::new((-100.0f32).to_bits()),
@@ -533,6 +557,7 @@ fn process_block(
     meters.scratch_l.clear();
     meters.scratch_r.clear();
 
+    let mut block_clipped = false;
     for f in 0..frames {
         let base = f * channels;
         let (mut l, mut r) = if mono {
@@ -544,9 +569,11 @@ fn process_block(
 
         if l.abs() >= CLIP_THRESHOLD {
             handle.clip_l.store(true, Ordering::Relaxed);
+            block_clipped = true;
         }
         if r.abs() >= CLIP_THRESHOLD {
             handle.clip_r.store(true, Ordering::Relaxed);
+            block_clipped = true;
         }
         l = l.clamp(-1.0, 1.0);
         r = r.clamp(-1.0, 1.0);
@@ -555,6 +582,16 @@ fn process_block(
         meters.scratch_r.push(r);
         out.push(l);
         out.push(r);
+    }
+    // A rising edge (this block clipped, the previous one didn't) bumps the
+    // edge count a caller can diff against to detect a genuinely new clip —
+    // see the `clip_edge_seq` field doc for why `clip_l`/`clip_r` alone
+    // can't do this (they're sticky until manually reset).
+    let was_active = handle
+        .clip_block_active
+        .swap(block_clipped, Ordering::Relaxed);
+    if block_clipped && !was_active {
+        handle.clip_edge_seq.fetch_add(1, Ordering::Relaxed);
     }
 
     // Feed the post-gain, post-clamp block through the IEC ballistics
