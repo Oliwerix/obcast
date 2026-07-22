@@ -96,7 +96,11 @@ impl SharedState {
     /// entries also latch `encoder_failed`, so a dead pipeline flips the GUI
     /// out of "live" without every call site needing to track that
     /// separately (see `take_encoder_failed`).
-    pub fn push_log(&self, level: LogLevel, message: impl Into<String>) {
+    /// Returns the `log_seq` value assigned to this entry, so a caller that
+    /// needs to refer back to this exact line later (e.g. the GUI's alarm
+    /// highlight — see `gui::app::ObcastApp::fire_alarm`) doesn't need a
+    /// second, racy lookup.
+    pub fn push_log(&self, level: LogLevel, message: impl Into<String>) -> u64 {
         let entry = LogEntry {
             at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -108,12 +112,13 @@ impl SharedState {
         if level == LogLevel::Error {
             self.encoder_failed.store(true, Ordering::Relaxed);
         }
-        self.log_seq.fetch_add(1, Ordering::Relaxed);
+        let seq = self.log_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let mut log = self.log.lock().unwrap();
         log.push_back(entry);
         while log.len() > LOG_CAP {
             log.pop_front();
         }
+        seq
     }
 
     /// Snapshot of the retained log, oldest first, for the GUI panel to

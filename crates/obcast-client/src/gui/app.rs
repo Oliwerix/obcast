@@ -116,29 +116,53 @@ struct ObcastApp {
     /// When the app started — an arbitrary but stable zero point for the
     /// connection-fail flash's continuous blink phase (see `flash_color`).
     created_at: Instant,
-    /// Whether either selected input was clipping as of the last frame —
-    /// used to detect the rising edge of a fresh clip, since the underlying
-    /// `AudioHandle::clip_l`/`clip_r` flags are a latch that stays set until
-    /// the operator clears it by clicking a level meter (`meter_panel`), not
-    /// a one-shot event. Without edge detection an unreset clip would keep
-    /// restarting the flash sequence every frame.
-    was_clipping: bool,
-    /// `Some(t)` while a clip-flash sequence is running (started at `t`);
-    /// cleared once `CLIP_FLASH_COUNT` on/off cycles have elapsed. See
-    /// `flash_color`.
-    clip_flash_started_at: Option<Instant>,
+    /// When the clip alarm (see `check_clip_alarm`) last fired. `None`
+    /// whenever the clip latch (`AudioHandle::clip_l`/`clip_r`) is currently
+    /// clear — a fresh clip after that always alarms immediately rather
+    /// than possibly landing inside a stale `ALARM_REPEAT_INTERVAL` window
+    /// left over from before the operator reset it.
+    last_clip_alarm_at: Option<Instant>,
+    /// When the input level (the louder of the two selected channels' VU
+    /// readings) most recently dropped below
+    /// `AppConfig::low_level_threshold_db` and has stayed there
+    /// continuously since — `None` whenever it's currently at or above
+    /// threshold. Lets `check_low_level_alarm` require a full
+    /// `ALARM_REPEAT_INTERVAL` of sustained low level before ever alarming,
+    /// rather than firing on a brief dip.
+    low_level_since: Option<Instant>,
+    /// When the low-level alarm last fired, mirroring `last_clip_alarm_at`.
+    last_low_level_alarm_at: Option<Instant>,
+    /// `Some((started, color))` while an alarm-triggered border flash is
+    /// running; cleared once `CLIP_FLASH_COUNT` on/off cycles have elapsed.
+    /// Takes priority over the connection-fail flash in `flash_color` since
+    /// an alarm is a discrete event that would otherwise get masked by an
+    /// ongoing link outage.
+    alarm_flash: Option<(Instant, egui::Color32)>,
+    /// `Some((seq, until))` while the log panel should keep the line with
+    /// `SharedState::push_log`'s returned `seq` highlighted, until the
+    /// `until` deadline — set by `fire_alarm`, read by `log_panel`.
+    alarm_highlight: Option<(u64, Instant)>,
 }
 
-/// How many full on/off blinks a fresh input clip flashes the window
-/// border.
+/// How many full on/off blinks a border flash (clip/low-level alarm, or the
+/// connection-fail flash) runs before an alarm flash stops on its own (the
+/// connection-fail flash instead just keeps going for as long as the link
+/// stays down).
 const CLIP_FLASH_COUNT: u32 = 4;
-/// Duration of each on or off half-cycle of a border flash (clip or
-/// connection-fail).
+/// Duration of each on or off half-cycle of a border flash.
 const FLASH_HALF_PERIOD: Duration = Duration::from_millis(200);
 /// `link_panel`'s "Buffer" estimate, below which a connection failure
 /// flashes red instead of yellow — the point past which dropout is close
 /// enough to demand more urgency than a plain heads-up.
 const FLASH_BUFFER_THRESHOLD_MS: u32 = 45_000;
+/// How often an unresolved alarm condition re-fires (flash + log again) for
+/// as long as it stays unresolved. Also how long a low input level must
+/// persist before it first fires at all (the clip alarm has no such initial
+/// debounce — a clip is unambiguous the instant it happens).
+const ALARM_REPEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// How long a freshly-fired alarm's log line stays highlighted once the log
+/// panel is showing it.
+const ALARM_HIGHLIGHT_DURATION: Duration = Duration::from_secs(10);
 
 /// How far back the Link panel's rolling graphs look.
 const HISTORY_WINDOW: Duration = Duration::from_secs(60);
@@ -189,8 +213,11 @@ impl ObcastApp {
             buffer_quality_history: VecDeque::new(),
             history_sampled_at: None,
             created_at: Instant::now(),
-            was_clipping: false,
-            clip_flash_started_at: None,
+            last_clip_alarm_at: None,
+            low_level_since: None,
+            last_low_level_alarm_at: None,
+            alarm_flash: None,
+            alarm_highlight: None,
         }
     }
 
@@ -872,6 +899,51 @@ impl ObcastApp {
                 self.audio.reset_integrated_lufs();
             }
         });
+
+        ui.separator();
+        self.alarms_panel(ui);
+    }
+
+    /// Toggles for the two input-level alarms (see `check_clip_alarm`/
+    /// `check_low_level_alarm`): a clip warning (on by default — clipping
+    /// is always a fault) and a sustained-low-level warning (off by
+    /// default — a quiet input is often intentional, e.g. a pause between
+    /// segments, so it'd otherwise nag through normal operation).
+    fn alarms_panel(&mut self, ui: &mut egui::Ui) {
+        let repeat_secs = ALARM_REPEAT_INTERVAL.as_secs();
+        ui.heading("Alarms");
+        if ui
+            .checkbox(&mut self.cfg.clip_warning_enabled, "Clip warning")
+            .on_hover_text(format!(
+                "Log and flash the window border when the selected inputs clip, repeating \
+                 every {repeat_secs}s until the meter's clip indication is cleared.",
+            ))
+            .changed()
+        {
+            self.persist_config();
+        }
+
+        ui.horizontal(|ui| {
+            let low_level_resp = ui
+                .checkbox(
+                    &mut self.cfg.low_level_warning_enabled,
+                    "Low input level warning, below",
+                )
+                .on_hover_text(format!(
+                    "Log and flash the window border when the input level stays below the \
+                     threshold for {repeat_secs}s, repeating every {repeat_secs}s until it \
+                     recovers.",
+                ));
+            let threshold_resp = ui.add_enabled(
+                self.cfg.low_level_warning_enabled,
+                egui::DragValue::new(&mut self.cfg.low_level_threshold_db)
+                    .range(-90.0..=0.0)
+                    .suffix(" dB"),
+            );
+            if low_level_resp.changed() || threshold_resp.changed() {
+                self.persist_config();
+            }
+        });
     }
 
     /// Link health at a glance: how much safety buffer is left, how hard
@@ -1119,7 +1191,14 @@ impl ObcastApp {
         });
         ui.separator();
 
+        let now = Instant::now();
+        if self.alarm_highlight.is_some_and(|(_, until)| now >= until) {
+            self.alarm_highlight = None;
+        }
+        let highlighted_seq = self.alarm_highlight.map(|(seq, _)| seq);
+
         let entries = self.shared.recent_log();
+        let total_seq = self.shared.log_seq();
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .auto_shrink([false, false])
@@ -1127,8 +1206,10 @@ impl ObcastApp {
                 if entries.is_empty() {
                     ui.label("(no log entries yet)");
                 }
-                for entry in &entries {
-                    log_line(ui, entry);
+                let n = entries.len() as u64;
+                for (i, entry) in entries.iter().enumerate() {
+                    let seq = total_seq - (n - 1 - i as u64);
+                    log_line(ui, entry, highlighted_seq == Some(seq));
                 }
             });
     }
@@ -1151,30 +1232,106 @@ impl ObcastApp {
         Some((buffer_ms, age >= crate::shared::STALE_AFTER))
     }
 
-    /// The window-border flash color for this frame, if any. A fresh clip on
-    /// the selected inputs (edge-detected — see `was_clipping`) takes
-    /// priority and flashes `CLIP_FLASH_COUNT` times, since it's a discrete
-    /// event that would otherwise get masked by an ongoing link outage.
-    /// Once that's done (or never started), a currently-down link flashes
-    /// continuously for as long as the outage lasts — yellow while `Buffer`
-    /// still has `FLASH_BUFFER_THRESHOLD_MS` of headroom, red once it's
-    /// below that and dropout is close.
-    fn flash_color(&mut self, now: Instant) -> Option<egui::Color32> {
+    /// Checks the selected inputs' clip latch and, if
+    /// `AppConfig::clip_warning_enabled`, fires an alarm on a fresh clip and
+    /// again every `ALARM_REPEAT_INTERVAL` for as long as the latch stays
+    /// set. The latch (`AudioHandle::clip_l`/`clip_r`) only clears when the
+    /// operator clicks a level meter (`meter_panel`) — that same click also
+    /// resets `last_clip_alarm_at`, so a *new* clip right after a reset
+    /// alarms immediately instead of possibly landing inside a stale
+    /// window. This only drives the log/flash side of things — the meter's
+    /// own "CLIP" indication is untouched.
+    fn check_clip_alarm(&mut self, now: Instant) {
         let clipping = self.audio.take_clip_l() || self.audio.take_clip_r();
-        if clipping && !self.was_clipping {
-            self.clip_flash_started_at = Some(now);
+        if !clipping {
+            self.last_clip_alarm_at = None;
+            return;
         }
-        self.was_clipping = clipping;
+        if !self.cfg.clip_warning_enabled {
+            return;
+        }
+        let due = self
+            .last_clip_alarm_at
+            .is_none_or(|t| now.duration_since(t) >= ALARM_REPEAT_INTERVAL);
+        if due {
+            self.last_clip_alarm_at = Some(now);
+            self.fire_alarm(
+                now,
+                "Input clip detected on the selected channel(s)",
+                egui::Color32::from_rgb(0xff, 0x40, 0x40),
+            );
+        }
+    }
 
-        if let Some(started) = self.clip_flash_started_at {
+    /// Checks whether the louder of the two selected inputs' VU readings has
+    /// been continuously below `AppConfig::low_level_threshold_db` for a
+    /// full `ALARM_REPEAT_INTERVAL` and, if
+    /// `AppConfig::low_level_warning_enabled`, fires an alarm — then
+    /// re-fires every `ALARM_REPEAT_INTERVAL` for as long as the level
+    /// stays under, same cadence as the clip alarm.
+    fn check_low_level_alarm(&mut self, now: Instant) {
+        if !self.cfg.low_level_warning_enabled {
+            self.low_level_since = None;
+            return;
+        }
+        let ((vu_l, _), (vu_r, _)) = self.audio.meters();
+        if vu_l.max(vu_r) >= self.cfg.low_level_threshold_db {
+            self.low_level_since = None;
+            return;
+        }
+        let since = *self.low_level_since.get_or_insert(now);
+        if now.duration_since(since) < ALARM_REPEAT_INTERVAL {
+            return;
+        }
+        let due = self
+            .last_low_level_alarm_at
+            .is_none_or(|t| now.duration_since(t) >= ALARM_REPEAT_INTERVAL);
+        if due {
+            self.last_low_level_alarm_at = Some(now);
+            self.fire_alarm(
+                now,
+                format!(
+                    "Input level below {:.0} dB for {}s",
+                    self.cfg.low_level_threshold_db,
+                    ALARM_REPEAT_INTERVAL.as_secs()
+                ),
+                egui::Color32::from_rgb(0x3a, 0x7c, 0xd9),
+            );
+        }
+    }
+
+    /// Common side effects of any alarm firing: logs `message` at `Warn`,
+    /// starts a `CLIP_FLASH_COUNT`-cycle border flash in `color`, and forces
+    /// the log panel open with this line highlighted for
+    /// `ALARM_HIGHLIGHT_DURATION`.
+    fn fire_alarm(&mut self, now: Instant, message: impl Into<String>, color: egui::Color32) {
+        let seq = self.shared.push_log(LogLevel::Warn, message);
+        self.alarm_flash = Some((now, color));
+        self.show_log = true;
+        self.alarm_highlight = Some((seq, now + ALARM_HIGHLIGHT_DURATION));
+    }
+
+    /// The window-border flash color for this frame, if any. An alarm
+    /// (clip or low-level, see `check_clip_alarm`/`check_low_level_alarm`)
+    /// takes priority and flashes `CLIP_FLASH_COUNT` times, since it's a
+    /// discrete event that would otherwise get masked by an ongoing link
+    /// outage. Once that's done (or no alarm fired), a currently-down link
+    /// flashes continuously for as long as the outage lasts — yellow while
+    /// `Buffer` still has `FLASH_BUFFER_THRESHOLD_MS` of headroom, red once
+    /// it's below that and dropout is close.
+    fn flash_color(&mut self, now: Instant) -> Option<egui::Color32> {
+        self.check_clip_alarm(now);
+        self.check_low_level_alarm(now);
+
+        if let Some((started, color)) = self.alarm_flash {
             let elapsed = now.duration_since(started).as_secs_f32();
             let half_period = FLASH_HALF_PERIOD.as_secs_f32();
             let half_periods_elapsed = (elapsed / half_period) as u32;
             if half_periods_elapsed < CLIP_FLASH_COUNT * 2 {
                 let on = half_periods_elapsed.is_multiple_of(2);
-                return on.then_some(egui::Color32::from_rgb(0xff, 0x40, 0x40));
+                return on.then_some(color);
             }
-            self.clip_flash_started_at = None;
+            self.alarm_flash = None;
         }
 
         let (buffer_ms, link_down) = self.buffer_estimate()?;
@@ -1264,24 +1421,36 @@ impl eframe::App for ObcastApp {
 }
 
 /// One row of the log panel: wall-clock time, a color-coded level tag, and
-/// the message.
-fn log_line(ui: &mut egui::Ui, entry: &LogEntry) {
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format_log_time(entry.at_ms))
-                .monospace()
-                .small()
-                .color(egui::Color32::GRAY),
-        );
-        ui.colored_label(
-            log_level_color(entry.level),
-            egui::RichText::new(log_level_tag(entry.level))
-                .monospace()
-                .small()
-                .strong(),
-        );
-        ui.label(&entry.message);
-    });
+/// the message — optionally wrapped in a highlighted frame while an alarm
+/// event points at this exact line (see `ObcastApp::alarm_highlight`).
+fn log_line(ui: &mut egui::Ui, entry: &LogEntry, highlighted: bool) {
+    let row = |ui: &mut egui::Ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format_log_time(entry.at_ms))
+                    .monospace()
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            ui.colored_label(
+                log_level_color(entry.level),
+                egui::RichText::new(log_level_tag(entry.level))
+                    .monospace()
+                    .small()
+                    .strong(),
+            );
+            ui.label(&entry.message);
+        });
+    };
+    if highlighted {
+        egui::Frame::default()
+            .fill(egui::Color32::from_rgba_unmultiplied(0xe8, 0xc5, 0x2a, 60))
+            .corner_radius(3.0)
+            .inner_margin(3)
+            .show(ui, row);
+    } else {
+        row(ui);
+    }
 }
 
 /// `HH:MM:SS`, UTC-based (epoch millis are wall-clock, but converting to the
