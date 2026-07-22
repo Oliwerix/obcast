@@ -24,7 +24,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -252,6 +252,19 @@ pub struct PlayoutHandle {
     /// started/sought). See `fed_seq()` and `ServerState::PlayoutStatus::fed_seq`
     /// for why the upgrade scheduler needs this rather than `position_seq`.
     fed_seq: AtomicI64,
+    /// Bumped by the engine command loop on every `Start`/`Seek` to ask the
+    /// output callback to drop whatever's currently sitting in the ring
+    /// buffer — see `flush_ring_and_pending`'s doc comment for why a seek
+    /// needs this in addition to restarting the decoder session (killing the
+    /// decoder stops *new* stale writes, but doesn't touch bytes it already
+    /// pushed before the jump, which would otherwise keep draining out of
+    /// the speaker for up to `RING_SEGMENTS` worth of audio after a seek).
+    flush_generation: AtomicU64,
+    /// Set by the output callback to the last `flush_generation` it actually
+    /// cleared the ring for — `flush_ring_and_pending` polls this to know
+    /// when it's safe to let a freshly spawned decoder session start writing
+    /// again without its first samples getting wiped by a late flush.
+    flushed_generation: AtomicU64,
     cmd_tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
@@ -608,6 +621,35 @@ fn teardown_decoder_session(session: DecoderSession) -> ringbuf::HeapProd<f32> {
     })
 }
 
+/// Clears the ring buffer's currently-queued audio plus the matching
+/// `pending` seq-tracking queue, for `Start`/`Seek`. Killing the old decoder
+/// session (see `teardown_decoder_session`, called by the caller just before
+/// this) stops any *new* stale writes, but does nothing about bytes it
+/// already pushed before the jump — those would otherwise sit in the ring
+/// and keep draining out to the speaker for up to `RING_SEGMENTS` worth of
+/// audio after the jump, which is exactly the "seek starts playing the new
+/// position, then jumps back to the old one" bug this exists to fix (the
+/// stale entries in `pending` would also keep overwriting `position_seq`
+/// back to the pre-seek value as that stale audio drains, since
+/// `drain_pending` runs off whatever's at the front of the queue).
+///
+/// The ring's consumer half lives only inside the cpal output callback
+/// closure (see `run_engine`), so this can't clear it directly from the
+/// engine command loop — it bumps `flush_generation` and the callback
+/// performs the actual `consumer.clear()` on its next invocation, acking via
+/// `flushed_generation`. Blocks briefly (bounded by `deadline`, since a
+/// paused/stalled output device would otherwise never invoke the callback
+/// at all) so the caller's subsequent fresh decoder session can't race the
+/// flush and have its own first samples wiped along with the stale ones.
+fn flush_ring_and_pending(handle: &Arc<PlayoutHandle>) {
+    handle.pending.lock().unwrap().clear();
+    let target = handle.flush_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while handle.flushed_generation.load(Ordering::Relaxed) < target && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Tears down any existing decoder session and starts a fresh one — used by
 /// `Start`/`Seek` (a discontinuity the old session's buffered state can't
 /// straddle) and by the feed loop when a stdin write fails (the decoder
@@ -687,6 +729,8 @@ pub fn spawn(
         pending: std::sync::Mutex::new(VecDeque::new()),
         playing_rung: AtomicI32::new(-1),
         fed_seq: AtomicI64::new(-1),
+        flush_generation: AtomicU64::new(0),
+        flushed_generation: AtomicU64::new(0),
         cmd_tx,
     });
 
@@ -790,9 +834,22 @@ fn run_engine(
     // slice without allocating on the real-time audio thread.
     let mut scratch_l: Vec<f32> = Vec::new();
     let mut scratch_r: Vec<f32> = Vec::new();
+    // Last `flush_generation` this callback has already acted on — see
+    // `flush_ring_and_pending`. Checked unconditionally (even while the test
+    // tone is active) so the ack always stays in sync with what the engine
+    // command loop asked for, regardless of which branch below runs.
+    let mut last_flush_gen: u64 = 0;
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
+            let want_flush = volume_handle.flush_generation.load(Ordering::Relaxed);
+            if want_flush != last_flush_gen {
+                consumer.clear();
+                last_flush_gen = want_flush;
+                volume_handle
+                    .flushed_generation
+                    .store(want_flush, Ordering::Relaxed);
+            }
             if volume_handle.test_tone.load(Ordering::Relaxed) {
                 // Test tone bypasses the segment ring buffer entirely — it's
                 // a hardware-output wiring check, independent of DVR/decode.
@@ -920,6 +977,14 @@ fn run_engine(
                 // callback will clear this on its first full buffer.
                 handle.underrun.store(true, Ordering::Relaxed);
                 pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
+                if let Some(old) = session.take() {
+                    producer_holder = Some(teardown_decoder_session(old));
+                }
+                // `flush_ring_and_pending` needs the output callback to
+                // actually run in order to ack the flush — a Start right
+                // after Stop finds the stream paused, so `play()` first.
+                let _ = stream.play();
+                flush_ring_and_pending(&handle);
                 restart_decoder_session(
                     &mut session,
                     &mut producer_holder,
@@ -927,7 +992,6 @@ fn run_engine(
                     pending_skip_samples,
                     &handle,
                 );
-                let _ = stream.play();
                 tracing::info!(seq = position, skip_ms, "playout started");
             }
             Ok(EngineCommand::Stop) => {
@@ -975,8 +1039,20 @@ fn run_engine(
                 // A seek is a discontinuity in the byte stream fed to the
                 // decoder, so the old session (mid-decode of the pre-seek
                 // position) must go — restart fresh rather than let stale
-                // audio for the old position keep draining out of it.
+                // audio for the old position keep draining out of it. The
+                // ring buffer and `pending` need the same treatment (see
+                // `flush_ring_and_pending`): otherwise audio already decoded
+                // for the pre-seek position, still sitting in the ring,
+                // keeps draining out *after* the jump — audibly playing the
+                // new position for an instant and then "jumping back" to
+                // the old one as that stale backlog (and `pending`'s
+                // matching seq entries, which `drain_pending` reads
+                // `position_seq` off of) works its way through.
                 pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
+                if let Some(old) = session.take() {
+                    producer_holder = Some(teardown_decoder_session(old));
+                }
+                flush_ring_and_pending(&handle);
                 restart_decoder_session(
                     &mut session,
                     &mut producer_holder,
