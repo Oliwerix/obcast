@@ -854,7 +854,13 @@ fn run_engine(
     // (`ring_segments` here, threaded in from `main.rs`) trading resilience
     // to that kind of hiccup, and ingest-to-audible latency, against each
     // other — a shallower ring means less headroom but faster time-to-air;
-    // default is 4 segments (8s at the 2s default).
+    // default is 4 segments (8s at the 2s default). A permanent (not
+    // transient) "buffer underrun" stall was once mistaken for insufficient
+    // ring depth and briefly fixed by raising this default — confirmed live
+    // that it wasn't: the actual cause was `EngineCommand::Start` never
+    // calling `stream.play()` on a stream's first-ever start (see its
+    // handler in `run_engine`), so no ring depth could have helped since the
+    // output callback was never running at all.
     let segment_samples = (segment_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
     let ring = HeapRb::<f32>::new(segment_samples * ring_segments.max(1));
     let (producer, mut consumer) = ring.split();
@@ -1029,6 +1035,20 @@ fn run_engine(
                 // actually run in order to unblock a stuck reader thread and
                 // ack the flush — a Start right after Stop finds the stream
                 // paused, so it plays the stream first (see its doc comment).
+                // But `teardown_session_safely` no-ops entirely when there's
+                // no prior session to tear down — which is exactly a stream's
+                // very first `Start` in its whole lifetime, so that call
+                // alone never actually plays the stream in that case. Without
+                // this explicit, unconditional `play()`, cpal's stream stayed
+                // in whatever paused state it was constructed in and never
+                // once invoked its output callback — so the ring/decoder
+                // pipeline backed up and blocked permanently on the first
+                // feed, `position_seq` never advanced, and playout reported
+                // a permanent "stalled" with no way to recover (confirmed
+                // live: reproduced with a real segment feed and a real
+                // hardware sink — increasing the ring buffer depth did
+                // nothing, since the stream was never actually running).
+                let _ = stream.play();
                 teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
                 restart_decoder_session(
                     &mut session,
