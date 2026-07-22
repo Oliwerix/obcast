@@ -38,6 +38,27 @@ use obcast_proto::state::{PlayoutState, RungId, Seq};
 
 use crate::config::AudioConfig;
 use crate::logs::LogSink;
+
+/// Raises the *calling* OS thread to the platform's highest scheduling
+/// priority. Must be called from the real cpal output callback thread
+/// itself, not the engine thread that builds the stream — `cpal` creates
+/// that thread internally, so there's no `JoinHandle` to set this on ahead
+/// of time; the callback's first invocation is the earliest point we're
+/// actually running on it. Best-effort: an unprivileged process can't raise
+/// its priority on Linux without `CAP_SYS_NICE` (the same permission
+/// wrinkle pro-audio apps like JACK solve with an `/etc/security/limits.d`
+/// audio-group entry, not something this binary can grant itself), so
+/// failure is logged once and playout keeps running at normal priority
+/// rather than treating it as fatal.
+fn elevate_audio_thread_priority() {
+    use thread_priority::{set_current_thread_priority, ThreadPriority};
+    if let Err(err) = set_current_thread_priority(ThreadPriority::Max) {
+        tracing::warn!(
+            ?err,
+            "failed to raise playout thread priority, continuing at normal priority"
+        );
+    }
+}
 use crate::store::DvrStore;
 
 /// `Device` only exposes its name via `description()` (or the `Display`
@@ -199,10 +220,14 @@ pub struct PlayoutHandle {
     /// Name of the output device actually opened, set once by the engine
     /// thread at startup; empty until then or if no device was found.
     device_name: RwLock<String>,
-    /// Set once, permanently, if the engine thread fails to open the audio
-    /// device/stream at startup — makes `playout_state()` report `Error`
-    /// instead of a silently-dead `Stopped` (see `run_engine`'s early-return
-    /// branches). `None` means playout initialized fine.
+    /// Set whenever the engine thread fails to open the audio device/stream
+    /// (at startup, or on any later reconnect attempt) or a live stream's
+    /// `err_fn` reports a runtime error (e.g. the device is unplugged/loses
+    /// power mid-session) — makes `playout_state()` report `Error` instead
+    /// of a silently-dead `Stopped`. Not permanent: `run_engine`'s outer
+    /// reconnect loop (`DEVICE_RETRY_INTERVAL`) keeps retrying and clears
+    /// this the moment the device/stream opens successfully again. `None`
+    /// means playout is currently fine.
     device_error: RwLock<Option<String>>,
     /// Human-readable reason for the most recent stall-causing event (decode
     /// failure, encoder-abandoned segment, or the stall-skip timeout);
@@ -691,6 +716,131 @@ fn teardown_session_safely(
     }
 }
 
+/// How long the reconnect loop waits between attempts to (re)open the output
+/// device after it's found missing at startup or a live stream errors out
+/// mid-session (e.g. an OB site's hardware mixer loses power or gets
+/// unplugged) — see `run_engine`'s outer loop. Short enough that a brief
+/// power-cycle (a few seconds) doesn't read as a long outage, long enough
+/// that a genuinely absent device doesn't spam retries/logs.
+const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Records a device/stream failure onto `handle` (so `playout_state()`
+/// reports `Error` and the reason reaches the web remote/GUI via `detail()`)
+/// and logs it: loudly (`tracing::error!` plus a pushed web-remote log line)
+/// the first time this outage starts, quietly (`tracing::warn!` only, no
+/// repeated web-remote spam for what could be a long outage) on every
+/// retry after that. `already_erroring` is the caller's per-outage flag,
+/// flipped here and reset back to `false` by `run_engine` once a reconnect
+/// attempt actually succeeds (see its "reconnected" log).
+fn report_device_error(handle: &Arc<PlayoutHandle>, msg: &str, already_erroring: &mut bool) {
+    *handle.device_error.write().unwrap() = Some(msg.to_string());
+    if *already_erroring {
+        tracing::warn!("{msg}; still retrying");
+        return;
+    }
+    *already_erroring = true;
+    tracing::error!("{msg}; will keep retrying every {DEVICE_RETRY_INTERVAL:?}");
+    handle.push_log(
+        LogLevel::Error,
+        format!("{msg}; will keep retrying every {DEVICE_RETRY_INTERVAL:?}"),
+    );
+}
+
+/// Applies only the state-bookkeeping side effects of an `EngineCommand` —
+/// used exclusively by `wait_for_retry_or_shutdown` while no output device
+/// is available, when there is no stream/decoder session to actually drive.
+/// Keeps `handle`/`current` consistent with what the operator asked for
+/// (e.g. a `Start` sent while the mixer is unplugged still records "should
+/// be playing from seq N") so `run_engine`'s reconnect path can resume
+/// correctly once the device reappears, without the operator having to
+/// reissue the command. `playout_state()` still reports `Error` throughout
+/// regardless of `running` here, since `device_error` stays set — this only
+/// keeps position/running bookkeeping honest, it never claims audio is
+/// actually flowing.
+fn apply_command_offline(
+    cmd: EngineCommand,
+    handle: &Arc<PlayoutHandle>,
+    current: &mut Option<Seq>,
+) {
+    match cmd {
+        EngineCommand::Start { position, .. } | EngineCommand::Seek { position, .. } => {
+            *current = Some(position);
+            handle
+                .position_seq
+                .store(position as i64, Ordering::Relaxed);
+            handle.playing_rung.store(-1, Ordering::Relaxed);
+            handle.fed_seq.store(-1, Ordering::Relaxed);
+            handle.running.store(true, Ordering::Relaxed);
+            handle.paused.store(false, Ordering::Relaxed);
+        }
+        EngineCommand::Stop => {
+            *current = None;
+            handle.running.store(false, Ordering::Relaxed);
+            handle.position_seq.store(-1, Ordering::Relaxed);
+            handle.playing_rung.store(-1, Ordering::Relaxed);
+            handle.fed_seq.store(-1, Ordering::Relaxed);
+        }
+        EngineCommand::Pause => handle.paused.store(true, Ordering::Relaxed),
+        EngineCommand::Resume => handle.paused.store(false, Ordering::Relaxed),
+        EngineCommand::SetVolume { gain } => {
+            handle
+                .volume_millis
+                .store((gain.max(0.0) * 1000.0) as u32, Ordering::Relaxed);
+        }
+        // No device to output a test tone to; ignored while offline.
+        EngineCommand::SetTestTone { .. } => {}
+    }
+}
+
+/// Waits up to `interval` for the next command, applying it offline (see
+/// `apply_command_offline`) as soon as it arrives rather than only after the
+/// full interval elapses — so e.g. an operator's `Stop` during an outage
+/// takes effect immediately instead of waiting out the retry clock. Returns
+/// `true` if the command channel disconnected (the owning `PlayoutHandle`
+/// was dropped, i.e. the stream is shutting down entirely), telling
+/// `run_engine` to stop retrying and return rather than looping forever
+/// after nobody can send it commands anymore.
+fn wait_for_retry_or_shutdown(
+    cmd_rx: &mut mpsc::UnboundedReceiver<EngineCommand>,
+    handle: &Arc<PlayoutHandle>,
+    current: &mut Option<Seq>,
+    interval: Duration,
+) -> bool {
+    let deadline = Instant::now() + interval;
+    loop {
+        match cmd_rx.try_recv() {
+            Ok(cmd) => apply_command_offline(cmd, handle, current),
+            Err(mpsc::error::TryRecvError::Disconnected) => return true,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Best-effort abandonment of a decoder session whose *output* device just
+/// failed out from under it — unlike `teardown_decoder_session` (used by
+/// `Start`/`Stop`/`Seek` via `teardown_session_safely`, which always has a
+/// live, functioning output callback available to drain the ring while
+/// tearing down), there is no running callback left here to unblock a reader
+/// thread that might be parked inside `push_all`, waiting for ring space
+/// that will now never free. Kills the ffmpeg process (so if the reader
+/// thread ever gets back to its `stdout.read()`, the pipe is closed) but
+/// deliberately does not join it — the thread either exits promptly (it
+/// wasn't blocked in `push_all` at the moment of failure) or is abandoned to
+/// run its course; a fresh ring/session is built for the next connection
+/// attempt regardless, so an abandoned thread's eventual fate doesn't affect
+/// subsequent playout. Only used on this hard-failure reconnect path — every
+/// other teardown site keeps using the safer, joined `teardown_session_safely`.
+fn abandon_decoder_session(session: DecoderSession) {
+    let DecoderSession { mut child, .. } = session;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Tears down any existing decoder session and starts a fresh one — used by
 /// `Start`/`Seek` (a discontinuity the old session's buffered state can't
 /// straddle) and by the feed loop when a stdin write fails (the decoder
@@ -808,193 +958,6 @@ fn run_engine(
     handle: Arc<PlayoutHandle>,
     mut cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
 ) {
-    let host = resolve_host(&audio_cfg.host);
-    let Some(device) = resolve_output_device(&host, &audio_cfg.device) else {
-        let msg = format!(
-            "no matching audio output device (host={:?}, device={:?})",
-            audio_cfg.host, audio_cfg.device
-        );
-        tracing::error!(host = %audio_cfg.host, device = %audio_cfg.device, "{msg}; playout disabled");
-        handle.push_log(LogLevel::Error, format!("{msg}; playout disabled"));
-        *handle.device_error.write().unwrap() = Some(msg);
-        drain_forever(&mut cmd_rx);
-        return;
-    };
-    *handle.device_name.write().unwrap() = device_name(&device);
-    let Ok(supported) = device.default_output_config() else {
-        let msg = "output device has no default config".to_string();
-        tracing::error!("{msg}; playout disabled");
-        handle.push_log(LogLevel::Error, format!("{msg}; playout disabled"));
-        *handle.device_error.write().unwrap() = Some(msg);
-        drain_forever(&mut cmd_rx);
-        return;
-    };
-    let sample_rate = supported.sample_rate();
-    handle.sample_rate.store(sample_rate, Ordering::Relaxed);
-    let config = cpal::StreamConfig {
-        channels: CHANNELS as u16,
-        sample_rate,
-        buffer_size: cpal::BufferSize::Default,
-    };
-
-    // Sized in segments: with the persistent decode session (see module
-    // docs and `DecoderSession`), how far ahead of playback ffmpeg can work
-    // is governed by pipe backpressure through this ring rather than a
-    // per-segment gate — feeding segments to its stdin blocks once the ring
-    // (and ffmpeg's own internal buffers) fill up. A deeper ring means more
-    // bytes can be decoded and queued ahead of the cpal callback's real-time
-    // consumption, which is what actually absorbs a transient slowdown (a
-    // loaded machine, a slow disk read for one segment) without an audible
-    // underrun — previously this was only 3 segments' worth (6s at the 2s
-    // default) and still not enough headroom to survive every hiccup, which
-    // surfaced as spurious "buffer underrun" stalls that recovered on their
-    // own once decode caught back up (confirmed live: both the client and
-    // server still had every segment on disk throughout, so it was never a
-    // data gap). Configurable via `OBCAST_PLAYOUT_RING_SEGMENTS`
-    // (`ring_segments` here, threaded in from `main.rs`) trading resilience
-    // to that kind of hiccup, and ingest-to-audible latency, against each
-    // other — a shallower ring means less headroom but faster time-to-air;
-    // default is 4 segments (8s at the 2s default). A permanent (not
-    // transient) "buffer underrun" stall was once mistaken for insufficient
-    // ring depth and briefly fixed by raising this default — confirmed live
-    // that it wasn't: the actual cause was `EngineCommand::Start` never
-    // calling `stream.play()` on a stream's first-ever start (see its
-    // handler in `run_engine`), so no ring depth could have helped since the
-    // output callback was never running at all.
-    let segment_samples = (segment_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
-    let ring = HeapRb::<f32>::new(segment_samples * ring_segments.max(1));
-    let (producer, mut consumer) = ring.split();
-    // Held by whichever side currently doesn't have a live decoder: the
-    // engine loop between sessions, or a `DecoderSession`'s reader thread
-    // while one is running. `teardown_decoder_session` always hands it back.
-    let mut producer_holder = Some(producer);
-    let mut session: Option<DecoderSession> = None;
-
-    let volume_handle = handle.clone();
-    let (test_tone_bounds, test_tone_total_samples) = build_test_tone_pattern(sample_rate);
-    // Only ever touched by this callback, so a plain (non-atomic) counter is
-    // enough; reset to 0 whenever test tone is off so re-enabling it always
-    // starts the pattern fresh from "both channels."
-    let mut test_tone_pos: u64 = 0;
-    // Persistent across callbacks: the 300 ms VU and 650 ms PPM time
-    // constants span many callbacks, so these must not reset each call.
-    let mut vu_l = obcast_proto::meter::Vu::new();
-    let mut vu_r = obcast_proto::meter::Vu::new();
-    let mut ppm_l = obcast_proto::meter::Ppm::new();
-    let mut ppm_r = obcast_proto::meter::Ppm::new();
-    let mut peak_l = obcast_proto::meter::Peak::new();
-    let mut peak_r = obcast_proto::meter::Peak::new();
-    // Reused each callback to hand the ballistics a contiguous per-channel
-    // slice without allocating on the real-time audio thread.
-    let mut scratch_l: Vec<f32> = Vec::new();
-    let mut scratch_r: Vec<f32> = Vec::new();
-    // Last `flush_generation` this callback has already acted on — see
-    // `flush_ring_and_pending`. Checked unconditionally (even while the test
-    // tone is active) so the ack always stays in sync with what the engine
-    // command loop asked for, regardless of which branch below runs.
-    let mut last_flush_gen: u64 = 0;
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [f32], _| {
-            let want_flush = volume_handle.flush_generation.load(Ordering::Relaxed);
-            if want_flush != last_flush_gen {
-                consumer.clear();
-                last_flush_gen = want_flush;
-                volume_handle
-                    .flushed_generation
-                    .store(want_flush, Ordering::Relaxed);
-            }
-            if volume_handle.test_tone.load(Ordering::Relaxed) {
-                // Test tone bypasses the segment ring buffer entirely — it's
-                // a hardware-output wiring check, independent of DVR/decode.
-                volume_handle.underrun.store(false, Ordering::Relaxed);
-                for frame in data.chunks_exact_mut(CHANNELS) {
-                    let (l, r) = test_tone_sample(test_tone_pos, sample_rate, &test_tone_bounds);
-                    frame[0] = l;
-                    frame[1] = r;
-                    test_tone_pos = (test_tone_pos + 1) % test_tone_total_samples;
-                }
-            } else {
-                test_tone_pos = 0;
-                let gain = volume_handle.volume();
-                let filled = consumer.pop_slice(data);
-                // A partial fill means the ring ran dry this callback — real
-                // audio, but not all of it; still an underrun, since some of
-                // `data` below gets zero-padded either way.
-                volume_handle
-                    .underrun
-                    .store(filled < data.len(), Ordering::Relaxed);
-                // Advance the reported position from what's actually
-                // draining out right now — only `filled` real samples, never
-                // the zero-padded underrun tail below (there's no decoded
-                // audio behind that padding to attribute to any seq).
-                volume_handle.drain_pending(filled);
-                for s in &mut data[..filled] {
-                    *s *= gain;
-                }
-                for s in &mut data[filled..] {
-                    *s = 0.0;
-                }
-            }
-
-            // Feed the whole post-gain buffer, including any zero-padded
-            // underrun tail — that silence is genuinely being output.
-            // `data` is interleaved L/R (CHANNELS == 2); deinterleave into
-            // scratch buffers so each channel gets its own ballistic.
-            scratch_l.clear();
-            scratch_r.clear();
-            for frame in data.chunks_exact(CHANNELS) {
-                scratch_l.push(frame[0]);
-                scratch_r.push(frame[1]);
-            }
-            vu_l.process(&scratch_l, sample_rate);
-            ppm_l.process(&scratch_l, sample_rate);
-            peak_l.process(&scratch_l, sample_rate);
-            vu_r.process(&scratch_r, sample_rate);
-            ppm_r.process(&scratch_r, sample_rate);
-            peak_r.process(&scratch_r, sample_rate);
-            volume_handle
-                .vu_l_bits
-                .store(vu_l.value_db().to_bits(), Ordering::Relaxed);
-            volume_handle
-                .vu_r_bits
-                .store(vu_r.value_db().to_bits(), Ordering::Relaxed);
-            volume_handle
-                .ppm_l_bits
-                .store(ppm_l.value_db().to_bits(), Ordering::Relaxed);
-            volume_handle
-                .ppm_r_bits
-                .store(ppm_r.value_db().to_bits(), Ordering::Relaxed);
-            volume_handle
-                .peak_l_bits
-                .store(peak_l.value_db().to_bits(), Ordering::Relaxed);
-            volume_handle
-                .peak_r_bits
-                .store(peak_r.value_db().to_bits(), Ordering::Relaxed);
-        },
-        {
-            let err_handle = handle.clone();
-            move |err| {
-                tracing::error!(error = %err, "playout stream error");
-                err_handle.push_log(LogLevel::Error, format!("playout stream error: {err}"));
-                *err_handle.device_error.write().unwrap() =
-                    Some(format!("output stream error: {err}"));
-            }
-        },
-        None,
-    );
-    let stream = match stream {
-        Ok(s) => s,
-        Err(err) => {
-            let msg = format!("failed to build output stream: {err}");
-            tracing::error!("{msg}; playout disabled");
-            handle.push_log(LogLevel::Error, format!("{msg}; playout disabled"));
-            *handle.device_error.write().unwrap() = Some(msg);
-            drain_forever(&mut cmd_rx);
-            return;
-        }
-    };
-
     let mut current: Option<Seq> = None;
     // When the current seq first became neither playable nor abandoned; reset
     // whenever the head moves (advance, seek, or a fresh start) so the clock
@@ -1009,47 +972,261 @@ fn run_engine(
     // itself only drops leading samples once per restart (see
     // `spawn_decoder_session`).
     let mut pending_skip_samples: usize = 0;
+    // Whether the device/stream is currently mid-outage — tracked across
+    // reconnect attempts so `report_device_error` only logs loudly (and
+    // pushes to the web remote log) once per outage onset rather than on
+    // every retry, and so a successful (re)open below knows to log
+    // "reconnected" rather than just "opened".
+    let mut already_erroring = false;
 
-    loop {
-        match cmd_rx.try_recv() {
-            Ok(EngineCommand::Start { position, skip_ms }) => {
-                current = Some(position);
-                stall_since = None;
-                *handle.stall_reason.write().unwrap() = None;
-                handle
-                    .position_seq
-                    .store(position as i64, Ordering::Relaxed);
-                // No rung confirmed draining yet for the new position —
-                // `drain_pending` sets this for real once audio for it
-                // actually reaches the output callback.
-                handle.playing_rung.store(-1, Ordering::Relaxed);
-                // Nothing fed yet at the new position either.
-                handle.fed_seq.store(-1, Ordering::Relaxed);
-                handle.running.store(true, Ordering::Relaxed);
-                handle.paused.store(false, Ordering::Relaxed);
-                // No audio has actually reached the ring yet; the output
-                // callback will clear this on its first full buffer.
-                handle.underrun.store(true, Ordering::Relaxed);
-                pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
-                // `teardown_session_safely` needs the output callback to
-                // actually run in order to unblock a stuck reader thread and
-                // ack the flush — a Start right after Stop finds the stream
-                // paused, so it plays the stream first (see its doc comment).
-                // But `teardown_session_safely` no-ops entirely when there's
-                // no prior session to tear down — which is exactly a stream's
-                // very first `Start` in its whole lifetime, so that call
-                // alone never actually plays the stream in that case. Without
-                // this explicit, unconditional `play()`, cpal's stream stayed
-                // in whatever paused state it was constructed in and never
-                // once invoked its output callback — so the ring/decoder
-                // pipeline backed up and blocked permanently on the first
-                // feed, `position_seq` never advanced, and playout reported
-                // a permanent "stalled" with no way to recover (confirmed
-                // live: reproduced with a real segment feed and a real
-                // hardware sink — increasing the ring buffer depth did
-                // nothing, since the stream was never actually running).
-                let _ = stream.play();
-                teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
+    // Outer reconnect loop: each iteration (re)resolves the configured host
+    // and device, builds a fresh ring buffer and output stream, and runs the
+    // command-processing inner loop until either the whole engine shuts down
+    // (command channel disconnected) or the output device fails — missing at
+    // open time, or the stream's `err_fn` firing mid-session (e.g. an OB
+    // site's hardware mixer losing power or being unplugged). `current` (and
+    // therefore the playout head) survives across a reconnect, so playout
+    // resumes from the same seq once the device comes back rather than
+    // requiring the operator to notice and re-issue `Start`.
+    'engine: loop {
+        let host = resolve_host(&audio_cfg.host);
+        let Some(device) = resolve_output_device(&host, &audio_cfg.device) else {
+            let msg = format!(
+                "no matching audio output device (host={:?}, device={:?})",
+                audio_cfg.host, audio_cfg.device
+            );
+            report_device_error(&handle, &msg, &mut already_erroring);
+            if wait_for_retry_or_shutdown(&mut cmd_rx, &handle, &mut current, DEVICE_RETRY_INTERVAL)
+            {
+                return;
+            }
+            continue 'engine;
+        };
+        *handle.device_name.write().unwrap() = device_name(&device);
+        let Ok(supported) = device.default_output_config() else {
+            let msg = "output device has no default config".to_string();
+            report_device_error(&handle, &msg, &mut already_erroring);
+            if wait_for_retry_or_shutdown(&mut cmd_rx, &handle, &mut current, DEVICE_RETRY_INTERVAL)
+            {
+                return;
+            }
+            continue 'engine;
+        };
+        let sample_rate = supported.sample_rate();
+        handle.sample_rate.store(sample_rate, Ordering::Relaxed);
+        let config = cpal::StreamConfig {
+            channels: CHANNELS as u16,
+            sample_rate,
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        // Sized in segments: with the persistent decode session (see module
+        // docs and `DecoderSession`), how far ahead of playback ffmpeg can work
+        // is governed by pipe backpressure through this ring rather than a
+        // per-segment gate — feeding segments to its stdin blocks once the ring
+        // (and ffmpeg's own internal buffers) fill up. A deeper ring means more
+        // bytes can be decoded and queued ahead of the cpal callback's real-time
+        // consumption, which is what actually absorbs a transient slowdown (a
+        // loaded machine, a slow disk read for one segment) without an audible
+        // underrun — previously this was only 3 segments' worth (6s at the 2s
+        // default) and still not enough headroom to survive every hiccup, which
+        // surfaced as spurious "buffer underrun" stalls that recovered on their
+        // own once decode caught back up (confirmed live: both the client and
+        // server still had every segment on disk throughout, so it was never a
+        // data gap). Configurable via `OBCAST_PLAYOUT_RING_SEGMENTS`
+        // (`ring_segments` here, threaded in from `main.rs`) trading resilience
+        // to that kind of hiccup, and ingest-to-audible latency, against each
+        // other — a shallower ring means less headroom but faster time-to-air;
+        // default is 4 segments (8s at the 2s default). A permanent (not
+        // transient) "buffer underrun" stall was once mistaken for insufficient
+        // ring depth and briefly fixed by raising this default — confirmed live
+        // that it wasn't: the actual cause was `EngineCommand::Start` never
+        // calling `stream.play()` on a stream's first-ever start (see its
+        // handler in `run_engine`), so no ring depth could have helped since the
+        // output callback was never running at all.
+        let segment_samples = (segment_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
+        let ring = HeapRb::<f32>::new(segment_samples * ring_segments.max(1));
+        let (producer, mut consumer) = ring.split();
+        // Held by whichever side currently doesn't have a live decoder: the
+        // engine loop between sessions, or a `DecoderSession`'s reader thread
+        // while one is running. `teardown_decoder_session` always hands it back.
+        let mut producer_holder = Some(producer);
+        let mut session: Option<DecoderSession> = None;
+
+        let volume_handle = handle.clone();
+        let (test_tone_bounds, test_tone_total_samples) = build_test_tone_pattern(sample_rate);
+        // Only ever touched by this callback, so a plain (non-atomic) counter is
+        // enough; reset to 0 whenever test tone is off so re-enabling it always
+        // starts the pattern fresh from "both channels."
+        let mut test_tone_pos: u64 = 0;
+        // Persistent across callbacks: the 300 ms VU and 650 ms PPM time
+        // constants span many callbacks, so these must not reset each call.
+        let mut vu_l = obcast_proto::meter::Vu::new();
+        let mut vu_r = obcast_proto::meter::Vu::new();
+        let mut ppm_l = obcast_proto::meter::Ppm::new();
+        let mut ppm_r = obcast_proto::meter::Ppm::new();
+        let mut peak_l = obcast_proto::meter::Peak::new();
+        let mut peak_r = obcast_proto::meter::Peak::new();
+        // Reused each callback to hand the ballistics a contiguous per-channel
+        // slice without allocating on the real-time audio thread.
+        let mut scratch_l: Vec<f32> = Vec::new();
+        let mut scratch_r: Vec<f32> = Vec::new();
+        // Last `flush_generation` this callback has already acted on — see
+        // `flush_ring_and_pending`. Checked unconditionally (even while the test
+        // tone is active) so the ack always stays in sync with what the engine
+        // command loop asked for, regardless of which branch below runs.
+        let mut last_flush_gen: u64 = 0;
+        // Flipped by the stream's err_fn (below) when cpal reports a runtime
+        // error on an otherwise-successfully-opened stream — e.g. the output
+        // device disappears mid-session. Checked by the inner command loop
+        // every tick so it can break out promptly and let the outer loop
+        // rebuild everything against a (hopefully by-then-reconnected) device,
+        // instead of leaving `PlayoutState::Error` stuck forever with no
+        // recovery path.
+        let stream_failed = Arc::new(AtomicBool::new(false));
+        // Checked once on the callback's first invocation only — see
+        // `elevate_audio_thread_priority`.
+        let mut priority_elevated = false;
+        let stream = device.build_output_stream(
+            config,
+            move |data: &mut [f32], _| {
+                if !priority_elevated {
+                    priority_elevated = true;
+                    elevate_audio_thread_priority();
+                }
+
+                let want_flush = volume_handle.flush_generation.load(Ordering::Relaxed);
+                if want_flush != last_flush_gen {
+                    consumer.clear();
+                    last_flush_gen = want_flush;
+                    volume_handle
+                        .flushed_generation
+                        .store(want_flush, Ordering::Relaxed);
+                }
+                if volume_handle.test_tone.load(Ordering::Relaxed) {
+                    // Test tone bypasses the segment ring buffer entirely — it's
+                    // a hardware-output wiring check, independent of DVR/decode.
+                    volume_handle.underrun.store(false, Ordering::Relaxed);
+                    for frame in data.chunks_exact_mut(CHANNELS) {
+                        let (l, r) =
+                            test_tone_sample(test_tone_pos, sample_rate, &test_tone_bounds);
+                        frame[0] = l;
+                        frame[1] = r;
+                        test_tone_pos = (test_tone_pos + 1) % test_tone_total_samples;
+                    }
+                } else {
+                    test_tone_pos = 0;
+                    let gain = volume_handle.volume();
+                    let filled = consumer.pop_slice(data);
+                    // A partial fill means the ring ran dry this callback — real
+                    // audio, but not all of it; still an underrun, since some of
+                    // `data` below gets zero-padded either way.
+                    volume_handle
+                        .underrun
+                        .store(filled < data.len(), Ordering::Relaxed);
+                    // Advance the reported position from what's actually
+                    // draining out right now — only `filled` real samples, never
+                    // the zero-padded underrun tail below (there's no decoded
+                    // audio behind that padding to attribute to any seq).
+                    volume_handle.drain_pending(filled);
+                    for s in &mut data[..filled] {
+                        *s *= gain;
+                    }
+                    for s in &mut data[filled..] {
+                        *s = 0.0;
+                    }
+                }
+
+                // Feed the whole post-gain buffer, including any zero-padded
+                // underrun tail — that silence is genuinely being output.
+                // `data` is interleaved L/R (CHANNELS == 2); deinterleave into
+                // scratch buffers so each channel gets its own ballistic.
+                scratch_l.clear();
+                scratch_r.clear();
+                for frame in data.chunks_exact(CHANNELS) {
+                    scratch_l.push(frame[0]);
+                    scratch_r.push(frame[1]);
+                }
+                vu_l.process(&scratch_l, sample_rate);
+                ppm_l.process(&scratch_l, sample_rate);
+                peak_l.process(&scratch_l, sample_rate);
+                vu_r.process(&scratch_r, sample_rate);
+                ppm_r.process(&scratch_r, sample_rate);
+                peak_r.process(&scratch_r, sample_rate);
+                volume_handle
+                    .vu_l_bits
+                    .store(vu_l.value_db().to_bits(), Ordering::Relaxed);
+                volume_handle
+                    .vu_r_bits
+                    .store(vu_r.value_db().to_bits(), Ordering::Relaxed);
+                volume_handle
+                    .ppm_l_bits
+                    .store(ppm_l.value_db().to_bits(), Ordering::Relaxed);
+                volume_handle
+                    .ppm_r_bits
+                    .store(ppm_r.value_db().to_bits(), Ordering::Relaxed);
+                volume_handle
+                    .peak_l_bits
+                    .store(peak_l.value_db().to_bits(), Ordering::Relaxed);
+                volume_handle
+                    .peak_r_bits
+                    .store(peak_r.value_db().to_bits(), Ordering::Relaxed);
+            },
+            {
+                let err_handle = handle.clone();
+                let err_flag = stream_failed.clone();
+                move |err| {
+                    tracing::error!(error = %err, "playout stream error");
+                    err_handle.push_log(LogLevel::Error, format!("playout stream error: {err}"));
+                    *err_handle.device_error.write().unwrap() =
+                        Some(format!("output stream error: {err}"));
+                    err_flag.store(true, Ordering::Relaxed);
+                }
+            },
+            None,
+        );
+        let stream = match stream {
+            Ok(s) => s,
+            Err(err) => {
+                let msg = format!("failed to build output stream: {err}");
+                report_device_error(&handle, &msg, &mut already_erroring);
+                if wait_for_retry_or_shutdown(
+                    &mut cmd_rx,
+                    &handle,
+                    &mut current,
+                    DEVICE_RETRY_INTERVAL,
+                ) {
+                    return;
+                }
+                continue 'engine;
+            }
+        };
+
+        if already_erroring {
+            tracing::info!("audio output device reconnected, resuming playout");
+            handle.push_log(
+                LogLevel::Info,
+                "audio output device reconnected, resuming playout".to_string(),
+            );
+            already_erroring = false;
+        }
+        handle.device_error.write().unwrap().take();
+
+        // Resume automatically if playout was (or was asked to be, during the
+        // outage — see `apply_command_offline`) running before this (re)connect,
+        // rather than leaving the operator to notice and press Start again.
+        handle.pending.lock().unwrap().clear();
+        if handle.running.load(Ordering::Relaxed) {
+            if let Some(seq) = current {
+                handle.position_seq.store(seq as i64, Ordering::Relaxed);
+            }
+            handle.playing_rung.store(-1, Ordering::Relaxed);
+            handle.fed_seq.store(-1, Ordering::Relaxed);
+            handle.underrun.store(true, Ordering::Relaxed);
+            stall_since = None;
+            *handle.stall_reason.write().unwrap() = None;
+            let _ = stream.play();
+            if current.is_some() {
                 restart_decoder_session(
                     &mut session,
                     &mut producer_holder,
@@ -1057,278 +1234,335 @@ fn run_engine(
                     pending_skip_samples,
                     &handle,
                 );
-                tracing::info!(seq = position, skip_ms, "playout started");
+                pending_skip_samples = 0;
             }
-            Ok(EngineCommand::Stop) => {
-                current = None;
-                stall_since = None;
-                *handle.stall_reason.write().unwrap() = None;
-                handle.running.store(false, Ordering::Relaxed);
-                handle.position_seq.store(-1, Ordering::Relaxed);
-                handle.playing_rung.store(-1, Ordering::Relaxed);
-                handle.fed_seq.store(-1, Ordering::Relaxed);
-                // Silence the meters rather than leaving them frozen at
-                // whatever they last read while playing — the audio callback
-                // that would otherwise update them stops firing once the
-                // stream is paused below.
-                let silence_bits = obcast_proto::meter::linear_to_dbfs(0.0).to_bits();
-                handle.vu_l_bits.store(silence_bits, Ordering::Relaxed);
-                handle.vu_r_bits.store(silence_bits, Ordering::Relaxed);
-                handle.ppm_l_bits.store(silence_bits, Ordering::Relaxed);
-                handle.ppm_r_bits.store(silence_bits, Ordering::Relaxed);
-                handle.peak_l_bits.store(silence_bits, Ordering::Relaxed);
-                handle.peak_r_bits.store(silence_bits, Ordering::Relaxed);
-                teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
-                let _ = stream.pause();
-                tracing::info!("playout stopped");
+        } else {
+            let _ = stream.pause();
+        }
+
+        loop {
+            if stream_failed.load(Ordering::Relaxed) {
+                tracing::warn!("playout output device failed, attempting to reconnect");
+                if let Some(s) = session.take() {
+                    abandon_decoder_session(s);
+                }
+                continue 'engine;
             }
-            Ok(EngineCommand::Pause) => {
-                handle.paused.store(true, Ordering::Relaxed);
-                let _ = stream.pause();
-            }
-            Ok(EngineCommand::Resume) => {
-                handle.paused.store(false, Ordering::Relaxed);
-                let _ = stream.play();
-            }
-            Ok(EngineCommand::Seek { position, skip_ms }) => {
-                current = Some(position);
-                stall_since = None;
-                *handle.stall_reason.write().unwrap() = None;
-                handle
-                    .position_seq
-                    .store(position as i64, Ordering::Relaxed);
-                handle.playing_rung.store(-1, Ordering::Relaxed);
-                handle.fed_seq.store(-1, Ordering::Relaxed);
-                // A seek is a discontinuity in the byte stream fed to the
-                // decoder, so the old session (mid-decode of the pre-seek
-                // position) must go — restart fresh rather than let stale
-                // audio for the old position keep draining out of it. The
-                // ring buffer and `pending` need the same treatment (see
-                // `flush_ring_and_pending`): otherwise audio already decoded
-                // for the pre-seek position, still sitting in the ring,
-                // keeps draining out *after* the jump — audibly playing the
-                // new position for an instant and then "jumping back" to
-                // the old one as that stale backlog (and `pending`'s
-                // matching seq entries, which `drain_pending` reads
-                // `position_seq` off of) works its way through.
-                //
-                // If the engine was already paused when this seek arrived,
-                // the old session's reader thread could easily be sitting
-                // blocked inside `push_all` (nothing was draining the ring
-                // while paused) — `teardown_session_safely` (unlike the raw
-                // `teardown_decoder_session` this used to call directly)
-                // makes sure the stream actually runs long enough to unblock
-                // and join it, then restores the paused state afterward, so
-                // a paused seek stays paused rather than starting to play
-                // audibly or wedging the whole engine command loop forever
-                // (see its doc comment — this was the "pause, then move the
-                // playhead, and it locks up for good" bug).
-                pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
-                teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
-                restart_decoder_session(
-                    &mut session,
-                    &mut producer_holder,
-                    sample_rate,
-                    pending_skip_samples,
-                    &handle,
-                );
-                tracing::info!(seq = position, skip_ms, "playout seek");
-            }
-            Ok(EngineCommand::SetVolume { gain }) => {
-                handle
-                    .volume_millis
-                    .store((gain.max(0.0) * 1000.0) as u32, Ordering::Relaxed);
-            }
-            Ok(EngineCommand::SetTestTone { enabled }) => {
-                handle.test_tone.store(enabled, Ordering::Relaxed);
-                if enabled {
-                    // The stream may not be playing at all yet (nothing ever
-                    // `Start`ed) — the test tone works independent of normal
-                    // playout, so it must (re)start the stream itself.
+            match cmd_rx.try_recv() {
+                Ok(EngineCommand::Start { position, skip_ms }) => {
+                    current = Some(position);
+                    stall_since = None;
+                    *handle.stall_reason.write().unwrap() = None;
+                    handle
+                        .position_seq
+                        .store(position as i64, Ordering::Relaxed);
+                    // No rung confirmed draining yet for the new position —
+                    // `drain_pending` sets this for real once audio for it
+                    // actually reaches the output callback.
+                    handle.playing_rung.store(-1, Ordering::Relaxed);
+                    // Nothing fed yet at the new position either.
+                    handle.fed_seq.store(-1, Ordering::Relaxed);
+                    handle.running.store(true, Ordering::Relaxed);
+                    handle.paused.store(false, Ordering::Relaxed);
+                    // No audio has actually reached the ring yet; the output
+                    // callback will clear this on its first full buffer.
+                    handle.underrun.store(true, Ordering::Relaxed);
+                    pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
+                    // `teardown_session_safely` needs the output callback to
+                    // actually run in order to unblock a stuck reader thread and
+                    // ack the flush — a Start right after Stop finds the stream
+                    // paused, so it plays the stream first (see its doc comment).
+                    // But `teardown_session_safely` no-ops entirely when there's
+                    // no prior session to tear down — which is exactly a stream's
+                    // very first `Start` in its whole lifetime, so that call
+                    // alone never actually plays the stream in that case. Without
+                    // this explicit, unconditional `play()`, cpal's stream stayed
+                    // in whatever paused state it was constructed in and never
+                    // once invoked its output callback — so the ring/decoder
+                    // pipeline backed up and blocked permanently on the first
+                    // feed, `position_seq` never advanced, and playout reported
+                    // a permanent "stalled" with no way to recover (confirmed
+                    // live: reproduced with a real segment feed and a real
+                    // hardware sink — increasing the ring buffer depth did
+                    // nothing, since the stream was never actually running).
                     let _ = stream.play();
-                } else if !handle.running.load(Ordering::Relaxed) {
-                    // Only pause if normal playout isn't also active; don't
-                    // stop real audio just because the tone was turned off.
+                    teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
+                    restart_decoder_session(
+                        &mut session,
+                        &mut producer_holder,
+                        sample_rate,
+                        pending_skip_samples,
+                        &handle,
+                    );
+                    tracing::info!(seq = position, skip_ms, "playout started");
+                }
+                Ok(EngineCommand::Stop) => {
+                    current = None;
+                    stall_since = None;
+                    *handle.stall_reason.write().unwrap() = None;
+                    handle.running.store(false, Ordering::Relaxed);
+                    handle.position_seq.store(-1, Ordering::Relaxed);
+                    handle.playing_rung.store(-1, Ordering::Relaxed);
+                    handle.fed_seq.store(-1, Ordering::Relaxed);
+                    // Silence the meters rather than leaving them frozen at
+                    // whatever they last read while playing — the audio callback
+                    // that would otherwise update them stops firing once the
+                    // stream is paused below.
+                    let silence_bits = obcast_proto::meter::linear_to_dbfs(0.0).to_bits();
+                    handle.vu_l_bits.store(silence_bits, Ordering::Relaxed);
+                    handle.vu_r_bits.store(silence_bits, Ordering::Relaxed);
+                    handle.ppm_l_bits.store(silence_bits, Ordering::Relaxed);
+                    handle.ppm_r_bits.store(silence_bits, Ordering::Relaxed);
+                    handle.peak_l_bits.store(silence_bits, Ordering::Relaxed);
+                    handle.peak_r_bits.store(silence_bits, Ordering::Relaxed);
+                    teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
+                    let _ = stream.pause();
+                    tracing::info!("playout stopped");
+                }
+                Ok(EngineCommand::Pause) => {
+                    handle.paused.store(true, Ordering::Relaxed);
                     let _ = stream.pause();
                 }
-                handle.push_log(
-                    LogLevel::Info,
-                    format!("test tone {}", if enabled { "enabled" } else { "disabled" }),
-                );
-                tracing::info!(enabled, "playout test tone toggled");
+                Ok(EngineCommand::Resume) => {
+                    handle.paused.store(false, Ordering::Relaxed);
+                    let _ = stream.play();
+                }
+                Ok(EngineCommand::Seek { position, skip_ms }) => {
+                    current = Some(position);
+                    stall_since = None;
+                    *handle.stall_reason.write().unwrap() = None;
+                    handle
+                        .position_seq
+                        .store(position as i64, Ordering::Relaxed);
+                    handle.playing_rung.store(-1, Ordering::Relaxed);
+                    handle.fed_seq.store(-1, Ordering::Relaxed);
+                    // A seek is a discontinuity in the byte stream fed to the
+                    // decoder, so the old session (mid-decode of the pre-seek
+                    // position) must go — restart fresh rather than let stale
+                    // audio for the old position keep draining out of it. The
+                    // ring buffer and `pending` need the same treatment (see
+                    // `flush_ring_and_pending`): otherwise audio already decoded
+                    // for the pre-seek position, still sitting in the ring,
+                    // keeps draining out *after* the jump — audibly playing the
+                    // new position for an instant and then "jumping back" to
+                    // the old one as that stale backlog (and `pending`'s
+                    // matching seq entries, which `drain_pending` reads
+                    // `position_seq` off of) works its way through.
+                    //
+                    // If the engine was already paused when this seek arrived,
+                    // the old session's reader thread could easily be sitting
+                    // blocked inside `push_all` (nothing was draining the ring
+                    // while paused) — `teardown_session_safely` (unlike the raw
+                    // `teardown_decoder_session` this used to call directly)
+                    // makes sure the stream actually runs long enough to unblock
+                    // and join it, then restores the paused state afterward, so
+                    // a paused seek stays paused rather than starting to play
+                    // audibly or wedging the whole engine command loop forever
+                    // (see its doc comment — this was the "pause, then move the
+                    // playhead, and it locks up for good" bug).
+                    pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
+                    teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
+                    restart_decoder_session(
+                        &mut session,
+                        &mut producer_holder,
+                        sample_rate,
+                        pending_skip_samples,
+                        &handle,
+                    );
+                    tracing::info!(seq = position, skip_ms, "playout seek");
+                }
+                Ok(EngineCommand::SetVolume { gain }) => {
+                    handle
+                        .volume_millis
+                        .store((gain.max(0.0) * 1000.0) as u32, Ordering::Relaxed);
+                }
+                Ok(EngineCommand::SetTestTone { enabled }) => {
+                    handle.test_tone.store(enabled, Ordering::Relaxed);
+                    if enabled {
+                        // The stream may not be playing at all yet (nothing ever
+                        // `Start`ed) — the test tone works independent of normal
+                        // playout, so it must (re)start the stream itself.
+                        let _ = stream.play();
+                    } else if !handle.running.load(Ordering::Relaxed) {
+                        // Only pause if normal playout isn't also active; don't
+                        // stop real audio just because the tone was turned off.
+                        let _ = stream.pause();
+                    }
+                    handle.push_log(
+                        LogLevel::Info,
+                        format!("test tone {}", if enabled { "enabled" } else { "disabled" }),
+                    );
+                    tracing::info!(enabled, "playout test tone toggled");
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => return,
+                Err(mpsc::error::TryRecvError::Empty) => {}
             }
-            Err(mpsc::error::TryRecvError::Disconnected) => return,
-            Err(mpsc::error::TryRecvError::Empty) => {}
-        }
 
-        let should_feed =
-            handle.running.load(Ordering::Relaxed) && !handle.paused.load(Ordering::Relaxed);
-        if should_feed && session.is_none() {
-            // Self-heal after a failed spawn (see `restart_decoder_session`)
-            // instead of leaving playout permanently stuck — retried every
-            // tick, which is fine for a rare/exceptional failure (e.g.
-            // `ffmpeg` briefly unavailable) and self-limiting since a
-            // successful respawn clears this branch immediately. Forwards
-            // whatever sub-segment skip is still pending from the most
-            // recent Start/Seek in case that one never got a chance to
-            // spawn successfully at all.
-            restart_decoder_session(
-                &mut session,
-                &mut producer_holder,
-                sample_rate,
-                pending_skip_samples,
-                &handle,
-            );
-        }
-        if should_feed && session.is_some() {
-            if let Some(seq) = current {
-                // No per-segment gate on ring space here (unlike the old
-                // per-segment decode): feeding bytes to the persistent
-                // decoder's stdin naturally blocks once the ring — and
-                // ffmpeg's own internal buffers — fill up, since nothing
-                // downstream is draining fast enough. That backpressure
-                // chain paces feeding to playback on its own.
-                let (path_and_rung, abandoned) = rt.block_on(async {
-                    let store = store.lock().await;
-                    (
-                        best_available_path(&store, &rungs, seq),
-                        store.is_abandoned(seq),
-                    )
-                });
+            let should_feed =
+                handle.running.load(Ordering::Relaxed) && !handle.paused.load(Ordering::Relaxed);
+            if should_feed && session.is_none() {
+                // Self-heal after a failed spawn (see `restart_decoder_session`)
+                // instead of leaving playout permanently stuck — retried every
+                // tick, which is fine for a rare/exceptional failure (e.g.
+                // `ffmpeg` briefly unavailable) and self-limiting since a
+                // successful respawn clears this branch immediately. Forwards
+                // whatever sub-segment skip is still pending from the most
+                // recent Start/Seek in case that one never got a chance to
+                // spawn successfully at all.
+                restart_decoder_session(
+                    &mut session,
+                    &mut producer_holder,
+                    sample_rate,
+                    pending_skip_samples,
+                    &handle,
+                );
+            }
+            if should_feed && session.is_some() {
+                if let Some(seq) = current {
+                    // No per-segment gate on ring space here (unlike the old
+                    // per-segment decode): feeding bytes to the persistent
+                    // decoder's stdin naturally blocks once the ring — and
+                    // ffmpeg's own internal buffers — fill up, since nothing
+                    // downstream is draining fast enough. That backpressure
+                    // chain paces feeding to playback on its own.
+                    let (path_and_rung, abandoned) = rt.block_on(async {
+                        let store = store.lock().await;
+                        (
+                            best_available_path(&store, &rungs, seq),
+                            store.is_abandoned(seq),
+                        )
+                    });
 
-                let mut advance = false;
-                if let Some((path, rung)) = path_and_rung {
-                    // Playable — the common case. A segment not yet on
-                    // disk holds the head in place rather than advancing
-                    // past it (see the `abandoned`/timeout branches
-                    // below for when it stops waiting), protecting "no
-                    // audio lost to a short outage" per CLAUDE.md §5.
-                    let fed = std::fs::read(&path)
-                        .and_then(|bytes| session.as_mut().unwrap().stdin.write_all(&bytes));
-                    match fed {
-                        Ok(()) => {
-                            // Bytes hit the decoder's stdin — whatever
-                            // stalled things before is no longer why. The
-                            // reader thread clears `underrun` once PCM
-                            // actually reaches the ring.
-                            *handle.stall_reason.write().unwrap() = None;
-                            // The persistent decoder demuxes one continuous
-                            // stream (see module docs), so there's no exact
-                            // per-segment PCM length to read off the way the
-                            // old per-segment decode had — `segment_samples`
-                            // (the nominal segment duration) stands in for
-                            // `pending`'s purpose of tracking roughly which
-                            // segment is audible right now, not sample-exact
-                            // position. Shortened by whatever sub-segment
-                            // offset a Start/Seek asked to skip past for
-                            // *this* segment specifically — see
-                            // `pending_skip_samples`'s doc comment — so
-                            // `ms_into_current_segment` reads the skip as
-                            // already-elapsed rather than the seek looking
-                            // like it snapped back to the segment's start.
-                            handle.enqueue_pending(
-                                seq,
-                                Some(rung),
-                                segment_samples.saturating_sub(pending_skip_samples),
-                            );
-                            pending_skip_samples = 0;
-                            advance = true;
-                        }
-                        Err(err) => {
-                            // Most likely the decoder process died (broken
-                            // pipe) rather than this one segment being bad —
-                            // restart the session and retry the same seq
-                            // next tick instead of skipping past it.
-                            tracing::warn!(seq, error = %err, "failed to feed decoder, restarting decode session");
-                            handle.push_log(
-                                LogLevel::Warn,
-                                format!(
+                    let mut advance = false;
+                    if let Some((path, rung)) = path_and_rung {
+                        // Playable — the common case. A segment not yet on
+                        // disk holds the head in place rather than advancing
+                        // past it (see the `abandoned`/timeout branches
+                        // below for when it stops waiting), protecting "no
+                        // audio lost to a short outage" per CLAUDE.md §5.
+                        let fed = std::fs::read(&path)
+                            .and_then(|bytes| session.as_mut().unwrap().stdin.write_all(&bytes));
+                        match fed {
+                            Ok(()) => {
+                                // Bytes hit the decoder's stdin — whatever
+                                // stalled things before is no longer why. The
+                                // reader thread clears `underrun` once PCM
+                                // actually reaches the ring.
+                                *handle.stall_reason.write().unwrap() = None;
+                                // The persistent decoder demuxes one continuous
+                                // stream (see module docs), so there's no exact
+                                // per-segment PCM length to read off the way the
+                                // old per-segment decode had — `segment_samples`
+                                // (the nominal segment duration) stands in for
+                                // `pending`'s purpose of tracking roughly which
+                                // segment is audible right now, not sample-exact
+                                // position. Shortened by whatever sub-segment
+                                // offset a Start/Seek asked to skip past for
+                                // *this* segment specifically — see
+                                // `pending_skip_samples`'s doc comment — so
+                                // `ms_into_current_segment` reads the skip as
+                                // already-elapsed rather than the seek looking
+                                // like it snapped back to the segment's start.
+                                handle.enqueue_pending(
+                                    seq,
+                                    Some(rung),
+                                    segment_samples.saturating_sub(pending_skip_samples),
+                                );
+                                pending_skip_samples = 0;
+                                advance = true;
+                            }
+                            Err(err) => {
+                                // Most likely the decoder process died (broken
+                                // pipe) rather than this one segment being bad —
+                                // restart the session and retry the same seq
+                                // next tick instead of skipping past it.
+                                tracing::warn!(seq, error = %err, "failed to feed decoder, restarting decode session");
+                                handle.push_log(
+                                    LogLevel::Warn,
+                                    format!(
                                     "segment {seq} failed to decode ({err}), restarting decoder"
                                 ),
-                            );
-                            *handle.stall_reason.write().unwrap() =
-                                Some(format!("segment {seq} failed to decode: {err}"));
-                            restart_decoder_session(
-                                &mut session,
-                                &mut producer_holder,
-                                sample_rate,
-                                pending_skip_samples,
-                                &handle,
-                            );
+                                );
+                                *handle.stall_reason.write().unwrap() =
+                                    Some(format!("segment {seq} failed to decode: {err}"));
+                                restart_decoder_session(
+                                    &mut session,
+                                    &mut producer_holder,
+                                    sample_rate,
+                                    pending_skip_samples,
+                                    &handle,
+                                );
+                            }
                         }
-                    }
-                } else if abandoned {
-                    // The encoder explicitly gave up on this seq via
-                    // `/abandon` — nothing will ever fill it, so waiting
-                    // any longer would freeze the head on a gap that's
-                    // already known permanent.
-                    tracing::warn!(seq, "segment abandoned by encoder, skipping");
-                    handle.push_log(
-                        LogLevel::Warn,
-                        format!("segment {seq} was abandoned by the encoder, skipping"),
-                    );
-                    *handle.stall_reason.write().unwrap() =
-                        Some(format!("segment {seq} was abandoned by the encoder"));
-                    handle.enqueue_pending(seq, None, 0);
-                    // No audio at all for this seq, so any skip requested
-                    // for it is moot — don't let it leak into whichever
-                    // segment plays next.
-                    pending_skip_samples = 0;
-                    advance = true;
-                } else {
-                    // Missing, not (yet) abandoned. Wait up to `timeout`
-                    // in case the encoder is just late/retrying, then
-                    // skip anyway — a backstop for the case where the
-                    // encoder crashed or disconnected and will never call
-                    // `/abandon` at all. Without this bound a permanent
-                    // gap freezes `position_seq` forever, violating the
-                    // "never block the playout head" invariant.
-                    let since = stall_since.get_or_insert_with(Instant::now);
-                    *handle.stall_reason.write().unwrap() =
-                        Some(format!("waiting on segment {seq} from the encoder"));
-                    if since.elapsed() >= timeout {
-                        tracing::warn!(
+                    } else if abandoned {
+                        // The encoder explicitly gave up on this seq via
+                        // `/abandon` — nothing will ever fill it, so waiting
+                        // any longer would freeze the head on a gap that's
+                        // already known permanent.
+                        tracing::warn!(seq, "segment abandoned by encoder, skipping");
+                        handle.push_log(
+                            LogLevel::Warn,
+                            format!("segment {seq} was abandoned by the encoder, skipping"),
+                        );
+                        *handle.stall_reason.write().unwrap() =
+                            Some(format!("segment {seq} was abandoned by the encoder"));
+                        handle.enqueue_pending(seq, None, 0);
+                        // No audio at all for this seq, so any skip requested
+                        // for it is moot — don't let it leak into whichever
+                        // segment plays next.
+                        pending_skip_samples = 0;
+                        advance = true;
+                    } else {
+                        // Missing, not (yet) abandoned. Wait up to `timeout`
+                        // in case the encoder is just late/retrying, then
+                        // skip anyway — a backstop for the case where the
+                        // encoder crashed or disconnected and will never call
+                        // `/abandon` at all. Without this bound a permanent
+                        // gap freezes `position_seq` forever, violating the
+                        // "never block the playout head" invariant.
+                        let since = stall_since.get_or_insert_with(Instant::now);
+                        *handle.stall_reason.write().unwrap() =
+                            Some(format!("waiting on segment {seq} from the encoder"));
+                        if since.elapsed() >= timeout {
+                            tracing::warn!(
                             seq,
                             timeout_ms = timeout.as_millis() as u64,
                             "segment missing past stall timeout, skipping to avoid freezing the playout head"
                         );
-                        handle.push_log(
+                            handle.push_log(
                             LogLevel::Warn,
                             format!(
                                 "segment {seq} missing for over {}ms, skipped to avoid freezing the playout head",
                                 timeout.as_millis()
                             ),
                         );
-                        *handle.stall_reason.write().unwrap() = Some(format!(
-                            "segment {seq} missing for over {}ms, skipped",
-                            timeout.as_millis()
-                        ));
-                        handle.enqueue_pending(seq, None, 0);
-                        pending_skip_samples = 0;
-                        advance = true;
+                            *handle.stall_reason.write().unwrap() = Some(format!(
+                                "segment {seq} missing for over {}ms, skipped",
+                                timeout.as_millis()
+                            ));
+                            handle.enqueue_pending(seq, None, 0);
+                            pending_skip_samples = 0;
+                            advance = true;
+                        }
+                    }
+
+                    if advance {
+                        current = Some(seq + 1);
+                        stall_since = None;
+                        // `position_seq` no longer advances here — it now
+                        // tracks real drain progress via `pending`/
+                        // `drain_pending`, driven by the output callback (see
+                        // `PlayoutHandle::pending`'s doc comment for why:
+                        // advancing it the instant a segment is fed to the
+                        // decoder would report a position up to a full ring's
+                        // worth ahead of what's actually audible).
                     }
                 }
-
-                if advance {
-                    current = Some(seq + 1);
-                    stall_since = None;
-                    // `position_seq` no longer advances here — it now
-                    // tracks real drain progress via `pending`/
-                    // `drain_pending`, driven by the output callback (see
-                    // `PlayoutHandle::pending`'s doc comment for why:
-                    // advancing it the instant a segment is fed to the
-                    // decoder would report a position up to a full ring's
-                    // worth ahead of what's actually audible).
-                }
             }
+
+            std::thread::sleep(Duration::from_millis(20));
         }
-
-        std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-fn drain_forever(cmd_rx: &mut mpsc::UnboundedReceiver<EngineCommand>) {
-    while cmd_rx.blocking_recv().is_some() {}
 }
 
 fn push_all(producer: &mut ringbuf::HeapProd<f32>, mut pcm: &[f32]) {
@@ -1577,5 +1811,103 @@ mod tests {
     #[test]
     fn skip_samples_zero_ms_is_zero_samples() {
         assert_eq!(skip_samples(0, 48_000, 2000), 0);
+    }
+
+    /// Builds a `PlayoutHandle` with no live engine thread behind it — enough
+    /// to exercise the pure-ish state mutation in `apply_command_offline`
+    /// without spawning real audio devices/threads.
+    fn test_handle() -> Arc<PlayoutHandle> {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let silence_bits = obcast_proto::meter::linear_to_dbfs(0.0).to_bits();
+        Arc::new(PlayoutHandle {
+            running: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            position_seq: AtomicI64::new(-1),
+            volume_millis: AtomicU32::new(1000),
+            test_tone: AtomicBool::new(false),
+            segment_ms: 2000,
+            sample_rate: AtomicU32::new(0),
+            vu_l_bits: AtomicU32::new(silence_bits),
+            vu_r_bits: AtomicU32::new(silence_bits),
+            ppm_l_bits: AtomicU32::new(silence_bits),
+            ppm_r_bits: AtomicU32::new(silence_bits),
+            peak_l_bits: AtomicU32::new(silence_bits),
+            peak_r_bits: AtomicU32::new(silence_bits),
+            underrun: AtomicBool::new(false),
+            device_name: RwLock::new(String::new()),
+            device_error: RwLock::new(None),
+            stall_reason: RwLock::new(None),
+            log: Arc::new(LogSink::default()),
+            pending: std::sync::Mutex::new(VecDeque::new()),
+            playing_rung: AtomicI32::new(-1),
+            fed_seq: AtomicI64::new(-1),
+            flush_generation: AtomicU64::new(0),
+            flushed_generation: AtomicU64::new(0),
+            cmd_tx,
+        })
+    }
+
+    #[test]
+    fn apply_command_offline_start_records_position_without_a_device() {
+        let handle = test_handle();
+        let mut current = None;
+        apply_command_offline(
+            EngineCommand::Start {
+                position: 42,
+                skip_ms: 0,
+            },
+            &handle,
+            &mut current,
+        );
+        assert_eq!(current, Some(42));
+        assert_eq!(handle.position(), Some(42));
+        assert!(handle.running.load(Ordering::Relaxed));
+        assert!(!handle.paused.load(Ordering::Relaxed));
+        assert_eq!(handle.playing_rung(), None);
+        assert_eq!(handle.fed_seq(), None);
+    }
+
+    #[test]
+    fn apply_command_offline_stop_clears_position() {
+        let handle = test_handle();
+        let mut current = Some(7);
+        handle.running.store(true, Ordering::Relaxed);
+        handle.position_seq.store(7, Ordering::Relaxed);
+        apply_command_offline(EngineCommand::Stop, &handle, &mut current);
+        assert_eq!(current, None);
+        assert_eq!(handle.position(), None);
+        assert!(!handle.running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_command_offline_seek_updates_current_without_touching_paused_state() {
+        let handle = test_handle();
+        let mut current = Some(1);
+        handle.paused.store(true, Ordering::Relaxed);
+        apply_command_offline(
+            EngineCommand::Seek {
+                position: 9,
+                skip_ms: 0,
+            },
+            &handle,
+            &mut current,
+        );
+        assert_eq!(current, Some(9));
+        // Seek (like Start) always resumes — matches the live `Seek` handler
+        // in `run_engine`'s inner loop, which never leaves the operator
+        // stuck paused on a seek issued while offline.
+        assert!(!handle.paused.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_command_offline_set_volume_still_applies_without_a_device() {
+        let handle = test_handle();
+        let mut current = None;
+        apply_command_offline(
+            EngineCommand::SetVolume { gain: 0.5 },
+            &handle,
+            &mut current,
+        );
+        assert_eq!(handle.volume(), 0.5);
     }
 }

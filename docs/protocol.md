@@ -463,14 +463,20 @@ GET /hls/{stream}/{rendition}/{seq}.ts
 **Scheduler tiers** (see `scheduler.rs`, all unit-tested):
 
 1. **Continuity** — from the playout head forward, fill any hole at the **low
-   rung** until `target_ms` of contiguous audio is secured. Allowed to burst past
-   the tick budget; dropout is the worst outcome. When the buffer is draining on
-   a flaky link, this is effectively "low quality first, no dropout."
+   rung** until `high_ms` (not just `target_ms`) of contiguous audio is secured.
+   Allowed to burst past the tick budget; dropout is the worst outcome — and so
+   is spending idle bandwidth on quality while the resilience margin is still
+   thin, since a link that just dropped can drop again. When the buffer is
+   draining or recovering on a flaky link, this is effectively "rebuild the
+   full standing buffer at low quality first, no dropout, before spending
+   anything on HD." Operators wanting a deeper standing margin before quality
+   resumes after a reconnect just configure a larger `high_ms` (e.g. 300s).
 2. **Live edge** — cover the newest ~`target_ms` at the low rung so the DVR stays
    contiguous and go-live is instant. Skipped in survival mode.
-3. **Upgrade** — only when `lead_ms ≥ high_ms` and bandwidth remains, raise
-   quality **strictly ahead of the playout head**, nearest-first, one rung step
-   per tick. This is "add HD back in as speed recovers," and the ahead-of-head
+3. **Upgrade** — only when `lead_ms ≥ high_ms` (i.e. continuity has finished
+   rebuilding the margin) and bandwidth remains, raise quality **strictly
+   ahead of the playout head**, nearest-first, one rung step per tick. This is
+   "add HD back in once the buffer is safely rebuilt," and the ahead-of-head
    guard is what stops us upgrading segments that will never be played.
 
 Continuity cost counts against the tick budget when gating tiers 2–3, so a
