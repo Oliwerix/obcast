@@ -73,13 +73,28 @@ fn resolve_output_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> 
 const CHANNELS: usize = 2;
 
 pub enum EngineCommand {
-    Start { position: Seq },
+    /// `skip_ms`: intra-segment offset to skip past before audio from
+    /// `position` starts draining — 0 for a plain segment-boundary
+    /// start/seek, nonzero for `PlayoutPosition::MillisBehindLive`'s
+    /// sub-segment precision. Converted from ms to samples inside the
+    /// engine, which is the only place `sample_rate` is known.
+    Start {
+        position: Seq,
+        skip_ms: u32,
+    },
     Stop,
     Pause,
     Resume,
-    Seek { position: Seq },
-    SetVolume { gain: f32 },
-    SetTestTone { enabled: bool },
+    Seek {
+        position: Seq,
+        skip_ms: u32,
+    },
+    SetVolume {
+        gain: f32,
+    },
+    SetTestTone {
+        enabled: bool,
+    },
 }
 
 /// Which channel(s) a test-tone pattern section outputs to.
@@ -157,6 +172,14 @@ pub struct PlayoutHandle {
     /// True while the test-tone pattern is overriding the hardware output
     /// (see `EngineCommand::SetTestTone`), independent of `running`/`paused`.
     test_tone: AtomicBool,
+    /// Nominal segment duration — immutable for the life of the handle
+    /// (set once at `spawn`), used by `ms_into_current_segment` to convert
+    /// `pending`'s remaining-sample count into a millisecond offset.
+    segment_ms: u32,
+    /// Output sample rate, known only once the engine thread opens the
+    /// device — 0 until then. `ms_into_current_segment` reports 0 rather
+    /// than dividing by zero while this is still unset.
+    sample_rate: AtomicU32,
     // Per-channel dBFS VU/PPM/Peak ballistics of the playout output
     // (post-gain), stored as raw f32 bits since there's no stable AtomicF32.
     vu_l_bits: AtomicU32,
@@ -259,6 +282,29 @@ impl PlayoutHandle {
     pub fn fed_seq(&self) -> Option<Seq> {
         let v = self.fed_seq.load(Ordering::Relaxed);
         (v >= 0).then_some(v as Seq)
+    }
+
+    /// Milliseconds already drained into the segment at `position()`,
+    /// against `segment_ms` — see `PlayoutStatus::position_ms_into_segment`.
+    /// Best-effort against `pending`'s front entry rather than sample-exact:
+    /// a segment's `remaining` count starts at `segment_samples` (or less,
+    /// for the first segment after a sub-segment seek — see
+    /// `EngineCommand::Seek`'s `skip_ms`), so `segment_samples - remaining`
+    /// is always "how far into this segment's nominal span we are,"
+    /// skip included. `0` before the sample rate is known or nothing is
+    /// queued yet (stopped, just started/sought).
+    pub fn ms_into_current_segment(&self) -> u32 {
+        let sample_rate = self.sample_rate.load(Ordering::Relaxed);
+        if sample_rate == 0 {
+            return 0;
+        }
+        let remaining = self.pending.lock().unwrap().front().map(|&(_, _, r)| r);
+        let Some(remaining) = remaining else {
+            return 0;
+        };
+        let segment_samples =
+            (self.segment_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
+        elapsed_ms_from_remaining(remaining, segment_samples, self.segment_ms)
     }
 
     pub fn playout_state(&self) -> PlayoutState {
@@ -392,6 +438,24 @@ fn advance_pending(
     })
 }
 
+/// Pure core of `PlayoutHandle::ms_into_current_segment`: converts a
+/// pending entry's `remaining` sample count into "ms already elapsed against
+/// this segment's nominal span." Works unmodified for a sub-segment-seek
+/// entry too — such an entry's `remaining` already starts at
+/// `segment_samples - skip_samples` rather than the full `segment_samples`
+/// (see `EngineCommand::Seek`'s `skip_ms` handling), so `segment_samples -
+/// remaining` is `skip_samples + drained-so-far`, i.e. still exactly "how far
+/// into the nominal segment," skip included, with no separate case needed.
+fn elapsed_ms_from_remaining(remaining: usize, segment_samples: usize, segment_ms: u32) -> u32 {
+    if segment_samples == 0 {
+        return 0;
+    }
+    let elapsed = segment_samples
+        .saturating_sub(remaining)
+        .min(segment_samples);
+    (elapsed as u64 * segment_ms as u64 / segment_samples as u64) as u32
+}
+
 /// Once a segment has been neither playable nor confirmed-abandoned for this
 /// long, playout skips it anyway rather than freezing the head forever — a
 /// backstop for when the encoder never calls `/abandon` at all (crashed,
@@ -399,6 +463,19 @@ fn advance_pending(
 /// but bounded: `3 * segment_ms` gives the encoder several retry ticks first.
 fn stall_timeout(segment_ms: u32) -> Duration {
     Duration::from_millis(segment_ms.max(1) as u64 * 3)
+}
+
+/// Converts a sub-segment seek's `skip_ms` (from `EngineCommand::Start`/
+/// `Seek`) into interleaved samples to drop from the next segment fed to the
+/// decoder (`spawn_decoder_session`'s `skip_samples`). Clamped below one
+/// full segment's worth — a `skip_ms >= segment_ms` would mean "skip the
+/// whole segment," which isn't this mechanism's job (the caller should have
+/// picked the next segment as `position` instead).
+fn skip_samples(skip_ms: u32, sample_rate: u32, segment_ms: u32) -> usize {
+    let segment_samples =
+        (segment_ms.max(1) as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
+    let requested = (skip_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
+    requested.min(segment_samples.saturating_sub(CHANNELS))
 }
 
 /// A live decode pipeline: one `ffmpeg` process reading a continuous MPEG-TS
@@ -419,9 +496,16 @@ struct DecoderSession {
 /// subprocess is the only fallible step, before `producer` is touched at
 /// all) — so a failed spawn never silently drops the only handle to the
 /// ring and leaves playout permanently mute.
+/// `skip_samples`: interleaved samples to silently discard from the front of
+/// the decoded PCM stream before any of it reaches the ring — the mechanism
+/// behind sub-segment seeking (`EngineCommand::Start`/`Seek`'s `skip_ms`,
+/// converted to samples by the caller). `0` for a plain segment-boundary
+/// start/seek or a mid-stream decoder restart, where nothing should be
+/// dropped.
 fn spawn_decoder_session(
     sample_rate: u32,
     mut producer: ringbuf::HeapProd<f32>,
+    skip_samples: usize,
 ) -> Result<DecoderSession, (std::io::Error, ringbuf::HeapProd<f32>)> {
     let child = std::process::Command::new("ffmpeg")
         .arg("-hide_banner")
@@ -455,6 +539,10 @@ fn spawn_decoder_session(
         // over to the front of the next read since `read()` gives no
         // alignment guarantee against our sample boundaries.
         let mut leftover: Vec<u8> = Vec::with_capacity(4);
+        // Counts down as leading samples are dropped for a sub-segment seek
+        // (see `skip_samples`'s doc comment); once it hits 0 every sample is
+        // pushed to the ring as normal for the rest of this session's life.
+        let mut skip_remaining = skip_samples;
         loop {
             match stdout.read(&mut buf) {
                 Ok(0) | Err(_) => break, // ffmpeg exited or the pipe broke
@@ -464,10 +552,15 @@ fn spawn_decoder_session(
                     if complete == 0 {
                         continue;
                     }
-                    let samples: Vec<f32> = leftover[..complete]
+                    let mut samples: Vec<f32> = leftover[..complete]
                         .chunks_exact(4)
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
+                    if skip_remaining > 0 {
+                        let drop_n = skip_remaining.min(samples.len());
+                        samples.drain(..drop_n);
+                        skip_remaining -= drop_n;
+                    }
                     push_all(&mut producer, &samples);
                     leftover.drain(..complete);
                 }
@@ -510,10 +603,14 @@ fn teardown_decoder_session(session: DecoderSession) -> ringbuf::HeapProd<f32> {
 /// playout can't produce audio without a working decoder any more than
 /// without a device — while leaving `producer_holder` populated so the next
 /// `Start`/`Seek` (or the feed loop's own retry) can still use it.
+/// `skip_samples` is forwarded to the fresh session (see
+/// `spawn_decoder_session`'s doc comment) — pass 0 for a mid-stream restart
+/// (self-heal, failed feed) where nothing should be dropped.
 fn restart_decoder_session(
     session: &mut Option<DecoderSession>,
     producer_holder: &mut Option<ringbuf::HeapProd<f32>>,
     sample_rate: u32,
+    skip_samples: usize,
     handle: &Arc<PlayoutHandle>,
 ) {
     if let Some(old) = session.take() {
@@ -522,7 +619,7 @@ fn restart_decoder_session(
     let producer = producer_holder
         .take()
         .expect("producer_holder is always repopulated by teardown or a prior failed spawn");
-    match spawn_decoder_session(sample_rate, producer) {
+    match spawn_decoder_session(sample_rate, producer, skip_samples) {
         Ok(s) => {
             *session = Some(s);
             handle.device_error.write().unwrap().take();
@@ -556,6 +653,8 @@ pub fn spawn(
         position_seq: AtomicI64::new(-1),
         volume_millis: AtomicU32::new(1000),
         test_tone: AtomicBool::new(false),
+        segment_ms,
+        sample_rate: AtomicU32::new(0),
         vu_l_bits: AtomicU32::new(0),
         vu_r_bits: AtomicU32::new(0),
         ppm_l_bits: AtomicU32::new(0),
@@ -624,6 +723,7 @@ fn run_engine(
         return;
     };
     let sample_rate = supported.sample_rate();
+    handle.sample_rate.store(sample_rate, Ordering::Relaxed);
     let config = cpal::StreamConfig {
         channels: CHANNELS as u16,
         sample_rate,
@@ -772,10 +872,18 @@ fn run_engine(
     // always measures how long *this* seq has been stuck, not a stale one.
     let mut stall_since: Option<Instant> = None;
     let timeout = stall_timeout(segment_ms);
+    // Set by `Start`/`Seek` to the sub-segment offset (in interleaved
+    // samples) to drop from whatever segment is fed next — see
+    // `EngineCommand::Start`'s `skip_ms`. Consumed once, by the very next
+    // successful feed, then reset to 0: only the first segment after a
+    // discontinuity can have a nonzero skip, since the decoder session
+    // itself only drops leading samples once per restart (see
+    // `spawn_decoder_session`).
+    let mut pending_skip_samples: usize = 0;
 
     loop {
         match cmd_rx.try_recv() {
-            Ok(EngineCommand::Start { position }) => {
+            Ok(EngineCommand::Start { position, skip_ms }) => {
                 current = Some(position);
                 stall_since = None;
                 *handle.stall_reason.write().unwrap() = None;
@@ -793,9 +901,16 @@ fn run_engine(
                 // No audio has actually reached the ring yet; the output
                 // callback will clear this on its first full buffer.
                 handle.underrun.store(true, Ordering::Relaxed);
-                restart_decoder_session(&mut session, &mut producer_holder, sample_rate, &handle);
+                pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
+                restart_decoder_session(
+                    &mut session,
+                    &mut producer_holder,
+                    sample_rate,
+                    pending_skip_samples,
+                    &handle,
+                );
                 let _ = stream.play();
-                tracing::info!(seq = position, "playout started");
+                tracing::info!(seq = position, skip_ms, "playout started");
             }
             Ok(EngineCommand::Stop) => {
                 current = None;
@@ -819,7 +934,7 @@ fn run_engine(
                 handle.paused.store(false, Ordering::Relaxed);
                 let _ = stream.play();
             }
-            Ok(EngineCommand::Seek { position }) => {
+            Ok(EngineCommand::Seek { position, skip_ms }) => {
                 current = Some(position);
                 stall_since = None;
                 *handle.stall_reason.write().unwrap() = None;
@@ -832,8 +947,15 @@ fn run_engine(
                 // decoder, so the old session (mid-decode of the pre-seek
                 // position) must go — restart fresh rather than let stale
                 // audio for the old position keep draining out of it.
-                restart_decoder_session(&mut session, &mut producer_holder, sample_rate, &handle);
-                tracing::info!(seq = position, "playout seek");
+                pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
+                restart_decoder_session(
+                    &mut session,
+                    &mut producer_holder,
+                    sample_rate,
+                    pending_skip_samples,
+                    &handle,
+                );
+                tracing::info!(seq = position, skip_ms, "playout seek");
             }
             Ok(EngineCommand::SetVolume { gain }) => {
                 handle
@@ -869,8 +991,17 @@ fn run_engine(
             // instead of leaving playout permanently stuck — retried every
             // tick, which is fine for a rare/exceptional failure (e.g.
             // `ffmpeg` briefly unavailable) and self-limiting since a
-            // successful respawn clears this branch immediately.
-            restart_decoder_session(&mut session, &mut producer_holder, sample_rate, &handle);
+            // successful respawn clears this branch immediately. Forwards
+            // whatever sub-segment skip is still pending from the most
+            // recent Start/Seek in case that one never got a chance to
+            // spawn successfully at all.
+            restart_decoder_session(
+                &mut session,
+                &mut producer_holder,
+                sample_rate,
+                pending_skip_samples,
+                &handle,
+            );
         }
         if should_feed && session.is_some() {
             if let Some(seq) = current {
@@ -911,8 +1042,19 @@ fn run_engine(
                             // (the nominal segment duration) stands in for
                             // `pending`'s purpose of tracking roughly which
                             // segment is audible right now, not sample-exact
-                            // position.
-                            handle.enqueue_pending(seq, Some(rung), segment_samples);
+                            // position. Shortened by whatever sub-segment
+                            // offset a Start/Seek asked to skip past for
+                            // *this* segment specifically — see
+                            // `pending_skip_samples`'s doc comment — so
+                            // `ms_into_current_segment` reads the skip as
+                            // already-elapsed rather than the seek looking
+                            // like it snapped back to the segment's start.
+                            handle.enqueue_pending(
+                                seq,
+                                Some(rung),
+                                segment_samples.saturating_sub(pending_skip_samples),
+                            );
+                            pending_skip_samples = 0;
                             advance = true;
                         }
                         Err(err) => {
@@ -933,6 +1075,7 @@ fn run_engine(
                                 &mut session,
                                 &mut producer_holder,
                                 sample_rate,
+                                pending_skip_samples,
                                 &handle,
                             );
                         }
@@ -950,6 +1093,10 @@ fn run_engine(
                     *handle.stall_reason.write().unwrap() =
                         Some(format!("segment {seq} was abandoned by the encoder"));
                     handle.enqueue_pending(seq, None, 0);
+                    // No audio at all for this seq, so any skip requested
+                    // for it is moot — don't let it leak into whichever
+                    // segment plays next.
+                    pending_skip_samples = 0;
                     advance = true;
                 } else {
                     // Missing, not (yet) abandoned. Wait up to `timeout`
@@ -980,6 +1127,7 @@ fn run_engine(
                             timeout.as_millis()
                         ));
                         handle.enqueue_pending(seq, None, 0);
+                        pending_skip_samples = 0;
                         advance = true;
                     }
                 }
@@ -1198,5 +1346,59 @@ mod tests {
         // says is best right now.
         let mut pending = VecDeque::from([(5, Some(2), 10), (6, Some(0), 10)]);
         assert_eq!(advance_pending(&mut pending, 10), Some((6, Some(0))));
+    }
+
+    #[test]
+    fn elapsed_ms_is_zero_for_a_freshly_fed_segment() {
+        assert_eq!(elapsed_ms_from_remaining(100, 100, 2000), 0);
+    }
+
+    #[test]
+    fn elapsed_ms_is_full_segment_once_fully_drained() {
+        assert_eq!(elapsed_ms_from_remaining(0, 100, 2000), 2000);
+    }
+
+    #[test]
+    fn elapsed_ms_is_proportional_partway_through() {
+        // 25 of 100 samples drained -> a quarter of the way through.
+        assert_eq!(elapsed_ms_from_remaining(75, 100, 2000), 500);
+    }
+
+    #[test]
+    fn elapsed_ms_counts_a_sub_segment_seek_skip_as_already_elapsed() {
+        // A seek that skipped the first half of the segment starts this
+        // entry's `remaining` at half the nominal sample count (see
+        // `skip_samples`) — even with nothing drained yet, that should read
+        // as already halfway into the segment, not 0.
+        assert_eq!(elapsed_ms_from_remaining(50, 100, 2000), 1000);
+    }
+
+    #[test]
+    fn elapsed_ms_is_zero_with_no_sample_rate_known() {
+        assert_eq!(elapsed_ms_from_remaining(0, 0, 2000), 0);
+    }
+
+    #[test]
+    fn skip_samples_converts_ms_to_interleaved_samples() {
+        // 48kHz stereo, 250ms -> 12000 frames * 2 channels.
+        assert_eq!(skip_samples(250, 48_000, 2000), 24_000);
+    }
+
+    #[test]
+    fn skip_samples_clamps_below_one_full_segment() {
+        // Requesting the whole segment (or more) clamps just under it —
+        // "skip the whole segment" isn't this mechanism's job (see the
+        // function's doc comment).
+        let segment_samples = 2000 * 48_000 / 1000 * CHANNELS;
+        assert_eq!(skip_samples(2000, 48_000, 2000), segment_samples - CHANNELS);
+        assert_eq!(
+            skip_samples(10_000, 48_000, 2000),
+            segment_samples - CHANNELS
+        );
+    }
+
+    #[test]
+    fn skip_samples_zero_ms_is_zero_samples() {
+        assert_eq!(skip_samples(0, 48_000, 2000), 0);
     }
 }

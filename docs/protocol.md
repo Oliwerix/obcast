@@ -179,6 +179,20 @@ levels, so in steady state almost none of those uploads could ever actually
 be heard. Falls back to `position_seq` when absent (older server, or
 stopped), preserving the previous ahead-of-head-only behavior.
 
+`playout.position_ms_into_segment` (`u32`, `#[serde(default)]`) is how far
+into the segment at `position_seq` playout has drained, against that
+segment's *nominal* `segment_ms` — best-effort, not sample-exact (see
+`PlayoutHandle::ms_into_current_segment` in `playout.rs`). `0` while stopped
+or nothing has been fed at the current position yet. This is what lets a
+client compute a continuous elapsed-time readout and a smoothly-moving
+playhead instead of one that jumps in whole-`segment_ms` steps — the web
+remote (`stream.html`) interpolates between updates using this field plus a
+local wall clock (see "Web remote" below) rather than only advancing on each
+whole-segment change. It's also where a sub-segment seek
+(`MillisBehindLive`, below) shows up: the skipped intra-segment offset lands
+here immediately rather than the seek looking like it snapped back to the
+segment's start.
+
 ### `ServerState` fields that drive the scheduler
 - `playout.state` + `playout.position_seq` — the anchor for all urgency.
   `position_seq` tracks the seq whose audio is actually draining out of the
@@ -260,8 +274,30 @@ carries the current state as `test_tone: bool`, separate from `state`, so a
 stream can be `stopped` (or `playing`) with the tone on or off.
 
 `position` is a `PlayoutPosition`: `{"kind":"live"}`,
-`{"kind":"seq","value":123}`, or `{"kind":"seconds_behind_live","value":30}`.
-A position outside the DVR window is clamped to `[dvr_start_seq, live_seq]`.
+`{"kind":"seq","value":123}`, `{"kind":"seconds_behind_live","value":30}`, or
+`{"kind":"millis_behind_live","value":30500}`. A position outside the DVR
+window is clamped to `[dvr_start_seq, live_seq]`.
+
+`millis_behind_live` is for the web remote's waveform click-to-seek, where
+rounding every click to the nearest whole segment made a click land up to
+`segment_ms` away from where the user actually clicked. Its reference point
+is deliberately *not* the same as `seconds_behind_live`'s: `seconds_behind_live`
+counts whole segments back from the *start* of the live segment (so
+`{"seconds_behind_live":0}` always lands at the beginning of whatever segment
+is newest, however little of it has actually arrived), while
+`millis_behind_live`'s `0` is the *end* of the newest available segment — true
+"now," matching where the far right edge of the web remote's waveform
+actually sits. `0` therefore still lands on the live segment either way, but
+the two scales otherwise disagree by up to one `segment_ms` for the same
+numeric value (e.g. `{"millis_behind_live":2000}` lands at the *start* of the
+live segment, not one segment further back the way
+`{"seconds_behind_live":2}` does) — pick whichever reference point matches
+what's being converted from. The server resolves the value to a target
+segment plus an intra-segment offset (`api.rs::resolve_millis_behind_live`)
+that the playout engine skips past before that segment's audio starts
+draining (`playout.rs`'s decoder-session skip) —
+`playout.position_ms_into_segment` (above) reflects the skip immediately once
+it takes effect.
 
 Because the playout head is part of `ServerState`, any seek immediately reshapes
 the encoder's upload plan — e.g. seeking back 30 s makes the encoder protect
@@ -337,6 +373,22 @@ exposes two independent audio paths and does not conflate them:
   whose `seek()` posts to `POST /api/{stream}/playout` and whose notion of
   current time/playing state is a mirror of the WS `ControlEvent` stream —
   there is no real decode or playback happening in the browser for this path.
+  Its time axis is anchored to the waveform JSON's own first `seqs[0]`
+  (`serverPlayer`'s `waveformBaseSeq`) rather than `status.dvr_start_seq` —
+  those two are refreshed independently (status on every WS push, the
+  waveform every 5s plus an immediate client-side trim on eviction, see
+  below), so anchoring the playhead to whichever start seq the *currently
+  displayed* waveform data actually begins at is what keeps the cursor over
+  the right color segment instead of drifting during the gap between
+  waveform refreshes. Between authoritative `status` updates the client
+  interpolates the playhead forward from a wall clock (reset and corrected on
+  every update using `playout.position_ms_into_segment`) and emits it every
+  animation frame, which is what drives peaks.js's `autoScroll` smoothly
+  instead of only once per `status` push. A DVR eviction
+  (`dvr_start_seq` advancing) is applied to the already-loaded waveform
+  immediately by slicing off its leading points client-side — no server round
+  trip — so an evicted segment's waveform disappears from the overview
+  promptly rather than lingering until the next 5s poll.
 - **Listen-along preview** — a plain `hls.js` pull of `/hls/{stream}/master.m3u8`
   into a browser `<audio>` element, for checking levels/timing by ear. It has
   its own independent buffering and is not the playhead described above.

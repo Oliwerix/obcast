@@ -15,6 +15,13 @@ pub enum PlayoutPosition {
     Seq(Seq),
     /// N seconds behind the live edge (DVR time-shift).
     SecondsBehindLive(u32),
+    /// N milliseconds behind the live edge — same idea as
+    /// `SecondsBehindLive` but sub-segment precision, for the web remote's
+    /// waveform click-to-seek. Resolves to a target segment *plus* an
+    /// intra-segment offset the playout engine skips past before audio for
+    /// that segment starts draining (`playout.rs`'s decoder-session skip),
+    /// rather than always landing on a segment boundary.
+    MillisBehindLive(u64),
 }
 
 /// Commands the web remote can issue to the server's playout engine.

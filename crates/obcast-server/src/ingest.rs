@@ -104,7 +104,10 @@ async fn maybe_auto_start(handle: &StreamHandle) {
         LogLevel::Info,
         format!("auto-start: requested buffer reached, starting playout at seq {seq}"),
     );
-    handle.playout.send(EngineCommand::Start { position: seq });
+    handle.playout.send(EngineCommand::Start {
+        position: seq,
+        skip_ms: 0,
+    });
     let state = current_state(handle).await;
     let _ = handle.tx.send(state);
 }

@@ -54,6 +54,7 @@ impl StreamHandle {
             position_seq: self.playout.position(),
             playing_rung: self.playout.playing_rung(),
             fed_seq: self.playout.fed_seq(),
+            position_ms_into_segment: self.playout.ms_into_current_segment(),
             device: self.playout.device_name(),
             volume: self.playout.volume(),
             detail: self.playout.detail(),
