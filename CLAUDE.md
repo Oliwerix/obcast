@@ -649,6 +649,40 @@ resizes on its own). True continuous (non-jumping) scroll is possible but would 
 peaks.js's autoScroll and driving `view.updateWaveform()` every animation frame ourselves — left
 as a follow-up if the 25%-edge jump still isn't smooth enough in practice.
 
+**Fixed: after a reconnect, the buffer sat flat at a small margin for tens of seconds before growing,
+instead of proactively rebuilding.** Reported directly: after a deliberate network drop and
+reconnect, the server-reported buffer drained to ~15s (didn't run dry, good) but then *held* at
+~15s for ~30s — neither draining further nor growing — before finally starting to climb, even
+though the reconnected link had ample spare bandwidth the whole time. Root cause was in
+`scheduler.rs`'s Tier A (continuity): it only walked the contiguous frontier forward from the
+playout head until securing `water.target_ms` (a small, fixed 12s by default) — not `water.high_ms`
+(20s, the threshold that separately gates when Tier C is allowed to start upgrading quality). Tier B
+(live edge) only ever touches its own newest-`target_ms` tail near the encoder's live edge. Nothing
+filled the region in between — exactly the backlog a network outage creates, since the encoder kept
+producing segments locally the whole time it couldn't upload them — regardless of how much idle
+bandwidth was sitting unused (continuity uploads are explicitly burst/budget-exempt, so budget was
+never the constraint). That backlog only got touched once the anchor's own real-time playback
+advance happened to walk the near-anchor window into it, which is what produced the "flat for ~30s,
+then climbing" symptom — and once it did start catching up, the now-uncapped-by-budget continuity
+burst could catch up fast, which is also what produced a related report (immediately prior in this
+same investigation) of the buffer appearing to "suddenly dump the whole thing into HD" once `high_ms`
+was finally crossed. Fixed by extending Tier A's stopping point from `target_ms` to `high_ms`:
+continuity now spends its budget-exempt priority rebuilding the *entire* resilience margin — not
+just a small dropout-safety sliver — before Tier C ever runs, on the reasoning that a link that just
+dropped can drop again, so depth is worth more than quality until the margin is back. No new config
+surface was needed: `water.high_ms` already meant exactly "how much buffer before quality resumes,"
+it just wasn't being filled that far. An operator wanting a deep standing buffer rebuilt before
+quality resumes (e.g. "get back to 300s before touching HD") just configures a larger `high_ms`.
+`scheduler.rs`'s `far_behind_head_only_fills_near_anchor_and_near_live_edge_not_the_middle` test
+(which had asserted the *old*, buggy "middle region left untouched all the way out to `high_ms`"
+behavior as correct) was replaced with
+`far_behind_head_rebuilds_to_high_ms_and_still_fills_the_live_edge`, plus a new end-to-end
+regression, `after_reconnect_rebuilds_the_full_margin_before_any_upgrade_across_ticks`, simulating
+the real per-tick loop (16 actions/tick, matching `uploader.rs`) across many ticks with a 300s
+`high_ms` and a deep post-outage backlog, asserting zero upgrades fire until the full margin is
+rebuilt and that the rebuild genuinely takes multiple ticks rather than completing in one. `docs/
+protocol.md` §5 updated in the same change.
+
 **What's next.** Everything from the previous "auth split / resource leak / DVR reaping / stalled
 playout state / waveform decode failures / reverse telemetry / packaging / StreamProfile dedup /
 browser DVR scrub / HE-AAC survival rung / scheduler edge-case tests" punch list is now DONE — see the
