@@ -38,6 +38,27 @@ use obcast_proto::state::{PlayoutState, RungId, Seq};
 
 use crate::config::AudioConfig;
 use crate::logs::LogSink;
+
+/// Raises the *calling* OS thread to the platform's highest scheduling
+/// priority. Must be called from the real cpal output callback thread
+/// itself, not the engine thread that builds the stream — `cpal` creates
+/// that thread internally, so there's no `JoinHandle` to set this on ahead
+/// of time; the callback's first invocation is the earliest point we're
+/// actually running on it. Best-effort: an unprivileged process can't raise
+/// its priority on Linux without `CAP_SYS_NICE` (the same permission
+/// wrinkle pro-audio apps like JACK solve with an `/etc/security/limits.d`
+/// audio-group entry, not something this binary can grant itself), so
+/// failure is logged once and playout keeps running at normal priority
+/// rather than treating it as fatal.
+fn elevate_audio_thread_priority() {
+    use thread_priority::{set_current_thread_priority, ThreadPriority};
+    if let Err(err) = set_current_thread_priority(ThreadPriority::Max) {
+        tracing::warn!(
+            ?err,
+            "failed to raise playout thread priority, continuing at normal priority"
+        );
+    }
+}
 use crate::store::DvrStore;
 
 /// `Device` only exposes its name via `description()` (or the `Display`
@@ -893,9 +914,17 @@ fn run_engine(
     // tone is active) so the ack always stays in sync with what the engine
     // command loop asked for, regardless of which branch below runs.
     let mut last_flush_gen: u64 = 0;
+    // Checked once on the callback's first invocation only — see
+    // `elevate_audio_thread_priority`.
+    let mut priority_elevated = false;
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
+            if !priority_elevated {
+                priority_elevated = true;
+                elevate_audio_thread_priority();
+            }
+
             let want_flush = volume_handle.flush_generation.load(Ordering::Relaxed);
             if want_flush != last_flush_gen {
                 consumer.clear();
