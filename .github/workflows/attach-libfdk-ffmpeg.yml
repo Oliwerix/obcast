@@ -63,6 +63,14 @@ jobs:
       # backfilling v0.1.1: the Windows leg's failure killed 3 in-flight
       # uploads that would otherwise have succeeded).
       fail-fast: false
+      # The per-asset archive upload is independent per leg, but the last
+      # step's read-modify-write of the single shared sha256.sum asset
+      # isn't: seen backfilling v0.1.1, two legs' clobber-uploads landed
+      # close enough together that one leg's upload hit a 404 on an asset
+      # ID a sibling had just deleted out from under it. Each leg here
+      # only takes ~15s, so serializing costs nothing worth avoiding the
+      # race for.
+      max-parallel: 1
       matrix:
         include:
           # ffmpeg_artifact names must stay in sync with the literal names
