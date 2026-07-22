@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -324,6 +325,44 @@ pub fn spawn(pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>) -> Arc<AudioHandle> 
     handle
 }
 
+/// How long the engine waits between automatic attempts to reopen the
+/// capture device after it's lost mid-session (e.g. an OB site's mixer loses
+/// power or is unplugged) or an explicit `Open` fails — see `run_engine`'s
+/// retry branch. Short enough that a brief power-cycle doesn't read as a
+/// long outage, long enough that a genuinely absent device doesn't spam
+/// retries/logs.
+const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Attempts to open `host`/`device`, applying the resulting state to
+/// `handle` and swapping it into `*stream` on success — shared by the
+/// explicit `Open` command handler and the automatic reconnect retry below,
+/// which differ only in what they log around the call.
+fn try_open(
+    host: &str,
+    device: &str,
+    handle: &Arc<AudioHandle>,
+    pcm_tx: &tokio_mpsc::UnboundedSender<Vec<f32>>,
+    stream: &mut Option<cpal::Stream>,
+) -> Result<(u16, u32)> {
+    match open_stream(host, device, handle.clone(), pcm_tx.clone()) {
+        Ok((s, channels, rate, opened_name)) => {
+            handle.device_channels.store(channels, Ordering::Relaxed);
+            handle.sample_rate.store(rate, Ordering::Relaxed);
+            *handle.device_name.write().unwrap() = opened_name;
+            *handle.channel_peaks.write().unwrap() = vec![0.0; channels as usize];
+            handle.running.store(true, Ordering::Relaxed);
+            *handle.last_error.write().unwrap() = None;
+            *stream = Some(s);
+            Ok((channels, rate))
+        }
+        Err(err) => {
+            handle.running.store(false, Ordering::Relaxed);
+            *handle.last_error.write().unwrap() = Some(err.to_string());
+            Err(err)
+        }
+    }
+}
+
 // `stream` below is held only for its `Drop` (which stops the device) —
 // it's intentionally never read, just reassigned to swap/close devices.
 #[allow(unused_assignments, unused_variables)]
@@ -333,32 +372,61 @@ fn run_engine(
     pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>,
 ) {
     let mut stream: Option<cpal::Stream> = None;
+    // The most recently requested (host, device), used to retry the same
+    // target automatically — `None` means no `Open` has been requested yet,
+    // or an explicit `Close` cancelled any pending retry.
+    let mut last_open: Option<(String, String)> = None;
+    // Set once an `Open` fails, or a previously-open stream's `err_fn`
+    // reports it lost — cleared the moment a (re)connect attempt succeeds.
+    let mut retrying = false;
 
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            AudioCommand::Open { host, device } => {
+    loop {
+        match cmd_rx.recv_timeout(DEVICE_RETRY_INTERVAL) {
+            Ok(AudioCommand::Open { host, device }) => {
                 stream = None; // close any previous device before opening the next
-                match open_stream(&host, &device, handle.clone(), pcm_tx.clone()) {
-                    Ok((s, channels, rate, opened_name)) => {
-                        handle.device_channels.store(channels, Ordering::Relaxed);
-                        handle.sample_rate.store(rate, Ordering::Relaxed);
-                        *handle.device_name.write().unwrap() = opened_name;
-                        *handle.channel_peaks.write().unwrap() = vec![0.0; channels as usize];
-                        handle.running.store(true, Ordering::Relaxed);
-                        *handle.last_error.write().unwrap() = None;
-                        stream = Some(s);
+                last_open = Some((host.clone(), device.clone()));
+                retrying = false;
+                match try_open(&host, &device, &handle, &pcm_tx, &mut stream) {
+                    Ok((channels, rate)) => {
                         tracing::info!(host = %host, device = %device, channels, rate, "capture device opened");
                     }
                     Err(err) => {
-                        handle.running.store(false, Ordering::Relaxed);
-                        *handle.last_error.write().unwrap() = Some(err.to_string());
-                        tracing::warn!(host = %host, device = %device, error = %err, "failed to open capture device");
+                        tracing::warn!(host = %host, device = %device, error = %err, "failed to open capture device; will keep retrying");
+                        retrying = true;
                     }
                 }
             }
-            AudioCommand::Close => {
+            Ok(AudioCommand::Close) => {
                 stream = None;
+                last_open = None;
+                retrying = false;
                 handle.running.store(false, Ordering::Relaxed);
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                // A stream that was open can go silently not-running between
+                // wakeups if its `err_fn` fired (device lost) — start
+                // retrying against the same host/device rather than leaving
+                // capture dead until the operator notices and manually
+                // reopens (e.g. the OB site's mixer losing power).
+                if stream.is_some() && !handle.running.load(Ordering::Relaxed) {
+                    stream = None;
+                    retrying = true;
+                    tracing::warn!("capture device disconnected, will attempt to reconnect");
+                }
+                if retrying {
+                    if let Some((host, device)) = last_open.clone() {
+                        match try_open(&host, &device, &handle, &pcm_tx, &mut stream) {
+                            Ok((channels, rate)) => {
+                                tracing::info!(host = %host, device = %device, channels, rate, "capture device reconnected");
+                                retrying = false;
+                            }
+                            Err(err) => {
+                                tracing::debug!(host = %host, device = %device, error = %err, "capture device still unavailable, will retry");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
