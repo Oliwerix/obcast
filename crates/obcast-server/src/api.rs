@@ -155,22 +155,14 @@ pub async fn set_playout(
         }
     }
 
-    let state = {
-        let store = handle.store.lock().await;
-        store.build_server_state(handle.playout_status())
-    };
+    let state = handle.current_state().await;
     let _ = handle.tx.send(state);
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn build_status(stream: &str, handle: &StreamHandle) -> ControlStatus {
-    let (server, encoder) = {
-        let store = handle.store.lock().await;
-        (
-            store.build_server_state(handle.playout_status()),
-            store.encoder_state().cloned(),
-        )
-    };
+    let server = handle.current_state().await;
+    let encoder = handle.store.lock().await.encoder_state().cloned();
 
     let last_ingest = *handle.last_ingest.lock().await;
     let (connected, last_segment_age_ms) = match last_ingest {

@@ -314,6 +314,19 @@ pub struct ServerState {
     /// buffered history" indicator.
     #[serde(default)]
     pub buffered_ms: u32,
+    /// Whether this stream has had no ingested segment for at least the
+    /// server's configured stale-reset window (`OBCAST_STALE_RESET_MS`,
+    /// default 300s). A client starting a genuinely new broadcast under a
+    /// reused stream name reads this at go-live time to decide whether to
+    /// continue `Seq` numbering from `live_seq + 1` (append — the default
+    /// for a quick restart or a live rung-toggle respawn) or restart at 0
+    /// (this flag is set, meaning the prior session is considered over). See
+    /// `docs/protocol.md` §3 "Session continuity" and CLAUDE.md §8 for the
+    /// full design (this alone is advisory to the client; the server's own
+    /// ingest-time reset additionally requires the client's `X-New-Session`
+    /// marker before it will actually discard DVR history).
+    #[serde(default)]
+    pub stale_session: bool,
 }
 
 impl ServerState {
@@ -340,6 +353,7 @@ impl ServerState {
             water: WaterLevels::default(),
             coverage: Vec::new(),
             buffered_ms: 0,
+            stale_session: false,
         }
     }
 }

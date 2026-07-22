@@ -29,6 +29,7 @@ Config is via environment variables, all optional:
 | `OBCAST_WEB_REMOTE_DIR`  | `web/remote`   | static files served at `/remote`            |
 | `OBCAST_DVR_WINDOW_MS`   | `300000` (5 min) | how much history the DVR keeps before evicting; `0` disables eviction (unbounded — retains every segment for the life of the stream, unbounded disk use) |
 | `OBCAST_PLAYOUT_RING_SEGMENTS` | `4`      | how many segments deep the playout engine decodes ahead of real-time output; higher = more resilience to a transient decode/disk slowdown at the cost of more ingest-to-audible latency |
+| `OBCAST_STALE_RESET_MS`  | `300000` (5 min) | how long a stream must go without an ingested segment before a client's next `X-New-Session` upload is treated as a genuinely new broadcast (wipes the old DVR/segments for that name); a same-name restart under this window always just appends — see `docs/protocol.md` §3 "Session continuity" |
 
 Each `{stream}` name is created lazily on first ingest — there's no separate
 "create a stream" step. Read-only routes (`status`/`waveform`/`ws`/HLS

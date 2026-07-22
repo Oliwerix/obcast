@@ -61,6 +61,21 @@ struct AbandonBody<'a> {
     seqs: &'a [Seq],
 }
 
+/// The wire `Seq` to add to this session's local (always-0-based, see
+/// `encode.rs`) file numbering, given the latest known `ServerState`. If the
+/// stream is stale (no ingest for the server's configured window, or this
+/// is a genuinely fresh name), start at 0; otherwise continue the existing
+/// numbering so a quick restart or a live rung-toggle respawn appends
+/// rather than colliding with — and getting evicted behind — the server's
+/// existing live edge. See CLAUDE.md §8 "stream restart / name reuse".
+fn resolve_seq_offset(server: &ServerState) -> Seq {
+    if server.stale_session {
+        0
+    } else {
+        server.live_seq.map(|s| s + 1).unwrap_or(0)
+    }
+}
+
 pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>) {
     let rungs: Vec<RungId> = cfg.profile.rungs.iter().map(|r| r.id).collect();
     let low = cfg.profile.low_rung();
@@ -80,11 +95,28 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
     let mut heartbeat_rev: u64 = 0;
     let mut last_heartbeat: Option<tokio::time::Instant> = None;
 
+    // Whether this session's first segment has been successfully uploaded
+    // yet. Until then: `seq_offset` is recomputed every tick from the
+    // latest known `ServerState` (so an early tick that races ahead of the
+    // SSE feed's first update doesn't lock in a wrong guess), and every
+    // upload attempt carries `X-New-Session` so the server can tell a
+    // genuine new encoder session apart from the same session's backlog
+    // draining after a long outage (see `should_reset_for_new_session` in
+    // `obcast-server/src/ingest.rs`). Once the first upload succeeds, both
+    // freeze — the offset because it's now load-bearing (the server has
+    // recorded a real segment at that wire seq), the marker because the
+    // server only needs to see it once.
+    let mut session_started = false;
+    let mut seq_offset: Seq = 0;
+
     loop {
         tick.tick().await;
 
         let scan = inventory::scan(&cfg.out_dir, &rungs);
         let server = shared.server_state_or_unknown().await;
+        if !session_started {
+            seq_offset = resolve_seq_offset(&server);
+        }
         let mut server_best: BTreeMap<_, _> = server
             .coverage
             .iter()
@@ -99,10 +131,20 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
             server_best.insert(seq, Some(low));
         }
 
+        // Local files are always numbered from 0 by ffmpeg (see
+        // `encode.rs`); shift into wire-seq space here so everything
+        // downstream — `plan_uploads`, `stalled_continuity_seq`, the
+        // heartbeat's `encoded_seq` — operates in the same space as
+        // `server.coverage`. Converted back to a local path only when
+        // actually reading a segment's bytes off disk, below.
         let mut inv = LocalInventory {
-            encoded_seq: scan.encoded_seq,
-            oldest_seq: scan.oldest_seq,
-            available: scan.available,
+            encoded_seq: scan.encoded_seq + seq_offset,
+            oldest_seq: scan.oldest_seq + seq_offset,
+            available: scan
+                .available
+                .into_iter()
+                .map(|(seq, rungs)| (seq + seq_offset, rungs))
+                .collect(),
             server_best,
         };
 
@@ -205,10 +247,13 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
         }
 
         for action in actions {
+            // `action.seq` is wire-seq (shifted above); the on-disk file is
+            // still named by ffmpeg's own 0-based local numbering.
+            let local_seq = action.seq - seq_offset;
             let path = cfg
                 .out_dir
                 .join(action.rung.to_string())
-                .join(format!("{}.ts", action.seq));
+                .join(format!("{local_seq}.ts"));
             let Ok(bytes) = tokio::fs::read(&path).await else {
                 continue;
             };
@@ -223,9 +268,18 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
             if let Some(token) = &cfg.ingest_token {
                 req = req.header("X-Auth", token.clone());
             }
+            if !session_started {
+                // Tells the server this is genuinely the first upload of a
+                // new encoder session, so it can reset a stale stream to a
+                // fresh DVR rather than treating this as backlog draining
+                // after a long outage. Sent until the first successful
+                // upload, then dropped — see `session_started` above.
+                req = req.header("X-New-Session", "true");
+            }
 
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
+                    session_started = true;
                     let elapsed = started.elapsed().as_secs_f32().max(0.001);
                     throughput_kbps = ((len as f32 * 8.0 / 1000.0) / elapsed) as u32;
                     shared.note_upload(action.seq, throughput_kbps);
@@ -259,5 +313,37 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with(live_seq: Option<Seq>, stale_session: bool) -> ServerState {
+        let mut s = ServerState::unknown();
+        s.live_seq = live_seq;
+        s.stale_session = stale_session;
+        s
+    }
+
+    #[test]
+    fn appends_after_the_existing_live_seq_when_not_stale() {
+        assert_eq!(resolve_seq_offset(&state_with(Some(5000), false)), 5001);
+    }
+
+    #[test]
+    fn restarts_at_zero_when_stale() {
+        assert_eq!(resolve_seq_offset(&state_with(Some(5000), true)), 0);
+    }
+
+    #[test]
+    fn restarts_at_zero_for_a_never_ingested_name() {
+        assert_eq!(resolve_seq_offset(&state_with(None, false)), 0);
+    }
+
+    #[test]
+    fn stale_with_no_prior_content_still_starts_at_zero() {
+        assert_eq!(resolve_seq_offset(&state_with(None, true)), 0);
     }
 }
