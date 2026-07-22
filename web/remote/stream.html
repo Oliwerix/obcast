@@ -58,7 +58,7 @@
   .meter-toggle button:hover:not(.active) { background: #2a2e35; }
   .note { font-size: 12px; color: #8a8f98; margin-top: 6px; }
   audio, video { width: 100%; border-radius: 6px; margin-top: 8px; background: #000; }
-  #zoomview-container { width: 100%; height: 100px; background: #0e0f12; border-radius: 6px; margin-top: 4px; cursor: pointer; overflow: hidden; }
+  #zoomview-container { width: 100%; height: 220px; background: #0e0f12; border-radius: 6px; margin-top: 4px; cursor: pointer; overflow: hidden; }
   .legend { display: flex; gap: 16px; margin-top: 8px; font-size: 11px; color: #8a8f98; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
@@ -748,9 +748,8 @@ function makeServerPlayer() {
     setSource() { return Promise.resolve(); }, // no real media source to swap
     // -- internal: fed by connectWs()'s status handler / applyWaveform(), not part of the adapter contract --
     updateFromStatus(s) {
-      if (s.live_seq != null && s.dvr_start_seq != null) {
+      if (s.live_seq != null) {
         lastLiveSeq = s.live_seq;
-        durationSecs = ((s.live_seq - s.dvr_start_seq + 1) * segMs) / 1000;
       }
       if (s.playout.position_seq != null) {
         const subMs = s.playout.position_ms_into_segment ?? 0;
@@ -764,9 +763,42 @@ function makeServerPlayer() {
     },
     setSegmentMs(ms) { segMs = ms; },
     setWaveformBase(seq) { waveformBaseSeq = seq; },
+    // `durationSecs` used to be derived from status as
+    // `(live_seq - dvr_start_seq + 1) * segMs` — the DVR window's nominal
+    // span, refreshed on every WS push. That's the same "distance from a
+    // sliding window start" shape of bug already fixed for the position
+    // anchor above: the waveform actually on screen is anchored to its own
+    // `waveformBaseSeq`/length (set by applyWaveform/trimEvictedSegments,
+    // refreshed on a slower 5s poll plus client-side eviction trims), which
+    // drifts out of step with `dvr_start_seq`. A `durationSecs` computed from
+    // the wrong span clamps `currentTimeSecs()` against a length that doesn't
+    // match what's actually drawn, which is exactly the class of mismatch the
+    // position-anchor fix above was written to eliminate. Now set directly
+    // from the loaded waveform's own point count whenever it changes, so it's
+    // always exact for whatever is currently on screen.
+    setDuration(secs) { durationSecs = secs; },
   };
 }
 const serverPlayer = makeServerPlayer();
+
+// peaks.js's own autoScroll (zoomview `autoScrollOffset`, default 100px)
+// re-anchors the playhead a fixed number of *pixels* in from the left edge
+// the instant it comes within that many pixels of the right edge. On a wide
+// container (this one is full page width) 100px is a small fraction of the
+// view, so the visible behaviour is "the playhead crawls most of the way
+// across, waits at the right edge, then snaps back to near the start" —
+// most of a full-width jump, not the smooth or centered scroll it looks
+// like it should be. Scaling the offset to a fraction of the *view's own
+// width* instead keeps the relative jump distance constant regardless of
+// container size: trigger 25% of the width from the right border, land 25%
+// from the left, every time.
+const AUTO_SCROLL_EDGE_FRACTION = 0.25;
+function applyAutoScrollOffset() {
+  if (!peaksInstance) return;
+  const view = peaksInstance.views.getView('zoomview');
+  if (!view) return;
+  view.enableAutoScroll(true, { offset: Math.round(view.getWidth() * AUTO_SCROLL_EDGE_FRACTION) });
+}
 
 function initWaveform(json) {
   peaks.init({
@@ -782,7 +814,9 @@ function initWaveform(json) {
     if (err) { console.error('peaks.js init failed', err); return; }
     peaksInstance = instance;
     serverPlayer.setWaveformBase(json.seqs[0]);
+    serverPlayer.setDuration((json.length * pointMs(json)) / 1000);
     applySegmentColors(json);
+    applyAutoScrollOffset();
   });
 }
 
@@ -846,6 +880,7 @@ async function applyWaveform() {
     initWaveform(json);
   } else {
     serverPlayer.setWaveformBase(json.seqs[0]);
+    serverPlayer.setDuration((json.length * waveformPointMs) / 1000);
     peaksInstance.setSource({ waveformData: { json } }, (err) => {
       if (err) { console.error('waveform refresh failed', err); return; }
       applySegmentColors(json);
@@ -885,6 +920,7 @@ function trimEvictedSegments(newStartSeq) {
   const trimmed = sliceWaveformFrom(currentWaveformJson, i);
   currentWaveformJson = trimmed;
   serverPlayer.setWaveformBase(trimmed.seqs[0]);
+  serverPlayer.setDuration((trimmed.length * waveformPointMs) / 1000);
   peaksInstance.setSource({ waveformData: { json: trimmed } }, (err) => {
     if (err) { console.error('waveform trim failed', err); return; }
     applySegmentColors(trimmed);
@@ -920,6 +956,22 @@ function connectWs() {
 connectWs();
 applyWaveform();
 setInterval(applyWaveform, 5000);
+
+// The zoomview container is full page width (`width: 100%`), so a window
+// resize changes the view's pixel width and both peaks.js's own layout
+// (`fitToContainer`, per its docs — it does not track container resizes on
+// its own) and the width-relative autoScroll offset above need recomputing
+// against the new size, not just once at load.
+let zoomviewResizeTimer = null;
+new ResizeObserver(() => {
+  clearTimeout(zoomviewResizeTimer);
+  zoomviewResizeTimer = setTimeout(() => {
+    if (!peaksInstance) return;
+    const view = peaksInstance.views.getView('zoomview');
+    if (view) view.fitToContainer();
+    applyAutoScrollOffset();
+  }, 200);
+}).observe(document.getElementById('zoomview-container'));
 
 // Listen-along player: independent HLS pull, not tied to server playout state.
 // Its own hls.js instance, media events drive a small custom transport UI, and

@@ -623,6 +623,32 @@ once, so the segments always sum to the full covered fraction instead of collaps
 one number. The Link panel's 60s trend sparkline for this metric is kept (relabeled "Buffer quality
 trend (% at top rung)") since a stacked bar has no natural single-line history equivalent.
 
+**Waveform overview: duration anchoring, size, and scroll behavior.** Requested after an operator
+found the waveform card small and its auto-scroll disorienting. Three changes to `stream.html`:
+(1) the same class of bug fixed earlier for the playhead's *position* anchor (see the "playhead
+clock jumping backward"/"waveform's own scroll cursor" entries above) also existed, unfixed, in its
+*duration*: `serverPlayer`'s `durationSecs` was still computed from `status` as
+`(live_seq - dvr_start_seq + 1) * segMs` — the DVR window's nominal span, refreshed on every WS
+push — while the waveform actually on screen is anchored to its own `waveformBaseSeq`/point count
+(set by `applyWaveform`/`trimEvictedSegments`, refreshed on a slower 5s poll plus client-side
+eviction trims). The two drift out of step the same way the position anchor used to, and
+`durationSecs` clamps `currentTimeSecs()` against a length that may not match what's actually
+drawn. Fixed by deriving `durationSecs` directly from the loaded waveform's own point count
+(`json.length * pointMs(json)`) via a new `serverPlayer.setDuration()`, called everywhere the
+waveform data changes, instead of from `status`. (2) `#zoomview-container`'s height went from
+100px to 220px — just a bigger card. (3) peaks.js's own `autoScroll` re-anchors the playhead a
+fixed 100px (its default `autoScrollOffset`) from the left edge the instant it comes within 100px
+of the right edge; on this card's full-page-width container that reads as "crawls most of the way
+across, waits at the right edge, then snaps most of the way back" rather than anything smooth or
+centered. `applyAutoScrollOffset()` now sets the offset to 25% of the view's actual pixel width
+(`view.enableAutoScroll(true, { offset })`) instead of the fixed default, so the jump always
+triggers 25% of the width from the right border and lands 25% from the left, regardless of
+container size — re-applied on load and on a debounced `ResizeObserver` of the container (which
+also calls peaks.js's own `view.fitToContainer()`, since per its docs it does not track container
+resizes on its own). True continuous (non-jumping) scroll is possible but would mean disabling
+peaks.js's autoScroll and driving `view.updateWaveform()` every animation frame ourselves — left
+as a follow-up if the 25%-edge jump still isn't smooth enough in practice.
+
 **What's next.** Everything from the previous "auth split / resource leak / DVR reaping / stalled
 playout state / waveform decode failures / reverse telemetry / packaging / StreamProfile dedup /
 browser DVR scrub / HE-AAC survival rung / scheduler edge-case tests" punch list is now DONE — see the
