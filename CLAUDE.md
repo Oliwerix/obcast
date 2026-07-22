@@ -402,10 +402,14 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   dist's single top-level directory inside each archive, repacking without introducing a stray leading
   `./` on every path, matching dist's own `{hash} *{filename}` checksum format) was verified locally
   byte-for-byte against a real `dist build` output rather than assumed from `dist plan`'s summary alone.
-  Both workflow files pass `actionlint` with zero errors. Not yet independently exercised end-to-end
-  against a real published release, since that requires actually cutting a version tag — a genuine
-  release event with real user-facing consequences, deliberately left for the maintainer to trigger
-  rather than done unilaterally by an agent working on a feature branch.
+  Both workflow files pass `actionlint` with zero errors. Firing it end-to-end requires actually
+  publishing a release (a real version tag) — asked explicitly rather than assumed either way, and the
+  maintainer's call was to cut that first real release themselves rather than have an agent do it
+  (even a disposable test tag) on a feature branch; that first release is what exercises this workflow
+  for real. Implementation-wise this is complete: the archive/checksum logic is verified byte-for-byte
+  against a real `dist build` output, and the trigger, job wiring, and artifact-naming contract with
+  `build-libfdk-ffmpeg.yml` are all in place and lint-clean — what's left is the maintainer's own act of
+  shipping, not unfinished work on this end.
 - **De-duplicated `StreamProfile` construction in the client crate.** `client/main.rs`'s single-use
   `fn profile(segment_ms) -> StreamProfile` wrapper (just `StreamProfile::default_ladder(segment_ms)`)
   was deleted and inlined at its one call site. `client/gui/app.rs`'s `profile(&self)` method was left
@@ -475,10 +479,9 @@ real bug, not just re-running the same job: it targeted the `macos-13` runner la
 matter how long it waited; fixed to `macos-15-intel`); and the built ffmpeg binaries are wired into
 the actual release archives by `attach-libfdk-ffmpeg.yml`, with its archive-manipulation logic verified
 locally byte-for-byte against a real `dist build` output. See the "Packaging" milestone entry above for
-the full detail on all three, including the one honestly-flagged gap: `attach-libfdk-ffmpeg.yml`
-itself hasn't been exercised against an actual published release (deliberately not done by cutting a
-real version tag unilaterally) — first real release should be watched to confirm it behaves as
-designed.
+the full detail on all three. Nothing left in this list requires further code changes — the maintainer
+has chosen to cut the project's first real release themselves, which is what exercises
+`attach-libfdk-ffmpeg.yml` end-to-end; that's a shipping decision, not outstanding implementation work.
 
 ---
 
