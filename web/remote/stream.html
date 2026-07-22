@@ -881,11 +881,30 @@ function applySegmentColors(json) {
 // full re-fetches without re-decoding anything server-side.
 let currentWaveformJson = null;
 
+// `GET /api/{stream}/waveform` decodes every segment in the DVR window via a
+// serial `ffmpeg` spawn per segment (see waveform.rs's handler docs) — cheap
+// for a fresh stream's small window, but as the window grows toward its full
+// multi-minute size that decode time grows too, and eventually exceeds this
+// function's own 5s poll interval. Once it does, requests overlap in flight,
+// and completion order no longer matches issue order — an earlier request
+// (snapshotting an earlier, smaller DVR state) can finish *after* a later one
+// and clobber `waveformBaseSeq`/duration with stale, smaller values, which is
+// exactly a "jumps back in time" symptom appearing only once a stream has run
+// long enough for decode time to catch up with the poll interval. Guard by
+// issue order (a monotonic counter bumped when the request is *sent*, not
+// when it *finishes*) so a stale response is dropped no matter how the
+// network reorders completions.
+let waveformFetchSeq = 0;
+let lastAppliedWaveformFetchSeq = 0;
+
 async function applyWaveform() {
+  const myFetchSeq = ++waveformFetchSeq;
   const resp = await fetch(`/api/${stream}/waveform`);
   if (!resp.ok) return;
   const json = await resp.json();
+  if (myFetchSeq <= lastAppliedWaveformFetchSeq) return;
   if (json.length === 0) return;
+  lastAppliedWaveformFetchSeq = myFetchSeq;
 
   currentWaveformJson = json;
   waveformPointMs = pointMs(json);
