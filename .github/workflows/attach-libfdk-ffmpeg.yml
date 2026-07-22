@@ -164,7 +164,14 @@ jobs:
           gh release download "$TAG" --pattern "sha256.sum" --dir . --clobber || true
           if [ -f sha256.sum ]; then
             new_line="$(sha256sum "$asset")"
-            grep -v " \*$asset\$" sha256.sum > sha256.sum.new || true
+            # Match any line ending in this exact asset name, not just
+            # dist's own `{hash} *{name}` format — a rerun (this step ran
+            # 4 times backfilling v0.1.1 chasing other bugs) finds its own
+            # previous pass's line in plain `sha256sum` format (`{hash}
+            # {name}`, two spaces, no asterisk), which the asterisk-only
+            # pattern silently failed to match and remove, leaving a
+            # stale duplicate instead of replacing it.
+            grep -v -- "$asset\$" sha256.sum > sha256.sum.new || true
             echo "$new_line" >> sha256.sum.new
             mv sha256.sum.new sha256.sum
             gh release upload "$TAG" sha256.sum --clobber
