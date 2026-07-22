@@ -786,6 +786,61 @@ on its next invocation and acks via `flushed_generation`, and the command loop w
 freshly spawned decoder session start writing — otherwise a flush racing a few milliseconds late
 could wipe the new session's first samples along with the stale ones.
 
+**Automatic reconnect when the hardware audio device disconnects mid-session (server playout output
+and client capture input).** Prompted by an operator question: "what happens if the audio device
+disconnects, e.g. the mixer goes down?" Investigation found both sides *detected* and *surfaced* a
+device error already (not silent), but neither *recovered*: the server's `cpal` output stream was
+built once at engine startup and never rebuilt, so once its `err_fn` fired (or the configured device
+was missing/mis-configured at startup), `device_error`/`PlayoutState::Error` stuck **permanently** —
+`playout_state()` checks `device_error` first, and the only place that ever cleared it
+(`restart_decoder_session`'s success path) is unrelated to the output device itself, so recovery
+required restarting the server process for that stream. The client's capture `err_fn` at least
+demoted `running`/set `last_error` cleanly, and an existing PCM-stall watchdog (`gui/app.rs`) already
+dropped a dead pipeline out of "live" rather than broadcasting silence forever (the M6 fix) — but
+still required the operator to manually click "Open" again once the mixer came back.
+- **Server (`playout.rs`).** `run_engine`'s device/stream setup and its command-processing loop are
+  now wrapped in an outer `'engine` reconnect loop. On any device/stream failure — missing device or
+  no default config at startup, a failed `build_output_stream`, or the stream's `err_fn` firing
+  mid-session (new `stream_failed: Arc<AtomicBool>`, checked once per inner-loop tick) — the loop
+  tears down what it can and retries every `DEVICE_RETRY_INTERVAL` (3s) until the device/stream opens
+  successfully again, rather than the old permanent `drain_forever`. `current` (the playout head)
+  survives across reconnects, and if playout was (or was asked to be) running when the device died,
+  it resumes automatically from the same seq once reconnected — no operator action needed. While the
+  device is down, `wait_for_retry_or_shutdown` still drains and applies incoming `EngineCommand`s via
+  `apply_command_offline` (state bookkeeping only — `current`/`running`/`position_seq`/etc. — since
+  there's no stream/decoder to actually drive), so a `Stop`/`Start` issued mid-outage isn't lost and
+  takes effect immediately rather than only once the retry clock happens to elapse. A hard mid-session
+  failure can't safely reuse `teardown_session_safely` (which needs a *working* output callback to
+  drain the ring while joining the old decoder's reader thread — exactly what's gone) — a new
+  `abandon_decoder_session` kills the ffmpeg process but deliberately does not join the reader thread,
+  which might be parked forever inside `push_all` waiting for ring space that a dead stream will never
+  free again; a fresh ring/session is built for the next connection attempt regardless. Logging (the
+  actual originating ask — "make sure the server logs it"): `report_device_error` logs loudly
+  (`tracing::error!` plus a pushed web-remote log line, so it shows up in `stream.html`'s log panel,
+  not just the server's own stdout) on the *first* failure of an outage, then quietly
+  (`tracing::warn!` only) on each subsequent retry so a long outage doesn't spam the web remote; a
+  successful reconnect logs "audio output device reconnected, resuming playout" at `info` level plus
+  a matching web-remote log line. Five new `playout.rs` tests cover `apply_command_offline`'s state
+  bookkeeping (`Start`/`Stop`/`Seek`/`SetVolume` while offline).
+- **Client (`audio.rs`).** `run_engine`'s command loop switched from a blocking `cmd_rx.recv()` to
+  `cmd_rx.recv_timeout(DEVICE_RETRY_INTERVAL)` (also 3s) so it wakes up periodically even with no new
+  command. A new `last_open: Option<(String, String)>` remembers the most recently requested
+  host/device; on each timeout wakeup, if a stream was open but `running` has gone false (the
+  capture `err_fn` fired since the last wakeup — e.g. the mixer lost power), the loop begins retrying
+  against that same host/device via a shared `try_open` helper (factored out of the `Open` command
+  handler, which also now retries on a failed *explicit* open rather than giving up after one try).
+  Retrying stops the moment `try_open` succeeds (logs "capture device reconnected") or the operator
+  sends an explicit `Close`. Confirmed (via a read-only research pass over `gui/app.rs`) that nothing
+  in the GUI assumes `AudioHandle::is_running()`/`last_error()` only change in direct response to a
+  GUI-issued `Open` — the device panel, Go Live button enablement, and the PCM-stall watchdog are all
+  re-evaluated fresh every frame with no edge-triggered/GUI-owned latch — so `running` flipping true
+  again from a background retry (rather than a button click) is safe and requires no GUI changes.
+  Deliberately unchanged: reconnecting the *capture device* does not itself resume the encoder's
+  "live" (broadcasting) state — that still requires an explicit operator "Go Live" after an
+  interruption of unknown length, per the existing M6 behavior; this fix is scoped to the device
+  connection itself; per CLAUDE.md's own spirit, resuming *what* to broadcast after an unknown gap
+  stays a deliberate operator decision, not something to automate silently.
+
 ---
 
 ## 9. Conventions
