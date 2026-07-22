@@ -350,13 +350,22 @@ function updatePlayoutTime(status) {
   const s = status.server;
   const posEl = document.getElementById('playout-time');
   const behindEl = document.getElementById('playout-behind');
-  if (s.dvr_start_seq == null || s.playout.position_seq == null) {
+  if (s.playout.position_seq == null) {
     posEl.textContent = '--:--';
     behindEl.textContent = '—';
     return;
   }
+  // Seq is a u64 starting at 0 for this encoder session (CLAUDE.md §5: "Seq
+  // is the canonical clock"), so position_seq * segment_ms is already the
+  // broadcast's true elapsed time. This used to be computed relative to
+  // `dvr_start_seq` (the sliding DVR window's start) instead — but that seq
+  // advances continuously with real time regardless of whether playout is
+  // actually advancing, so the displayed "elapsed" time was really "distance
+  // into the ~5-minute DVR window": capped near the window size once the
+  // stream outlived it, and visibly jumping backward whenever eviction
+  // outpaced a stalled/paused/lagging playhead.
   const subMs = s.playout.position_ms_into_segment ?? 0;
-  const elapsedSecs = Math.max(0, ((s.playout.position_seq - s.dvr_start_seq) * segmentMs + subMs) / 1000);
+  const elapsedSecs = Math.max(0, (s.playout.position_seq * segmentMs + subMs) / 1000);
   posEl.textContent = fmtTime(elapsedSecs);
   const behind = currentSecsBehindLive();
   behindEl.textContent = behind == null ? '—' : (behind < 1 ? 'at live edge' : `${Math.round(behind)}s behind live`);

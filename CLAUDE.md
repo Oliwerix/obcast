@@ -459,6 +459,20 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   behavior as correct ("nothing in that window can still be upgraded in time") — replaced with
   `upgrades_still_happen_when_feed_ahead_outruns_the_anchor_relative_window`, asserting upgrades resume
   starting right after the feed boundary instead of asserting silence.
+- **Fixed the web remote's big playhead clock jumping backward and capping out around the DVR window
+  size.** Reported as "the current time in the stream starts jumping back in time, so we stay at like
+  4 minutes." `stream.html`'s `updatePlayoutTime()` computed the displayed elapsed time as
+  `(position_seq - dvr_start_seq) * segment_ms` — distance from the start of the currently-buffered
+  DVR window, not the broadcast's actual elapsed time. `dvr_start_seq` advances continuously with real
+  time as the DVR evicts old segments, regardless of whether playout is actually advancing, so once a
+  stream outlived the ~5-minute DVR window this reading was structurally capped near the window size,
+  and any moment `position_seq` lagged behind real time (pause, stall, catching up after a network
+  drop) let eviction outpace it, making the display visibly jump backward. Fixed to read
+  `position_seq * segment_ms` directly — `Seq` is a `u64` starting at 0 for the encoder session (§5:
+  "Seq is the canonical clock"), so that product is already the broadcast's true monotonic elapsed
+  time and needs no window-relative anchor at all. Unrelated to (and doesn't touch) the waveform's own
+  `waveformBaseSeq`-anchored scrub coordinate frame described above, which is correct as-is for its own
+  purpose (positioning within the currently-loaded waveform data).
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
