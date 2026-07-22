@@ -232,7 +232,7 @@ pub struct PlayoutHandle {
     /// through it. The rung riding alongside each entry is what makes
     /// `playing_rung` ground truth rather than a live DVR-index lookup: the
     /// engine feeds bytes to the decoder many segments ahead of real-time
-    /// playback (see `RING_SEGMENTS`), so the rung it picked for a seq is
+    /// playback (see `ring_segments` in `spawn`/`run_engine`), so the rung it picked for a seq is
     /// locked in well before that seq's audio is actually heard — if a
     /// quality upgrade for that same seq lands on disk in the meantime (a
     /// routine race, not an edge case, since uploads are far faster than the
@@ -657,6 +657,7 @@ pub fn spawn(
     rungs: Vec<RungId>,
     audio_cfg: AudioConfig,
     segment_ms: u32,
+    ring_segments: usize,
     log: Arc<LogSink>,
 ) -> Arc<PlayoutHandle> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -697,6 +698,7 @@ pub fn spawn(
             rungs,
             audio_cfg,
             segment_ms,
+            ring_segments,
             worker_handle,
             cmd_rx,
         )
@@ -705,12 +707,14 @@ pub fn spawn(
     handle
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_engine(
     rt: tokio::runtime::Handle,
     store: Arc<Mutex<DvrStore>>,
     rungs: Vec<RungId>,
     audio_cfg: AudioConfig,
     segment_ms: u32,
+    ring_segments: usize,
     handle: Arc<PlayoutHandle>,
     mut cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
 ) {
@@ -756,10 +760,13 @@ fn run_engine(
     // surfaced as spurious "buffer underrun" stalls that recovered on their
     // own once decode caught back up (confirmed live: both the client and
     // server still had every segment on disk throughout, so it was never a
-    // data gap).
-    const RING_SEGMENTS: usize = 8;
+    // data gap). Configurable via `OBCAST_PLAYOUT_RING_SEGMENTS`
+    // (`ring_segments` here, threaded in from `main.rs`) trading resilience
+    // to that kind of hiccup, and ingest-to-audible latency, against each
+    // other — a shallower ring means less headroom but faster time-to-air;
+    // default is 4 segments (8s at the 2s default).
     let segment_samples = (segment_ms as u64 * sample_rate as u64 / 1000) as usize * CHANNELS;
-    let ring = HeapRb::<f32>::new(segment_samples * RING_SEGMENTS);
+    let ring = HeapRb::<f32>::new(segment_samples * ring_segments.max(1));
     let (producer, mut consumer) = ring.split();
     // Held by whichever side currently doesn't have a live decoder: the
     // engine loop between sessions, or a `DecoderSession`'s reader thread

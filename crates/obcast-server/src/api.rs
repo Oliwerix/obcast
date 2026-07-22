@@ -187,7 +187,7 @@ async fn build_status(stream: &str, handle: &StreamHandle) -> ControlStatus {
     // actually fed the decoder for the segment currently draining. NOT a
     // live "best rung for this seq" lookup against `coverage`/the DVR index
     // — the engine feeds bytes many segments ahead of real-time playback
-    // (see `playout.rs`'s `RING_SEGMENTS`), so a quality upgrade for a
+    // (see `playout.rs`'s `run_engine` / `ring_segments`), so a quality upgrade for a
     // segment already fed can land on disk before that segment is actually
     // heard; a live lookup would then report the new rung while the speaker
     // is still on the old one. See `PlayoutStatus::playing_rung`'s doc
