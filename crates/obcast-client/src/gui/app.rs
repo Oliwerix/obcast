@@ -233,48 +233,73 @@ impl ObcastApp {
         self.persist_config();
     }
 
+    /// Left side (heading + link/upload status, unbounded in length — a long
+    /// operator log message or server `detail` string used to push the Log
+    /// and Stop/Go Live controls on the right straight off the window edge,
+    /// since a plain `ui.horizontal` never wraps or clips) is rendered via
+    /// `egui::Sides` with `shrink_left().truncate()`: the right side (fixed
+    /// controls) is laid out first at its natural size, and the left side
+    /// only gets whatever width remains, eliding its text with "…" instead
+    /// of growing past it. Status strings are built into local `String`s
+    /// before the `Sides::show` call so the read-only left closure doesn't
+    /// need to borrow `self` at all, leaving the right closure free to hold
+    /// the `&mut self` it needs for the buttons.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("OBCast Encoder");
-            ui.separator();
-            ui.label(format!("stream: {}", self.cfg.stream));
-            ui.separator();
+        let stream_label = format!("stream: {}", self.cfg.stream);
 
-            if let Ok(state) = self.shared.server.try_lock() {
-                let playout = match state.playout.state {
-                    PlayoutState::Playing => "🟢 playing",
-                    PlayoutState::Paused => "🟡 paused",
-                    PlayoutState::Stopped => "⚪ stopped",
-                    PlayoutState::Stalled => "🟠 stalled",
-                    PlayoutState::Error => "🔴 error",
-                };
-                ui.label(format!("server: {playout}"));
-                if let Some(detail) = &state.playout.detail {
-                    ui.label(format!("({detail})"));
-                }
-                ui.label(format!("lead {} ms", state.lead_ms));
-                if let Some(seq) = state.live_seq {
-                    ui.label(format!("live seq {seq}"));
-                }
-            } else {
-                ui.label("server: (no link yet)");
+        let server_status = if let Ok(state) = self.shared.server.try_lock() {
+            let playout = match state.playout.state {
+                PlayoutState::Playing => "🟢 playing",
+                PlayoutState::Paused => "🟡 paused",
+                PlayoutState::Stopped => "⚪ stopped",
+                PlayoutState::Stalled => "🟠 stalled",
+                PlayoutState::Error => "🔴 error",
+            };
+            let mut s = format!("server: {playout}");
+            if let Some(detail) = &state.playout.detail {
+                s.push_str(&format!(" ({detail})"));
             }
-            ui.separator();
-            if let Some(seq) = self.shared.last_uploaded_seq() {
-                ui.label(format!(
-                    "uploaded seq {seq} @ {} kbps",
-                    self.shared.throughput_kbps()
-                ));
+            s.push_str(&format!("   lead {} ms", state.lead_ms));
+            if let Some(seq) = state.live_seq {
+                s.push_str(&format!("   live seq {seq}"));
             }
-            if let Some(entry) = self.shared.latest_log() {
+            s
+        } else {
+            "server: (no link yet)".to_string()
+        };
+
+        let uploaded_label = self.shared.last_uploaded_seq().map(|seq| {
+            format!(
+                "uploaded seq {seq} @ {} kbps",
+                self.shared.throughput_kbps()
+            )
+        });
+
+        let log_entry = self.shared.latest_log().map(|entry| {
+            (
+                log_level_color(entry.level),
+                format!("{} {}", log_level_tag(entry.level), entry.message),
+            )
+        });
+
+        egui::Sides::new().shrink_left().truncate().show(
+            ui,
+            |ui| {
+                ui.heading("OBCast Encoder");
                 ui.separator();
-                ui.colored_label(
-                    log_level_color(entry.level),
-                    format!("{} {}", log_level_tag(entry.level), entry.message),
-                );
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(stream_label);
+                ui.separator();
+                ui.label(server_status);
+                if let Some(uploaded_label) = uploaded_label {
+                    ui.separator();
+                    ui.label(uploaded_label);
+                }
+                if let Some((color, text)) = log_entry {
+                    ui.separator();
+                    ui.colored_label(color, text);
+                }
+            },
+            |ui| {
                 let log_text = if self.show_log { "Log ▼" } else { "Log ▲" };
                 if ui
                     .button(log_text)
@@ -302,8 +327,8 @@ impl ObcastApp {
                 {
                     self.toggle_live();
                 }
-            });
-        });
+            },
+        );
     }
 
     fn device_panel(&mut self, ui: &mut egui::Ui) {
@@ -781,6 +806,25 @@ impl ObcastApp {
                     );
                 }
             });
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            let (momentary, short_term, integrated) = self.audio.lufs();
+            ui.label(egui::RichText::new("LUFS").strong());
+            ui.label(format!("M {momentary:>6.1}"));
+            ui.label(format!("S {short_term:>6.1}"));
+            ui.label(format!("I {integrated:>6.1}"));
+            if ui
+                .small_button("Reset I")
+                .on_hover_text(
+                    "Clear the integrated (whole-programme) LUFS reading's gated history — \
+                     momentary and short-term are unaffected",
+                )
+                .clicked()
+            {
+                self.audio.reset_integrated_lufs();
+            }
         });
     }
 
