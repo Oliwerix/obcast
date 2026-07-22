@@ -2320,7 +2320,7 @@ dependencies = [
 
 [[package]]
 name = "obcast-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2340,14 +2340,14 @@ dependencies = [
 
 [[package]]
 name = "obcast-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "obcast-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "axum",
