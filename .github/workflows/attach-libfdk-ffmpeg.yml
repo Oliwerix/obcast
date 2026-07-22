@@ -12,25 +12,45 @@
 # built, non-Cargo binary into its archives. Runs after the fact, against
 # the already-published release, rather than trying to race dist's own
 # build-and-publish job.
+#
+# Triggers on `workflow_run` (Release workflow completing), not `release:
+# published` — found broken against the very first real release (v0.1.1):
+# dist's `host` job creates the GitHub Release using the default
+# GITHUB_TOKEN, and GitHub Actions never lets an event produced by that
+# token start another workflow (the standard anti-recursion guard), so
+# `release: published` silently never fired. `workflow_run` isn't subject
+# to that restriction since it's driven by the run's own completion, not a
+# synthetic event the run created. Also accepts `workflow_dispatch` with an
+# explicit tag, both as a manual escape hatch and to backfill a release
+# (like v0.1.1) that shipped before this fix existed.
 name: Attach libfdk_aac ffmpeg to release
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach ffmpeg binaries to (e.g. v0.1.1)"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
   build-ffmpeg:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
     uses: ./.github/workflows/build-libfdk-ffmpeg.yml
 
   attach:
     needs: build-ffmpeg
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ github.event.release.tag_name }}
+      TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     strategy:
       matrix:
         include:
