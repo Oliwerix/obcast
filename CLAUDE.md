@@ -459,6 +459,50 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   behavior as correct ("nothing in that window can still be upgraded in time") — replaced with
   `upgrades_still_happen_when_feed_ahead_outruns_the_anchor_relative_window`, asserting upgrades resume
   starting right after the feed boundary instead of asserting silence.
+- **Fixed the web remote's big playhead clock jumping backward and capping out around the DVR window
+  size.** Reported as "the current time in the stream starts jumping back in time, so we stay at like
+  4 minutes." `stream.html`'s `updatePlayoutTime()` computed the displayed elapsed time as
+  `(position_seq - dvr_start_seq) * segment_ms` — distance from the start of the currently-buffered
+  DVR window, not the broadcast's actual elapsed time. `dvr_start_seq` advances continuously with real
+  time as the DVR evicts old segments, regardless of whether playout is actually advancing, so once a
+  stream outlived the ~5-minute DVR window this reading was structurally capped near the window size,
+  and any moment `position_seq` lagged behind real time (pause, stall, catching up after a network
+  drop) let eviction outpace it, making the display visibly jump backward. Fixed to read
+  `position_seq * segment_ms` directly — `Seq` is a `u64` starting at 0 for the encoder session (§5:
+  "Seq is the canonical clock"), so that product is already the broadcast's true monotonic elapsed
+  time and needs no window-relative anchor at all. Unrelated to (and doesn't touch) the waveform's own
+  `waveformBaseSeq`-anchored scrub coordinate frame described above, which is correct as-is for its own
+  purpose (positioning within the currently-loaded waveform data).
+- **Same symptom, still live after the fix above: the real culprit was the waveform's own scroll
+  cursor, not the text clock.** The text-clock fix didn't touch `makeServerPlayer()`'s
+  `currentTimeSecs()` — the position peaks.js actually draws its cursor at and scrolls to, i.e. the
+  thing an operator watching the waveform card is looking at — which had the identical bug in a
+  different spot: `anchorMs` was computed as `(position_seq - waveformBaseSeq) * segMs` *once*, at the
+  moment a `status` update arrived, already converted into the waveform's local coordinate frame at
+  that instant. But `waveformBaseSeq` keeps sliding forward independently on every later eviction
+  (`trimEvictedSegments`, called on nearly every subsequent status push) without that anchor ever being
+  recomputed — so between authoritative updates the interpolated reading was stale relative to the
+  *current* base: systematically too high, clamped down to `durationSecs` (itself capped to the DVR
+  window size), reading as the cursor pinning near the window size and visibly snapping backward on
+  each correcting update. Fixed by making the interpolation anchor (`anchorAbsMs`) an absolute
+  elapsed-time reading (`position_seq * segMs`, same fixed seq-0 origin as the text-clock fix) instead
+  of pre-converting into the local frame, and converting to `waveformBaseSeq`-relative coordinates
+  fresh on every `currentTimeSecs()` call rather than storing a conversion that can go stale. This also
+  simplified `updateFromStatus`: it no longer needs to gate the anchor update on `waveformBaseSeq`
+  being known yet.
+- **DVR window size is now configurable, with an explicit "unbounded" mode.** `dvr_window_ms` used to
+  be a hardcoded 5-minute constant in `main.rs`, and `DvrStore::new` additionally clamped it to a
+  minimum of 1 segment (`.max(1)`) — so there was no way to ask for "never evict," and the auto-start
+  caveat in `docs/protocol.md` explicitly called this out as "not currently exposed." Now
+  `OBCAST_DVR_WINDOW_MS` (env var, matching the rest of `main.rs`'s per-run config — the TOML file in
+  `config.rs` stays reserved for genuinely per-machine settings like the audio device) sets it, default
+  unchanged at 5 minutes; `0` disables eviction entirely rather than clamping to a 1-segment window.
+  `DvrStore`'s internal `dvr_window_segs` is now `Option<u64>` (`None` = unbounded) so `evict_old`
+  short-circuits to "evict nothing" instead of computing a floor at all — covered by a new test,
+  `zero_dvr_window_ms_disables_eviction`, recording 500 segments and asserting none are evicted and
+  `dvr_start_seq` stays at the first seq ever recorded. An unbounded window means unbounded disk use for
+  the life of the stream — that's the operator's explicit choice in setting `0`, not a default; both
+  `docs/getting-started.md`'s env var table and the auto-start caveat in `docs/protocol.md` say so.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
