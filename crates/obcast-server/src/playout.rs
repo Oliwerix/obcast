@@ -655,6 +655,11 @@ pub fn spawn(
     log: Arc<LogSink>,
 ) -> Arc<PlayoutHandle> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    // Meters float at this silence floor until the playout callback first
+    // runs and starts storing real ballistic readings — 0 bits would decode
+    // as 0.0 dBFS (full-scale), pinning the web remote's meters at 100% red
+    // while the stream is stopped.
+    let silence_bits = obcast_proto::meter::linear_to_dbfs(0.0).to_bits();
     let handle = Arc::new(PlayoutHandle {
         running: AtomicBool::new(false),
         paused: AtomicBool::new(false),
@@ -663,12 +668,12 @@ pub fn spawn(
         test_tone: AtomicBool::new(false),
         segment_ms,
         sample_rate: AtomicU32::new(0),
-        vu_l_bits: AtomicU32::new(0),
-        vu_r_bits: AtomicU32::new(0),
-        ppm_l_bits: AtomicU32::new(0),
-        ppm_r_bits: AtomicU32::new(0),
-        peak_l_bits: AtomicU32::new(0),
-        peak_r_bits: AtomicU32::new(0),
+        vu_l_bits: AtomicU32::new(silence_bits),
+        vu_r_bits: AtomicU32::new(silence_bits),
+        ppm_l_bits: AtomicU32::new(silence_bits),
+        ppm_r_bits: AtomicU32::new(silence_bits),
+        peak_l_bits: AtomicU32::new(silence_bits),
+        peak_r_bits: AtomicU32::new(silence_bits),
         underrun: AtomicBool::new(false),
         device_name: RwLock::new(String::new()),
         device_error: RwLock::new(None),
@@ -928,6 +933,17 @@ fn run_engine(
                 handle.position_seq.store(-1, Ordering::Relaxed);
                 handle.playing_rung.store(-1, Ordering::Relaxed);
                 handle.fed_seq.store(-1, Ordering::Relaxed);
+                // Silence the meters rather than leaving them frozen at
+                // whatever they last read while playing — the audio callback
+                // that would otherwise update them stops firing once the
+                // stream is paused below.
+                let silence_bits = obcast_proto::meter::linear_to_dbfs(0.0).to_bits();
+                handle.vu_l_bits.store(silence_bits, Ordering::Relaxed);
+                handle.vu_r_bits.store(silence_bits, Ordering::Relaxed);
+                handle.ppm_l_bits.store(silence_bits, Ordering::Relaxed);
+                handle.ppm_r_bits.store(silence_bits, Ordering::Relaxed);
+                handle.peak_l_bits.store(silence_bits, Ordering::Relaxed);
+                handle.peak_r_bits.store(silence_bits, Ordering::Relaxed);
                 if let Some(old) = session.take() {
                     producer_holder = Some(teardown_decoder_session(old));
                 }
