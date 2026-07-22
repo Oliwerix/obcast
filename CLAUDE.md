@@ -526,6 +526,30 @@ segment steps):
   server round trip), so an evicted segment's color disappears within one WS push instead of lingering
   for up to 5s.
 
+**Client GUI Link panel: buffer graph survives a dropped link, and per-rung stacked buffer quality.**
+Two fixes to `gui/app.rs`'s Link panel, prompted by an operator watching the buffer gauge stay pinned
+at its last-known value through a connection outage instead of visibly draining. (1) `link_panel` used
+to read `self.shared.server` straight off the mutex and use `lead_ms`/`buffered_ms` verbatim — accurate
+while the feed is live, but frozen at whatever number arrived with the last `ServerState` once the SSE
+feed/upload-reply path actually stalls, which reads as "the buffer is fine" during the exact outage
+where it isn't. Both quantities in fact keep draining in real time with nothing arriving to replenish
+them: while playing, `lead_ms` is consumed by playout with no new segment upload to top it back up;
+while stopped, `buffered_ms` (contiguous DVR depth from the live edge) shrinks as the server's DVR
+window evicts its oldest end while the live edge sits frozen (no new segments extending it). New
+`SharedState::server_snapshot()` returns the held state alongside how long it's been since `update()`
+last refreshed it; the Link panel now extrapolates `buffer_ms = raw_buffer_ms.saturating_sub(age_ms)`
+unconditionally — in normal operation `age` stays near zero (state refreshes every tick) so this is a
+no-op, and it only visibly kicks in once the feed actually goes quiet, giving exactly the "60s buffered,
+10s of silence, now shows 50s" behaviour rather than a frozen readout; a "(estimated — link down Ns)"
+suffix appears once `age` crosses the existing `STALE_AFTER` (5s) threshold also used by
+`playing_quality`'s stale-link fallback. (2) "Buffer quality (HD)" — previously a single progress bar
+for "% of covered buffer at the top rung only" — is now "Buffer quality (by rung)", a 100%-stacked bar
+(new `meter::stacked_bar`, plus `meter::rung_color` mapping each enabled rung to a point on a
+red→yellow→green hue ramp, low→high) showing every enabled rung's share of the outstanding buffer at
+once, so the segments always sum to the full covered fraction instead of collapsing the distribution to
+one number. The Link panel's 60s trend sparkline for this metric is kept (relabeled "Buffer quality
+trend (% at top rung)") since a stacked bar has no natural single-line history equivalent.
+
 **What's next.** Everything from the previous "auth split / resource leak / DVR reaping / stalled
 playout state / waveform decode failures / reverse telemetry / packaging / StreamProfile dedup /
 browser DVR scrub / HE-AAC survival rung / scheduler edge-case tests" punch list is now DONE — see the
