@@ -119,11 +119,13 @@ auto-start for the same standing request; requesting a *different* value
 re-arms it.
 
 **Caveat:** while stopped, `buffered_ms` can never exceed the server's DVR
-window (`dvr_window_ms`, 5 minutes by default and not currently exposed to
-or configurable by the client) — eviction keeps trimming `dvr_start_seq`
+window (`OBCAST_DVR_WINDOW_MS`, 5 minutes by default; not exposed to or
+configurable by the client) — eviction keeps trimming `dvr_start_seq`
 forward to hold that window, so a requested buffer larger than it will never
 be satisfied and auto-start will simply never fire. Keep the requested
-buffer comfortably under the server's DVR window.
+buffer comfortably under the server's DVR window, unless the operator has
+set `OBCAST_DVR_WINDOW_MS=0` (unbounded — eviction disabled), in which case
+this caveat doesn't apply.
 
 ### Playout states
 `playout.state` (`PlayoutState`) is one of `stopped` / `playing` / `paused` /

@@ -220,6 +220,12 @@ async fn main() {
     // upload token shouldn't also be able to stop/seek/set-volume the
     // server's hardware output. See CLAUDE.md §8 "auth split".
     let control_token = std::env::var("OBCAST_CONTROL_TOKEN").ok();
+    // 0 disables eviction entirely (an unbounded DVR window, retaining every
+    // segment for the life of the stream) — see `DvrStore::new`.
+    let dvr_window_ms: u32 = std::env::var("OBCAST_DVR_WINDOW_MS")
+        .ok()
+        .map(|v| v.parse().expect("invalid OBCAST_DVR_WINDOW_MS"))
+        .unwrap_or(5 * 60 * 1000);
     let server_cfg = config::ServerConfig::load();
 
     let app_state = Arc::new(AppState {
@@ -227,7 +233,7 @@ async fn main() {
         data_dir,
         profile: StreamProfile::default_ladder(2000),
         water: WaterLevels::default(),
-        dvr_window_ms: 5 * 60 * 1000,
+        dvr_window_ms,
         ingest_token,
         control_token,
         audio: server_cfg.audio,

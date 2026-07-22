@@ -23,7 +23,9 @@ fn epoch_millis() -> u64 {
 pub struct DvrStore {
     profile: StreamProfile,
     water: WaterLevels,
-    dvr_window_segs: u64,
+    /// `None` means an unbounded DVR window (eviction disabled) — see
+    /// `DvrStore::new`'s handling of `dvr_window_ms == 0`.
+    dvr_window_segs: Option<u64>,
     data_dir: PathBuf,
     rev: u64,
     /// seq -> set of rungs present on disk.
@@ -44,13 +46,21 @@ pub struct DvrStore {
 }
 
 impl DvrStore {
+    /// `dvr_window_ms == 0` disables eviction entirely — an unbounded DVR
+    /// window that retains every segment for the life of the stream. The
+    /// operator asking for that is explicitly accepting the disk-space
+    /// consequence; see `OBCAST_DVR_WINDOW_MS` in `docs/getting-started.md`.
     pub fn new(
         profile: StreamProfile,
         water: WaterLevels,
         dvr_window_ms: u32,
         data_dir: PathBuf,
     ) -> Self {
-        let dvr_window_segs = (dvr_window_ms / profile.segment_ms.max(1)).max(1) as u64;
+        let dvr_window_segs = if dvr_window_ms == 0 {
+            None
+        } else {
+            Some((dvr_window_ms / profile.segment_ms.max(1)).max(1) as u64)
+        };
         Self {
             profile,
             water,
@@ -240,10 +250,13 @@ impl DvrStore {
     /// than `dvr_window_ms` of audio as a result, which is the safe
     /// direction to err in.
     fn evict_old(&mut self, playout_pos: Option<Seq>) -> Vec<(Seq, BTreeSet<RungId>)> {
+        let Some(window_segs) = self.dvr_window_segs else {
+            return Vec::new(); // unbounded window: never evict
+        };
         let Some(live) = self.live_seq() else {
             return Vec::new();
         };
-        let mut floor = live.saturating_sub(self.dvr_window_segs);
+        let mut floor = live.saturating_sub(window_segs);
         if let Some(pos) = playout_pos {
             floor = floor.min(pos);
         }
@@ -497,6 +510,21 @@ mod tests {
         }
         assert!(s.dvr_start_seq().unwrap() > 0);
         assert_eq!(s.live_seq(), Some(20));
+    }
+
+    #[test]
+    fn zero_dvr_window_ms_disables_eviction() {
+        let mut s = store(0);
+        let mut all_evicted = Vec::new();
+        for seq in 0..=500 {
+            all_evicted.extend(s.record(0, seq, None));
+        }
+        assert!(
+            all_evicted.is_empty(),
+            "dvr_window_ms=0 must retain every segment, evicted nothing expected"
+        );
+        assert_eq!(s.dvr_start_seq(), Some(0));
+        assert_eq!(s.live_seq(), Some(500));
     }
 
     #[test]
