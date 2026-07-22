@@ -473,6 +473,23 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   time and needs no window-relative anchor at all. Unrelated to (and doesn't touch) the waveform's own
   `waveformBaseSeq`-anchored scrub coordinate frame described above, which is correct as-is for its own
   purpose (positioning within the currently-loaded waveform data).
+- **Same symptom, still live after the fix above: the real culprit was the waveform's own scroll
+  cursor, not the text clock.** The text-clock fix didn't touch `makeServerPlayer()`'s
+  `currentTimeSecs()` — the position peaks.js actually draws its cursor at and scrolls to, i.e. the
+  thing an operator watching the waveform card is looking at — which had the identical bug in a
+  different spot: `anchorMs` was computed as `(position_seq - waveformBaseSeq) * segMs` *once*, at the
+  moment a `status` update arrived, already converted into the waveform's local coordinate frame at
+  that instant. But `waveformBaseSeq` keeps sliding forward independently on every later eviction
+  (`trimEvictedSegments`, called on nearly every subsequent status push) without that anchor ever being
+  recomputed — so between authoritative updates the interpolated reading was stale relative to the
+  *current* base: systematically too high, clamped down to `durationSecs` (itself capped to the DVR
+  window size), reading as the cursor pinning near the window size and visibly snapping backward on
+  each correcting update. Fixed by making the interpolation anchor (`anchorAbsMs`) an absolute
+  elapsed-time reading (`position_seq * segMs`, same fixed seq-0 origin as the text-clock fix) instead
+  of pre-converting into the local frame, and converting to `waveformBaseSeq`-relative coordinates
+  fresh on every `currentTimeSecs()` call rather than storing a conversion that can go stale. This also
+  simplified `updateFromStatus`: it no longer needs to gate the anchor update on `waveformBaseSeq`
+  being known yet.
 - **DVR window size is now configurable, with an explicit "unbounded" mode.** `dvr_window_ms` used to
   be a hardcoded 5-minute constant in `main.rs`, and `DvrStore::new` additionally clamped it to a
   minimum of 1 segment (`.max(1)`) — so there was no way to ask for "never evict," and the auto-start

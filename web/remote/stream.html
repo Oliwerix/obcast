@@ -664,14 +664,34 @@ function colorForRung(rung, failed) {
 // drifting the cursor away from the color segment it was actually over.
 // Anchoring both to the same value keeps them exact by construction.
 function makeServerPlayer() {
-  // Wall-clock interpolation: `anchorMs`/`anchorWallClock` are the last
+  // Wall-clock interpolation: `anchorAbsMs`/`anchorWallClock` are the last
   // authoritative elapsed-ms reading and the `performance.now()` it arrived
   // at. While playing, `currentTimeSecs()` extrapolates forward from that
   // anchor instead of waiting for the next server update, and a rAF loop
   // emits it every frame — this is what makes the playhead (and peaks.js's
   // autoScroll, which is driven purely by emitted 'player.timeupdate' calls)
   // move smoothly instead of jumping once per `status`/`position` event.
-  let anchorMs = 0;
+  //
+  // `anchorAbsMs` is deliberately an *absolute* elapsed-time reading
+  // (position_seq * segMs, from a fixed seq-0 origin — see the fix to
+  // updatePlayoutTime() above for the same reasoning), not relative to
+  // `waveformBaseSeq`. It used to be computed as
+  // `(position_seq - waveformBaseSeq) * segMs`, i.e. already converted into
+  // the waveform's local coordinate frame at the moment a `status` update
+  // arrived — but `waveformBaseSeq` keeps sliding forward independently on
+  // every later eviction (`trimEvictedSegments`, called on nearly every
+  // subsequent status push) without ever recomputing that anchor. Between
+  // authoritative updates the interpolated reading was therefore stale
+  // *relative to the current base*: systematically too high, clamped down to
+  // `durationSecs` (itself capped to the DVR window size), which read as the
+  // cursor pinning near the window size and visibly snapping backward each
+  // time the next status update recomputed it correctly — the same "stuck
+  // around 4 minutes, jumps back" symptom as the text-clock bug, just in the
+  // waveform's scroll cursor instead. Keeping the anchor absolute and
+  // converting to the waveform's local frame fresh on every read (in
+  // `currentTimeSecs()` below) means a `waveformBaseSeq` shift is reflected
+  // immediately and correctly, with no stale intermediate state possible.
+  let anchorAbsMs = 0;
   let anchorWallClock = null;
   let playing = false;
   let durationSecs = 0;
@@ -680,11 +700,22 @@ function makeServerPlayer() {
   let segMs = 2000;
   let emitter = null;
 
-  function currentTimeSecs() {
+  function absoluteElapsedMs() {
     if (anchorWallClock == null) return 0;
-    let elapsedMs = anchorMs;
-    if (playing) elapsedMs += performance.now() - anchorWallClock;
-    return Math.max(0, Math.min(durationSecs, elapsedMs / 1000));
+    let ms = anchorAbsMs;
+    if (playing) ms += performance.now() - anchorWallClock;
+    return Math.max(0, ms);
+  }
+
+  // Converts the absolute elapsed-time anchor into the *currently loaded
+  // waveform's* local coordinate frame (0 at `waveformBaseSeq`) — what
+  // peaks.js needs for pixel positioning — recomputed fresh on every call so
+  // a `waveformBaseSeq` change (eviction trim, or a fresh waveform fetch) is
+  // always reflected exactly, never against a stale conversion.
+  function currentTimeSecs() {
+    if (waveformBaseSeq == null) return 0;
+    const localMs = absoluteElapsedMs() - waveformBaseSeq * segMs;
+    return Math.max(0, Math.min(durationSecs, localMs / 1000));
   }
 
   function tick() {
@@ -721,9 +752,9 @@ function makeServerPlayer() {
         lastLiveSeq = s.live_seq;
         durationSecs = ((s.live_seq - s.dvr_start_seq + 1) * segMs) / 1000;
       }
-      if (s.playout.position_seq != null && waveformBaseSeq != null) {
+      if (s.playout.position_seq != null) {
         const subMs = s.playout.position_ms_into_segment ?? 0;
-        anchorMs = (s.playout.position_seq - waveformBaseSeq) * segMs + subMs;
+        anchorAbsMs = s.playout.position_seq * segMs + subMs;
         anchorWallClock = performance.now();
       }
       const wasPlaying = playing;
