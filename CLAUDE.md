@@ -719,6 +719,27 @@ on its next invocation and acks via `flushed_generation`, and the command loop w
 freshly spawned decoder session start writing — otherwise a flush racing a few milliseconds late
 could wipe the new session's first samples along with the stale ones.
 
+**Fixed: the web remote waveform still jumped backward in time, a few minutes into a stream, after
+every earlier anchor-math fix for this same symptom.** Reported directly: "the waveform time is still
+wrong and starts jumping after around the 4 minute mark and just jumps back in time" — after the
+`anchorAbsMs`/`durationSecs`/`waveformBaseSeq` fixes above had already closed every miscomputation
+found in how the playhead position is *derived*. The remaining bug wasn't in that math at all: it was
+a race in how `stream.html`'s `applyWaveform()` polls `GET /api/{stream}/waveform` (every 5s,
+`setInterval`). That endpoint decodes every segment in the DVR window via a serial `ffmpeg` spawn per
+segment (see `waveform.rs`'s handler docs on why the store lock is dropped before that runs) — cheap
+for a fresh stream's small window, but the decode cost scales with window size, and as a stream runs
+long enough for its window to fill out toward the full multi-minute size, that decode time grows past
+the 5s poll interval. Once it does, requests overlap in flight, and completion order stops matching
+issue order: an earlier request (which snapshotted an earlier, smaller DVR state) can finish *after* a
+later, faster one and clobber `waveformBaseSeq`/`durationSecs` with stale, smaller values — visibly
+snapping the cursor backward, and only once the stream has run long enough for decode time to catch up
+with the poll interval, matching the reported "around the 4 minute mark" onset exactly. Fixed with a
+monotonic `waveformFetchSeq` counter bumped when a request is *sent* (not when it finishes); a response
+is applied only if its counter value is still the highest one applied so far, so a stale response is
+dropped no matter how the network or server reorders completions. `trimEvictedSegments`'s client-side
+eviction trims are synchronous and unaffected by this race — only the periodic full re-fetch needed
+the guard.
+
 ---
 
 ## 9. Conventions
