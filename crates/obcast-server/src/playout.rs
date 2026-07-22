@@ -650,6 +650,47 @@ fn flush_ring_and_pending(handle: &Arc<PlayoutHandle>) {
     }
 }
 
+/// Tears down `session` (if any) without risking the engine command loop
+/// hanging forever. `teardown_decoder_session` joins the old session's
+/// reader thread — but that thread can be blocked indefinitely inside
+/// `push_all`, waiting for ring space that only opens up once the cpal
+/// output callback pops from (or clears) the ring, which never happens
+/// while the stream is paused. Previously `Start`/`Stop`/`Seek` each called
+/// `teardown_decoder_session` directly while the engine could still be
+/// paused from a prior `Pause`, so `reader.join()` could block forever —
+/// wedging the whole command loop (and every future command with it) the
+/// moment an operator paused, then moved the playhead (`Seek`) or pressed
+/// `Stop`. Fixed by making sure the stream is genuinely running and
+/// flushing *before* the teardown, so a stuck reader thread has room to
+/// finish and actually gets joined — then flushing once more, since the old
+/// reader was still alive (and could still be writing) during that first
+/// flush, to mop up whatever it squeezed in before `teardown_decoder_session`
+/// killed it. Restores whatever paused state the caller had going in —
+/// `Seek` wants to come out the other side still paused if it went in
+/// paused; `Start`/`Stop` already force their own end state via
+/// `handle.paused`/an explicit `stream.play()`/`pause()` right after this
+/// returns, so restoring here is a no-op for them.
+fn teardown_session_safely(
+    session: &mut Option<DecoderSession>,
+    producer_holder: &mut Option<ringbuf::HeapProd<f32>>,
+    handle: &Arc<PlayoutHandle>,
+    stream: &cpal::Stream,
+) {
+    if session.is_none() {
+        return;
+    }
+    let was_paused = handle.paused.load(Ordering::Relaxed);
+    let _ = stream.play();
+    flush_ring_and_pending(handle);
+    if let Some(old) = session.take() {
+        *producer_holder = Some(teardown_decoder_session(old));
+    }
+    flush_ring_and_pending(handle);
+    if was_paused {
+        let _ = stream.pause();
+    }
+}
+
 /// Tears down any existing decoder session and starts a fresh one — used by
 /// `Start`/`Seek` (a discontinuity the old session's buffered state can't
 /// straddle) and by the feed loop when a stdin write fails (the decoder
@@ -984,14 +1025,11 @@ fn run_engine(
                 // callback will clear this on its first full buffer.
                 handle.underrun.store(true, Ordering::Relaxed);
                 pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
-                if let Some(old) = session.take() {
-                    producer_holder = Some(teardown_decoder_session(old));
-                }
-                // `flush_ring_and_pending` needs the output callback to
-                // actually run in order to ack the flush — a Start right
-                // after Stop finds the stream paused, so `play()` first.
-                let _ = stream.play();
-                flush_ring_and_pending(&handle);
+                // `teardown_session_safely` needs the output callback to
+                // actually run in order to unblock a stuck reader thread and
+                // ack the flush — a Start right after Stop finds the stream
+                // paused, so it plays the stream first (see its doc comment).
+                teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
                 restart_decoder_session(
                     &mut session,
                     &mut producer_holder,
@@ -1020,9 +1058,7 @@ fn run_engine(
                 handle.ppm_r_bits.store(silence_bits, Ordering::Relaxed);
                 handle.peak_l_bits.store(silence_bits, Ordering::Relaxed);
                 handle.peak_r_bits.store(silence_bits, Ordering::Relaxed);
-                if let Some(old) = session.take() {
-                    producer_holder = Some(teardown_decoder_session(old));
-                }
+                teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
                 let _ = stream.pause();
                 tracing::info!("playout stopped");
             }
@@ -1055,11 +1091,20 @@ fn run_engine(
                 // the old one as that stale backlog (and `pending`'s
                 // matching seq entries, which `drain_pending` reads
                 // `position_seq` off of) works its way through.
+                //
+                // If the engine was already paused when this seek arrived,
+                // the old session's reader thread could easily be sitting
+                // blocked inside `push_all` (nothing was draining the ring
+                // while paused) — `teardown_session_safely` (unlike the raw
+                // `teardown_decoder_session` this used to call directly)
+                // makes sure the stream actually runs long enough to unblock
+                // and join it, then restores the paused state afterward, so
+                // a paused seek stays paused rather than starting to play
+                // audibly or wedging the whole engine command loop forever
+                // (see its doc comment — this was the "pause, then move the
+                // playhead, and it locks up for good" bug).
                 pending_skip_samples = skip_samples(skip_ms, sample_rate, segment_ms);
-                if let Some(old) = session.take() {
-                    producer_holder = Some(teardown_decoder_session(old));
-                }
-                flush_ring_and_pending(&handle);
+                teardown_session_safely(&mut session, &mut producer_holder, &handle, &stream);
                 restart_decoder_session(
                     &mut session,
                     &mut producer_holder,

@@ -264,7 +264,23 @@ document.getElementById('btn-playpause').onclick = () => {
   } else if (state === 'paused') {
     post(`/api/${stream}/playout`, { cmd: 'resume' });
   } else {
-    post(`/api/${stream}/playout`, { cmd: 'start', position: { kind: 'live' } });
+    // Stopped: start from wherever the playhead was last parked (e.g. a
+    // scrub on the waveform or the seek-to-offset field before ever
+    // pressing play) rather than always jumping to the live edge.
+    // `position_seq` survives a `seek` issued while stopped -- the server
+    // sets it unconditionally (see playout.rs's Seek handler), it just
+    // doesn't produce audio until something actually starts the engine --
+    // and goes back to null on a real `stop`, so a stream that's never
+    // been scrubbed still correctly falls back to live.
+    const s = lastStatus?.server;
+    const posSeq = s?.playout?.position_seq;
+    let position = { kind: 'live' };
+    if (posSeq != null && s.live_seq != null) {
+      const subMs = s.playout.position_ms_into_segment ?? 0;
+      const behindMs = Math.max(0, (s.live_seq - posSeq) * segmentMs - subMs);
+      position = { kind: 'millis_behind_live', value: behindMs };
+    }
+    post(`/api/${stream}/playout`, { cmd: 'start', position });
   }
 };
 document.getElementById('btn-stop').onclick = () => post(`/api/${stream}/playout`, { cmd: 'stop' });
