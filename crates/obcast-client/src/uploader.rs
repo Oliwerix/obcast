@@ -27,10 +27,17 @@ pub struct Config {
     /// Requested auto-start buffer, in ms — forwarded to the server on every
     /// heartbeat as `EncoderState::auto_start_buffer_ms`. `None` disables it.
     pub auto_start_buffer_ms: Option<u32>,
-    /// Operator's preferred rung to assume for the bootstrap bandwidth guess
-    /// before real throughput/`ServerState` feedback arrives. Resolved
-    /// against `profile` via `StreamProfile::nearest_enabled_or_low` in case
-    /// it's since been disabled.
+    /// Operator's "default quality" pick: the rung to assume for the
+    /// bootstrap bandwidth guess before real throughput/`ServerState`
+    /// feedback arrives, *and* (every tick, not just at bootstrap) the rung
+    /// `plan_uploads`'s live-edge tier tries first for newest-segment
+    /// coverage, falling back to the profile's low rung when it's not
+    /// affordable or not yet encoded locally (see
+    /// `scheduler::SchedulerInput::preferred_rung`). Continuity is
+    /// unaffected — it always uses the low rung regardless, so this never
+    /// weakens the no-dropout guarantee. Resolved against `profile` via
+    /// `StreamProfile::nearest_enabled_or_low` in case it's since been
+    /// disabled.
     pub bootstrap_rung: RungId,
 }
 
@@ -155,6 +162,7 @@ pub async fn run(client: reqwest::Client, cfg: Config, shared: Arc<SharedState>)
             throughput_kbps,
             headroom: 0.9,
             max_actions: 16,
+            preferred_rung: bootstrap_rung,
         });
 
         // Updated every tick (not gated by the heartbeat interval below) so

@@ -88,6 +88,17 @@ pub struct SchedulerInput<'a> {
     pub headroom: f32,
     /// Cap on actions returned per tick.
     pub max_actions: usize,
+    /// Operator's chosen "default quality" rung (resolved against `profile`
+    /// via `StreamProfile::nearest_enabled_or_low`, so this is always a rung
+    /// actually present in `profile`). Tier B (live edge) tries this rung
+    /// first for newest-segment coverage when it's locally available and
+    /// fits the tick's bandwidth budget, falling back to `profile.low_rung()`
+    /// otherwise — so the picker has a real, immediate effect on a link that
+    /// can sustain it, without weakening the dropout guarantee: Tier A
+    /// (continuity) is untouched and always uses the cheap low rung
+    /// regardless of this field. Set equal to `profile.low_rung()` to
+    /// recover the previous always-low-rung live-edge behavior.
+    pub preferred_rung: RungId,
 }
 
 const P_CONTINUITY: u32 = 0;
@@ -123,6 +134,7 @@ pub fn plan_uploads(input: &SchedulerInput) -> Vec<UploadAction> {
         throughput_kbps,
         headroom,
         max_actions,
+        preferred_rung,
     } = *input;
 
     let seg_ms = profile.segment_ms.max(1);
@@ -185,9 +197,20 @@ pub fn plan_uploads(input: &SchedulerInput) -> Vec<UploadAction> {
 
     let survival = lead_ms < server.water.low_ms;
 
-    // ---- Tier B: Live edge. Ensure the newest ~target window is covered at the
-    // low rung so the DVR stays contiguous and go-live is instant. Skipped in
-    // survival mode (every byte must go to continuity near the head).
+    // ---- Tier B: Live edge. Ensure the newest ~target window is covered so
+    // the DVR stays contiguous and go-live is instant. Skipped in survival
+    // mode (every byte must go to continuity near the head).
+    //
+    // Tries the operator's `preferred_rung` (the "default quality" picker)
+    // first when it's cheaply affordable and locally available, falling back
+    // to the guaranteed-cheap low rung otherwise — this is the only tier
+    // `preferred_rung` affects; continuity (Tier A) always uses `low`
+    // unconditionally, so the dropout guarantee never depends on this
+    // picker's accuracy. Without this, an operator's chosen default rung had
+    // no observable effect at all: continuity ignores it, live-edge was
+    // hardcoded to `low`, and upgrades don't engage until well past when any
+    // seeded bandwidth guess would have been overwritten by real
+    // measurements — see CLAUDE.md's "default quality selector" entry.
     let mut spent = continuity_cost;
     if !survival {
         let window_segs = (server.water.target_ms / seg_ms).max(1) as u64;
@@ -196,20 +219,36 @@ pub fn plan_uploads(input: &SchedulerInput) -> Vec<UploadAction> {
             if out.len() >= max_actions {
                 return finish(out, max_actions);
             }
-            if !inv.server_has_any(s) && inv.has_rung(s, low) && !already(&out, s) {
-                let c = cost(low);
-                if spent + c > budget_kbits {
-                    break;
-                }
-                spent += c;
-                out.push(UploadAction {
-                    seq: s,
-                    rung: low,
-                    reason: UploadReason::LiveEdge,
-                    // newest-first within the tier
-                    priority: P_LIVE_EDGE + (inv.encoded_seq.saturating_sub(s)) as u32,
-                });
+            if inv.server_has_any(s) || already(&out, s) {
+                continue;
             }
+            let preferred_fits = preferred_rung != low
+                && inv.has_rung(s, preferred_rung)
+                && spent + cost(preferred_rung) <= budget_kbits;
+            let rung = if preferred_fits {
+                Some(preferred_rung)
+            } else if inv.has_rung(s, low) {
+                Some(low)
+            } else {
+                None
+            };
+            let Some(rung) = rung else { continue };
+            let c = cost(rung);
+            if spent + c > budget_kbits {
+                // Even the cheapest option (`low`) doesn't fit — `low` is by
+                // construction the lowest-cost rung in the profile, so no
+                // later, equally-or-more-expensive segment this tick will
+                // fit either; stop scanning.
+                break;
+            }
+            spent += c;
+            out.push(UploadAction {
+                seq: s,
+                rung,
+                reason: UploadReason::LiveEdge,
+                // newest-first within the tier
+                priority: P_LIVE_EDGE + (inv.encoded_seq.saturating_sub(s)) as u32,
+            });
         }
     }
 
@@ -396,6 +435,7 @@ mod tests {
             throughput_kbps: 40, // barely enough for the 32k rung
             headroom: 0.9,
             max_actions: 8,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input);
 
@@ -430,6 +470,7 @@ mod tests {
             throughput_kbps: 5000, // huge headroom
             headroom: 0.9,
             max_actions: 20,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input);
 
@@ -469,6 +510,7 @@ mod tests {
             throughput_kbps: 5000,
             headroom: 0.9,
             max_actions: 20,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input);
 
@@ -510,6 +552,7 @@ mod tests {
             throughput_kbps: 5000,
             headroom: 0.9,
             max_actions: 20,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input);
         let upgrades: Vec<_> = plan
@@ -550,6 +593,7 @@ mod tests {
             throughput_kbps: 5000,
             headroom: 0.9,
             max_actions: 50,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input);
         assert!(plan
@@ -620,6 +664,7 @@ mod tests {
             throughput_kbps: 5000,
             headroom: 0.9,
             max_actions: 100,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input);
 
@@ -665,6 +710,7 @@ mod tests {
             throughput_kbps: 5000,
             headroom: 0.9,
             max_actions: 50,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input);
 
@@ -699,6 +745,7 @@ mod tests {
             throughput_kbps: 5000,
             headroom: 0.9,
             max_actions: 50,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input); // must not panic
                                          // Hard invariant that must hold no matter how water levels are
@@ -723,6 +770,7 @@ mod tests {
             throughput_kbps: 5000,
             headroom: 0.9,
             max_actions: 20,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input);
         // Anchor is the live edge (50); continuity fills the missing tail so a
@@ -746,6 +794,7 @@ mod tests {
             throughput_kbps: 5000,
             headroom: 0.9,
             max_actions: 20,
+            preferred_rung: 0,
         };
         let plan = plan_uploads(&input);
         assert!(plan.iter().any(|a| a.seq >= 41));
@@ -778,6 +827,7 @@ mod tests {
             throughput_kbps: 100, // barely enough for the 96k rung, not more
             headroom: 0.9,
             max_actions: 8,
+            preferred_rung: 1, // low_rung() of filtered=[1,2,3]
         };
         let plan = plan_uploads(&input);
 
@@ -820,6 +870,7 @@ mod tests {
                 throughput_kbps: 5000, // huge headroom
                 headroom: 0.9,
                 max_actions: 20,
+                preferred_rung: 0, // low_rung() of filtered=[0,1,2]
             };
             let plan: Vec<UploadAction> = plan_uploads(&input);
             assert!(
@@ -838,6 +889,164 @@ mod tests {
         assert!(
             (31..=35).all(|s| server_best.get(&s) == Some(&Some(2))),
             "expected every upgraded segment to plateau at the enabled top rung (2): {server_best:?}"
+        );
+    }
+
+    /// The operator's "default quality" picker (`preferred_rung`) must have a
+    /// real, immediate effect: with ample bandwidth, Tier B (live edge)
+    /// should cover the newest window at the preferred rung, not just `low`.
+    /// Regression test for the picker being a complete no-op (see CLAUDE.md).
+    #[test]
+    fn live_edge_prefers_the_operator_chosen_default_rung_when_budget_allows() {
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 16000,
+        };
+        // Anchor at the live edge (stopped) with plenty already secured
+        // behind it isn't needed here — just enough lead to leave survival
+        // mode so Tier B actually runs.
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        // Server already holds everything up to 27 (>= target_ms/seg_ms=4
+        // segments past the anchor), so continuity is fully satisfied and
+        // lead_ms comfortably clears `low_ms` — not in survival mode.
+        let cov: Vec<(Seq, Option<RungId>)> = (20..=30).map(|s| (s, Some(0))).collect();
+        let inv = inv_full(0, 50, &cov);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000, // huge headroom, preferred rung easily affordable
+            headroom: 0.9,
+            max_actions: 20,
+            preferred_rung: 3, // operator picked "hd"
+        };
+        let plan = plan_uploads(&input);
+
+        let live_edge: Vec<_> = plan
+            .iter()
+            .filter(|a| a.reason == UploadReason::LiveEdge)
+            .collect();
+        assert!(!live_edge.is_empty(), "expected some live-edge coverage");
+        assert!(
+            live_edge.iter().all(|a| a.rung == 3),
+            "live edge should use the operator's preferred rung when affordable: {live_edge:?}"
+        );
+    }
+
+    /// When the preferred rung doesn't fit the tick's bandwidth budget,
+    /// live edge must still fall back to the cheap low rung rather than
+    /// leaving the newest window uncovered.
+    #[test]
+    fn live_edge_falls_back_to_low_rung_when_preferred_rung_exceeds_budget() {
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 16000,
+        };
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let cov: Vec<(Seq, Option<RungId>)> = (20..=30).map(|s| (s, Some(0))).collect();
+        let inv = inv_full(0, 50, &cov);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            // Barely enough for the 48kbps low rung, nowhere near the
+            // 320kbps "hd" rung the operator picked.
+            throughput_kbps: 60,
+            headroom: 0.9,
+            max_actions: 20,
+            preferred_rung: 3, // operator picked "hd"
+        };
+        let plan = plan_uploads(&input);
+
+        let live_edge: Vec<_> = plan
+            .iter()
+            .filter(|a| a.reason == UploadReason::LiveEdge)
+            .collect();
+        assert!(
+            !live_edge.is_empty(),
+            "expected a low-rung fallback, not silence"
+        );
+        assert!(
+            live_edge.iter().all(|a| a.rung == 0),
+            "starved link must fall back to the cheap low rung: {live_edge:?}"
+        );
+    }
+
+    /// If the preferred rung isn't locally available yet (e.g. that rung's
+    /// encode hasn't caught up), live edge must fall back to low rather than
+    /// skip the segment entirely.
+    #[test]
+    fn live_edge_falls_back_to_low_rung_when_preferred_rung_not_locally_available() {
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 16000,
+        };
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let cov: Vec<(Seq, Option<RungId>)> = (20..=30).map(|s| (s, Some(0))).collect();
+        let mut inv = inv_full(0, 50, &cov);
+        // Only the low rung has actually been encoded locally for the newest
+        // segments — the "hd" rung hasn't been produced yet.
+        for s in 31..=50 {
+            inv.available.insert(s, vec![0]);
+        }
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000,
+            headroom: 0.9,
+            max_actions: 20,
+            preferred_rung: 3,
+        };
+        let plan = plan_uploads(&input);
+
+        let live_edge: Vec<_> = plan
+            .iter()
+            .filter(|a| a.reason == UploadReason::LiveEdge)
+            .collect();
+        assert!(!live_edge.is_empty());
+        assert!(
+            live_edge.iter().all(|a| a.rung == 0),
+            "must fall back to low when the preferred rung isn't on disk yet: {live_edge:?}"
+        );
+    }
+
+    /// `preferred_rung` must never leak into Tier A (continuity) — continuity
+    /// is the dropout-safety net and must always use the cheap low rung
+    /// regardless of the operator's chosen default quality.
+    #[test]
+    fn continuity_ignores_preferred_rung_even_with_ample_budget() {
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 16000,
+        };
+        // Draining scenario, same shape as
+        // `draining_flaky_link_sends_low_rung_at_playout_head_only`, but now
+        // with a high-quality `preferred_rung` and huge bandwidth to prove
+        // continuity still never touches anything but low.
+        let srv = server(PlayoutState::Playing, Some(20), water);
+        let inv = inv_full(0, 50, &[]);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000,
+            headroom: 0.9,
+            max_actions: 8,
+            preferred_rung: 3,
+        };
+        let plan = plan_uploads(&input);
+
+        assert!(!plan.is_empty());
+        assert!(
+            plan.iter()
+                .filter(|a| a.reason == UploadReason::Continuity)
+                .all(|a| a.rung == 0),
+            "continuity must never use preferred_rung: {plan:?}"
         );
     }
 }
