@@ -503,6 +503,35 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   `dvr_start_seq` stays at the first seq ever recorded. An unbounded window means unbounded disk use for
   the life of the stream — that's the operator's explicit choice in setting `0`, not a default; both
   `docs/getting-started.md`'s env var table and the auto-start caveat in `docs/protocol.md` say so.
+- **Fixed: the client GUI's "Default quality" picker (`AppConfig::default_rung`, the "ABR ladder
+  rework" milestone above) was a complete no-op.** Reported directly by an operator: picking a
+  higher default quality (e.g. "hd") had no effect at all — the stream always started at the
+  lowest rung. Root cause: the picker only ever fed `uploader::Config::bootstrap_rung` into a
+  one-time seed of `throughput_kbps` before the first real upload. That seed could never actually
+  reach any observable behavior: Tier A (continuity) ignores `throughput_kbps` entirely and always
+  targets the low rung; Tier B (live edge) is skipped outright while in survival mode
+  (`lead_ms < water.low_ms`), which covers essentially the whole ramp-up period right after going
+  live; and Tier C (upgrade) doesn't engage until `lead_ms >= water.high_ms` (20s of buffer), by
+  which point dozens of real uploads have already overwritten the seed (`throughput_kbps` is
+  recalculated after *every* successful upload, not just the first). So the picker's chosen value
+  was read once, influenced nothing, and was stale before any tier that might have consulted it
+  ever ran. Fixed by giving `SchedulerInput` a new `preferred_rung` field that Tier B (live edge)
+  now actually consults: it tries the operator's chosen rung first for newest-segment coverage
+  when it's both locally available and affordable within the tick's bandwidth budget, falling back
+  to the profile's low rung otherwise (unavailable, or budget-constrained) — so a link that can
+  sustain it visibly starts higher, while a link that can't still gets the safe fallback. Tier A
+  (continuity) is deliberately untouched — it always uses the low rung regardless of
+  `preferred_rung`, so the no-dropout guarantee never depends on the operator's quality pick being
+  achievable. `uploader.rs` threads the already-resolved `bootstrap_rung` (via
+  `StreamProfile::nearest_enabled_or_low`, in case the picked rung has since been disabled) into
+  `preferred_rung` every tick, not just at startup, so a config change takes effect on the very
+  next go-live as the GUI's hover text already promised. Five new `scheduler.rs` tests cover the
+  new behavior and its edges: live edge prefers the picked rung when affordable, falls back to low
+  when the picked rung exceeds the tick budget, falls back to low when the picked rung isn't
+  locally encoded yet, and continuity ignores `preferred_rung` even with ample budget and a
+  high-quality pick. All pre-existing tests were updated to pass `preferred_rung: low_rung()`
+  (recovering the previous always-low-rung live-edge behavior) and pass unchanged, confirming the
+  fix is additive rather than a behavior change for callers that don't set a preference.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);

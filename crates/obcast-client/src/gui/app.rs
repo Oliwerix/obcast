@@ -658,8 +658,10 @@ impl ObcastApp {
             })
             .response
             .on_hover_text(
-                "The rung the encoder assumes before real link feedback arrives. Takes effect \
-                 next time you go live — no restart needed.",
+                "The rung the encoder assumes before real link feedback arrives, and prefers \
+                 for newest-segment coverage whenever the link can sustain it — falling back \
+                 to the low rung otherwise, so this never risks dropout. Takes effect next \
+                 time you go live — no restart needed.",
             );
         if self.cfg.default_rung != before {
             self.persist_config();
