@@ -532,6 +532,39 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   high-quality pick. All pre-existing tests were updated to pass `preferred_rung: low_rung()`
   (recovering the previous always-low-rung live-edge behavior) and pass unchanged, confirming the
   fix is additive rather than a behavior change for callers that don't set a preference.
+- **Fixed: "Default quality" was still a no-op for the whole pre-roll phase — before the playhead
+  is ever initialized.** The fix above made Tier B (live edge) honor `preferred_rung`, but only
+  once `server.playout.state` is `Playing`/`Paused`/`Stalled` *and* there's already a real gap
+  between the anchor and the live edge (the normal "playing with a healthy buffer" shape the fix's
+  tests all used). Reported directly: start the client with quality set to "mid" and the very first
+  segments still go out at the lowest rung. Root cause: `anchor()` falls back to the live edge
+  itself while `server.playout.state` is `Stopped` (no position has ever been set — true right
+  after starting the encoder, and for the whole time a stream is buffering toward
+  `auto_start_buffer_ms`, see the "encoder-requested auto-start" entry below). With the anchor
+  pinned to the tip, Tier A's "secure `target_ms` of lead ahead of the anchor" walk resolves, every
+  tick, to "the one segment just encoded" — there's no pre-existing buffer ahead of the live edge
+  for a healthy link to ever separate from — so continuity claimed literally every newly-produced
+  segment, always at the low rung (its unconditional, deliberate behavior whenever a real playout
+  head is being defended). Tier B's identical newest-window scan then found nothing left to do.
+  Net effect: for as long as a stream stays stopped — which is the entire pre-roll window
+  auto-start is built around — every segment banked into the DVR was low quality regardless of the
+  operator's pick, and by the time playout actually started (at `dvr_start_seq`, i.e. the *oldest*
+  end of that buffer), Tier C's one-rung-per-tick ratcheting meant re-upgrading minutes of
+  already-low backlog instead of it having been recorded correctly the first time. Fixed by adding
+  a `has_active_head` check (`Playing | Paused | Stalled`) inside Tier A itself: with an active head,
+  behavior is unchanged (always low, unconditionally — the existing
+  `continuity_ignores_preferred_rung_even_with_ample_budget` test still passes untouched); without
+  one, continuity now tries `preferred_rung` first (same affordability/availability check Tier B
+  uses) and only falls back to `low` — still bursting past the tick budget, same as its ordinary
+  no-gap guarantee — when the preferred rung doesn't fit or isn't encoded yet. This keeps the
+  dropout guarantee intact for the one case it still matters while stopped: the web remote's
+  "start" button defaults to `position: live` (`stream.html`), so an operator hitting start with no
+  explicit scrub position can snap straight to the tip at any moment, and a low-rung fallback must
+  still be there when they do. Three new `scheduler.rs` tests cover the stopped/uninitialized case
+  directly: continuity banks the preferred rung with ample bandwidth, falls back to low when it's
+  unaffordable, and falls back to low when it hasn't been encoded locally yet — mirroring the three
+  Tier B tests above but for `PlayoutState::Stopped, position_seq: None` instead of a healthy
+  in-progress buffer.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);

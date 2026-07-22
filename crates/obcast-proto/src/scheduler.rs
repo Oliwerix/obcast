@@ -156,9 +156,36 @@ pub fn plan_uploads(input: &SchedulerInput) -> Vec<UploadAction> {
     // don't over-schedule a starved link.
     let mut continuity_cost = 0.0f32;
 
+    // Whether there's an actual playout head being defended right now. When
+    // there isn't (Stopped/Error — no position has ever been initialized,
+    // e.g. a stream that hasn't gone live yet, or is buffering toward
+    // auto-start), `anchor` falls back to the live edge itself (see
+    // `anchor()`), so "secure `target_ms` of lead ahead of the anchor" always
+    // resolves to "every segment as it's produced" — there's no pre-existing
+    // buffer ahead of the tip for a healthy link to ever separate from it.
+    // Left unconditionally low-rung, this silently ate 100% of every tick's
+    // uploads for as long as the stream stays stopped, which starves Tier B
+    // entirely (its newest-window scan finds these seqs already claimed) and
+    // means the operator's "default quality" picker has zero effect during
+    // exactly the phase that matters most for it: pre-roll buffering before a
+    // manual or auto-start. See CLAUDE.md's "default quality selection...
+    // playhead position is not yet initialized" entry.
+    let has_active_head = matches!(
+        server.playout.state,
+        crate::state::PlayoutState::Playing
+            | crate::state::PlayoutState::Paused
+            | crate::state::PlayoutState::Stalled
+    );
+
     // ---- Tier A: Continuity. Walk the contiguous frontier from the anchor
-    // forward; fill any hole with the low rung until we've secured
-    // `water.high_ms` of contiguous audio — not just `target_ms`.
+    // forward; fill any hole until we've secured `water.high_ms` of
+    // contiguous audio — not just `target_ms`. With an active head to
+    // defend, always the low rung — the no-dropout guarantee must never
+    // depend on the operator's quality pick being achievable. Without one,
+    // try `preferred_rung` first (same affordability/availability check
+    // Tier B uses) so pre-roll buffering banks the requested quality, still
+    // falling back to `low` — unconditionally, bursting past budget just like
+    // the active-head case — so a starved link never leaves a gap.
     //
     // `target_ms` alone used to be the stopping point here, which left a real
     // gap: everything between `target_ms` and `high_ms` (and beyond, out to
@@ -188,19 +215,31 @@ pub fn plan_uploads(input: &SchedulerInput) -> Vec<UploadAction> {
     while projected_lead_ms < server.water.high_ms && seq <= inv.encoded_seq {
         if inv.server_has_any(seq) {
             projected_lead_ms = projected_lead_ms.saturating_add(seg_ms);
-        } else if inv.has_rung(seq, low) {
+        } else {
+            let preferred_fits = !has_active_head
+                && preferred_rung != low
+                && inv.has_rung(seq, preferred_rung)
+                && continuity_cost + cost(preferred_rung) <= budget_kbits;
+            let rung = if preferred_fits {
+                Some(preferred_rung)
+            } else if inv.has_rung(seq, low) {
+                Some(low)
+            } else {
+                None
+            };
+            let Some(rung) = rung else {
+                // A near hole we cannot fill (not yet encoded / purged).
+                // Contiguity is broken here; stop extending the frontier.
+                break;
+            };
             out.push(UploadAction {
                 seq,
-                rung: low,
+                rung,
                 reason: UploadReason::Continuity,
                 priority: P_CONTINUITY + (seq.saturating_sub(anchor)) as u32,
             });
-            continuity_cost += cost(low);
+            continuity_cost += cost(rung);
             projected_lead_ms = projected_lead_ms.saturating_add(seg_ms);
-        } else {
-            // A near hole we cannot fill (not yet encoded / purged). Contiguity
-            // is broken here; stop extending the frontier.
-            break;
         }
         if out.len() >= max_actions {
             return finish(out, max_actions);
@@ -1176,9 +1215,14 @@ mod tests {
         );
     }
 
-    /// `preferred_rung` must never leak into Tier A (continuity) — continuity
-    /// is the dropout-safety net and must always use the cheap low rung
-    /// regardless of the operator's chosen default quality.
+    /// `preferred_rung` must never leak into Tier A (continuity) while an
+    /// actual playout head is being defended — continuity is the
+    /// dropout-safety net there and must always use the cheap low rung
+    /// regardless of the operator's chosen default quality. (Continuity
+    /// *does* honor `preferred_rung`, with the same low-rung fallback, when
+    /// there's no active head to defend — see
+    /// `continuity_prefers_operator_chosen_rung_while_stopped_and_uninitialized`
+    /// below — since there's no dropout to protect against yet.)
     #[test]
     fn continuity_ignores_preferred_rung_even_with_ample_budget() {
         let water = WaterLevels {
@@ -1209,6 +1253,127 @@ mod tests {
                 .filter(|a| a.reason == UploadReason::Continuity)
                 .all(|a| a.rung == 0),
             "continuity must never use preferred_rung: {plan:?}"
+        );
+    }
+
+    /// Regression test for the "default quality" picker being a no-op while
+    /// the playhead has never been initialized (`Stopped`, `position_seq:
+    /// None`) — e.g. right after starting the encoder, before a manual or
+    /// auto-start. Anchor falls back to the live edge itself in this case,
+    /// so continuity's "secure `target_ms` ahead of anchor" walk claims
+    /// every newly-produced segment, starving Tier B (whose identical newest-
+    /// window scan finds nothing left to do) and silently pinning pre-roll
+    /// buffering to the low rung regardless of the operator's pick. With
+    /// ample bandwidth, continuity should now bank the preferred rung
+    /// instead.
+    #[test]
+    fn continuity_prefers_operator_chosen_rung_while_stopped_and_uninitialized() {
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 16000,
+        };
+        let srv = server(PlayoutState::Stopped, None, water);
+        // Fresh stream: server has nothing yet, encoder has a little local
+        // backlog (56..=... in the range the loop can consider) at every
+        // rung.
+        let inv = inv_full(0, 55, &[]);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000, // huge headroom, "mid" easily affordable
+            headroom: 0.9,
+            max_actions: 20,
+            preferred_rung: 1, // operator picked "mid"
+        };
+        let plan = plan_uploads(&input);
+
+        let continuity: Vec<_> = plan
+            .iter()
+            .filter(|a| a.reason == UploadReason::Continuity)
+            .collect();
+        assert!(!continuity.is_empty(), "expected pre-roll uploads");
+        assert!(
+            continuity.iter().all(|a| a.rung == 1),
+            "continuity should bank the operator's preferred rung while no \
+             playout head is being defended: {continuity:?}"
+        );
+    }
+
+    /// Same uninitialized-playhead scenario, but the link can't afford the
+    /// preferred rung — continuity must still fall back to `low` (bursting
+    /// past budget, same as its ordinary dropout-safety behavior) rather
+    /// than leaving pre-roll segments unfilled.
+    #[test]
+    fn continuity_falls_back_to_low_rung_while_stopped_when_preferred_rung_unaffordable() {
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 16000,
+        };
+        let srv = server(PlayoutState::Stopped, None, water);
+        let inv = inv_full(0, 55, &[]);
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            // Barely enough for the 48kbps low rung, nowhere near "hd".
+            throughput_kbps: 60,
+            headroom: 0.9,
+            max_actions: 20,
+            preferred_rung: 3,
+        };
+        let plan = plan_uploads(&input);
+
+        let continuity: Vec<_> = plan
+            .iter()
+            .filter(|a| a.reason == UploadReason::Continuity)
+            .collect();
+        assert!(
+            !continuity.is_empty(),
+            "starved link must still fill pre-roll segments, not go silent"
+        );
+        assert!(
+            continuity.iter().all(|a| a.rung == 0),
+            "starved link must fall back to the cheap low rung: {continuity:?}"
+        );
+    }
+
+    /// Same uninitialized-playhead scenario; the preferred rung hasn't been
+    /// encoded locally yet — continuity must fall back to `low` rather than
+    /// stall waiting for it.
+    #[test]
+    fn continuity_falls_back_to_low_rung_while_stopped_when_preferred_rung_not_locally_available() {
+        let water = WaterLevels {
+            low_ms: 4000,
+            target_ms: 8000,
+            high_ms: 16000,
+        };
+        let srv = server(PlayoutState::Stopped, None, water);
+        let mut inv = inv_full(0, 55, &[]);
+        for s in 0..=55 {
+            inv.available.insert(s, vec![0]); // only the low rung is on disk
+        }
+        let input = SchedulerInput {
+            profile: &profile(),
+            server: &srv,
+            inv: &inv,
+            throughput_kbps: 5000,
+            headroom: 0.9,
+            max_actions: 20,
+            preferred_rung: 1,
+        };
+        let plan = plan_uploads(&input);
+
+        let continuity: Vec<_> = plan
+            .iter()
+            .filter(|a| a.reason == UploadReason::Continuity)
+            .collect();
+        assert!(!continuity.is_empty());
+        assert!(
+            continuity.iter().all(|a| a.rung == 0),
+            "must fall back to low when the preferred rung isn't on disk yet: {continuity:?}"
         );
     }
 }
