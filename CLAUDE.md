@@ -546,6 +546,37 @@ the full detail on all three. Nothing left in this list requires further code ch
 has chosen to cut the project's first real release themselves, which is what exercises
 `attach-libfdk-ffmpeg.yml` end-to-end; that's a shipping decision, not outstanding implementation work.
 
+**LUFS-I/LUFS-S/LUFS-M loudness metering (client).** New `obcast-proto/src/loudness.rs`:
+`Loudness`, an ITU-R BS.1770-4 / EBU R128 implementation computing momentary (400 ms), short-term
+(3 s) and integrated (gated, whole-programme) LUFS from post-gain L/R PCM — the same K-weighting +
+gating algorithm behind every standards-based loudness meter, built from scratch (no crate pulled in,
+matching `Vu`/`Ppm`/`Peak` in the same file's sibling `meter.rs`). K-weighting (a high-shelf pre-filter
+cascaded with the RLB high-pass) is re-derived from its analog prototype at whatever sample rate the
+open device actually runs, not hardcoded to the standard's published 48 kHz coefficients, so it stays
+correct at 44.1 kHz too. The integrated reading's two-pass gating (absolute gate at -70 LUFS, then a
+relative gate 10 LU below the resulting mean) is backed by a fixed-size histogram
+(`LoudnessHistogram`, 750 buckets at the same 0.1 LU resolution EBU R128 itself requires for logged
+values) rather than a growing list of every 400 ms block ever measured — deliberate, since an OB
+session can run for hours or days and this is metering, not a one-shot file analysis. Wired into
+`obcast-client/src/audio.rs`: `MeterState` now owns a `Loudness` alongside the existing VU/PPM/Peak
+ballistics, fed the same post-gain `scratch_l`/`scratch_r` blocks every callback (mono duplicates
+into both channels same as the other meters, which reads +3 LU relative to a true single-channel
+signal — the technically correct BS.1770 behavior for genuinely-duplicated dual-mono, not a bug);
+`AudioHandle::lufs()` exposes `(momentary, short_term, integrated)` and
+`AudioHandle::reset_integrated_lufs()` clears just the gated history (e.g. for a new
+programme/segment) via a flag the audio thread applies on its next callback, since the `Loudness`
+instance itself lives on the audio thread and the GUI never touches it directly. Displayed in the
+encoder GUI's Levels panel (`gui/app.rs::meter_panel`) as a compact M/S/I row with a "Reset I" button.
+
+**Status bar overflow fix.** The encoder GUI's top status bar (`gui/app.rs::status_bar`) laid out the
+Log toggle and Stop/Go Live button via `ui.with_layout(right_to_left, ...)` *after* a run of
+unbounded-length left-side content (server `detail` strings, the latest operator log message) in a
+plain `ui.horizontal` — which never wraps or clips, so a long log line or server detail pushed those
+controls past the window's right edge instead of just crowding them. Rewritten with
+`egui::Sides::new().shrink_left().truncate()`: the right side (fixed controls) lays out first at its
+natural size, and the left side gets only whatever width remains, eliding overflow text with "…"
+instead of growing past it — the controls now always stay on-screen regardless of message length.
+
 ---
 
 ## 9. Conventions

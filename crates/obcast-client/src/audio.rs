@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use obcast_proto::loudness::Loudness;
 use obcast_proto::meter::{Peak, Ppm, Vu};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -123,6 +124,19 @@ pub struct AudioHandle {
     peak_r_bits: AtomicU32,
     clip_l: AtomicBool,
     clip_r: AtomicBool,
+
+    /// ITU-R BS.1770-4 / EBU R128 K-weighted programme loudness (LUFS),
+    /// combined across L/R — see `obcast_proto::loudness::Loudness`. Unlike
+    /// the per-channel meters above, this is one reading for the whole
+    /// signal, not two.
+    momentary_lufs_bits: AtomicU32,
+    short_term_lufs_bits: AtomicU32,
+    integrated_lufs_bits: AtomicU32,
+    /// Set by `reset_integrated_lufs()`, cleared by the audio thread once
+    /// it has actually reset `Loudness`'s gated history — a flag rather
+    /// than a direct call since the `Loudness` instance lives on the audio
+    /// thread's `MeterState`, not on this handle.
+    reset_integrated_lufs: AtomicBool,
 
     /// Instantaneous (per-callback) peak for every input channel of the
     /// currently open device, pre-gain — lets the GUI show a meter per
@@ -242,6 +256,29 @@ impl AudioHandle {
         self.clip_r.store(false, Ordering::Relaxed);
     }
 
+    /// ITU-R BS.1770-4 K-weighted programme loudness in LUFS:
+    /// `(momentary, short_term, integrated)`. Momentary covers the last
+    /// 400 ms, short-term the last 3 s (both ungated); integrated is the
+    /// gated whole-programme-so-far reading, reset via
+    /// `reset_integrated_lufs()`. Combined across L/R, post-gain — one
+    /// reading for the signal as a whole, unlike the per-channel meters
+    /// above. Floors at -100.0 (matching this crate's dBFS silence
+    /// convention) before enough audio has been processed.
+    pub fn lufs(&self) -> (f32, f32, f32) {
+        (
+            f32::from_bits(self.momentary_lufs_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.short_term_lufs_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.integrated_lufs_bits.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// Requests that the audio thread clear the integrated LUFS reading's
+    /// gated history — e.g. an operator starting a new programme/segment —
+    /// without reopening the device or disturbing momentary/short-term.
+    pub fn reset_integrated_lufs(&self) {
+        self.reset_integrated_lufs.store(true, Ordering::Relaxed);
+    }
+
     /// Per-channel instantaneous peak (linear, pre-gain) for the currently
     /// open device. Empty until a device is open.
     pub fn channel_peaks(&self) -> Vec<f32> {
@@ -270,6 +307,10 @@ pub fn spawn(pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>) -> Arc<AudioHandle> 
         peak_r_bits: AtomicU32::new((-100.0f32).to_bits()),
         clip_l: AtomicBool::new(false),
         clip_r: AtomicBool::new(false),
+        momentary_lufs_bits: AtomicU32::new((-100.0f32).to_bits()),
+        short_term_lufs_bits: AtomicU32::new((-100.0f32).to_bits()),
+        integrated_lufs_bits: AtomicU32::new((-100.0f32).to_bits()),
+        reset_integrated_lufs: AtomicBool::new(false),
         channel_peaks: RwLock::new(Vec::new()),
         device_name: RwLock::new(String::new()),
         last_error: RwLock::new(None),
@@ -365,7 +406,7 @@ fn open_stream(
     // persists across callbacks — the whole point of the 300 ms VU / 650 ms
     // PPM time constants is that they span many blocks. Only the audio thread
     // ever touches it, so no locking is involved.
-    let mut meters = MeterState::new();
+    let mut meters = MeterState::new(sample_rate);
     let ch = channels as usize;
 
     let stream = match sample_format {
@@ -426,12 +467,18 @@ struct MeterState {
     ppm_r: Ppm,
     peak_l: Peak,
     peak_r: Peak,
+    /// ITU-R BS.1770-4 LUFS, combined across L/R — unlike the per-channel
+    /// ballistics above, this is baked to the device's sample rate at
+    /// construction (K-weighting is a fixed filter design, not something
+    /// re-derived per callback), so a device swap rebuilds `MeterState`
+    /// (see `open_stream`) rather than just resetting envelope state.
+    loudness: Loudness,
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
 }
 
 impl MeterState {
-    fn new() -> Self {
+    fn new(sample_rate: u32) -> Self {
         Self {
             vu_l: Vu::new(),
             ppm_l: Ppm::new(),
@@ -439,6 +486,7 @@ impl MeterState {
             ppm_r: Ppm::new(),
             peak_l: Peak::new(),
             peak_r: Peak::new(),
+            loudness: Loudness::new(OUT_CHANNELS, sample_rate),
             scratch_l: Vec::new(),
             scratch_r: Vec::new(),
         }
@@ -518,6 +566,13 @@ fn process_block(
     meters.ppm_r.process(&meters.scratch_r, sample_rate);
     meters.peak_r.process(&meters.scratch_r, sample_rate);
 
+    if handle.reset_integrated_lufs.swap(false, Ordering::Relaxed) {
+        meters.loudness.reset_integrated();
+    }
+    meters
+        .loudness
+        .process(&[&meters.scratch_l, &meters.scratch_r]);
+
     handle
         .vu_l_bits
         .store(meters.vu_l.value_db().to_bits(), Ordering::Relaxed);
@@ -536,6 +591,18 @@ fn process_block(
     handle
         .peak_r_bits
         .store(meters.peak_r.value_db().to_bits(), Ordering::Relaxed);
+    handle.momentary_lufs_bits.store(
+        meters.loudness.momentary_lufs().to_bits(),
+        Ordering::Relaxed,
+    );
+    handle.short_term_lufs_bits.store(
+        meters.loudness.short_term_lufs().to_bits(),
+        Ordering::Relaxed,
+    );
+    handle.integrated_lufs_bits.store(
+        meters.loudness.integrated_lufs().to_bits(),
+        Ordering::Relaxed,
+    );
 
     if handle.live.load(Ordering::Relaxed) {
         let _ = pcm_tx.send(out);
