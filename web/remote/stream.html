@@ -715,6 +715,24 @@ function makeServerPlayer() {
   let lastLiveSeq = null;
   let segMs = 2000;
   let emitter = null;
+  // `applyWaveform()`'s periodic 5s refresh moves `waveformBaseSeq` forward by
+  // however many segments the DVR evicted since the *previous* refresh —
+  // typically 2-3 segments (4-6s) at the default 2s segment length, since
+  // eviction runs continuously but the base only updates once per poll. That
+  // makes `currentTimeSecs()`'s frame-relative math (below) take a real step
+  // discontinuity at every refresh: the same absolute playhead position
+  // necessarily reads as a *smaller* local-frame value the instant the frame's
+  // origin jumps forward. `currentTimeSecs()` is what peaks.js's own playhead
+  // marker and autoScroll are driven from (via the emitted 'player.timeupdate'
+  // below), so left alone this reads as the playhead snapping backward once
+  // per refresh. `displayOffsetMs` exactly cancels that jump the moment
+  // `setWaveformBase()` applies it, then decays to 0 over a fraction of a
+  // second so the display settles onto the new frame's true value via a
+  // quick, smooth catch-up instead of a snap. Purely a display correction:
+  // the actual audio playing out server-side is completely unaffected.
+  let displayOffsetMs = 0;
+  let lastTickMs = null;
+  const DISPLAY_OFFSET_DECAY_PER_SEC = 6; // half-life ≈ 115ms
 
   function absoluteElapsedMs() {
     if (anchorWallClock == null) return 0;
@@ -727,14 +745,22 @@ function makeServerPlayer() {
   // waveform's* local coordinate frame (0 at `waveformBaseSeq`) — what
   // peaks.js needs for pixel positioning — recomputed fresh on every call so
   // a `waveformBaseSeq` change (eviction trim, or a fresh waveform fetch) is
-  // always reflected exactly, never against a stale conversion.
+  // always reflected exactly, never against a stale conversion. `displayOffsetMs`
+  // (see its doc comment above) smooths over the step change a base update
+  // itself introduces.
   function currentTimeSecs() {
     if (waveformBaseSeq == null) return 0;
-    const localMs = absoluteElapsedMs() - waveformBaseSeq * segMs;
+    const localMs = absoluteElapsedMs() - waveformBaseSeq * segMs + displayOffsetMs;
     return Math.max(0, Math.min(durationSecs, localMs / 1000));
   }
 
   function tick() {
+    const nowMs = performance.now();
+    if (lastTickMs != null && displayOffsetMs !== 0) {
+      displayOffsetMs *= Math.exp(-DISPLAY_OFFSET_DECAY_PER_SEC * (nowMs - lastTickMs) / 1000);
+      if (Math.abs(displayOffsetMs) < 1) displayOffsetMs = 0;
+    }
+    lastTickMs = nowMs;
     if (playing) emitter?.emit('player.timeupdate', currentTimeSecs());
     requestAnimationFrame(tick);
   }
@@ -761,6 +787,17 @@ function makeServerPlayer() {
     isSeeking() { return false; },
     getCurrentTime() { return currentTimeSecs(); },
     getDuration() { return durationSecs; },
+    // Converts a *local* time (0 at `waveformBaseSeq`, what peaks.js's axis
+    // natively works in) to the broadcast's true absolute elapsed time (0 at
+    // stream start — same fixed origin as the top `playout-time` clock, see
+    // `updatePlayoutTime()`). Used by `formatAxisTime` below so the
+    // waveform's own ruler shows the same clock as the rest of the page,
+    // instead of time-since-the-DVR-window-started (which is what the axis
+    // shows natively, unbounded and unrelated to how long the broadcast has
+    // actually been running).
+    absoluteSecsForLocal(localSecs) {
+      return waveformBaseSeq == null ? localSecs : localSecs + (waveformBaseSeq * segMs) / 1000;
+    },
     setSource() { return Promise.resolve(); }, // no real media source to swap
     // -- internal: fed by connectWs()'s status handler / applyWaveform(), not part of the adapter contract --
     updateFromStatus(s) {
@@ -778,7 +815,12 @@ function makeServerPlayer() {
       if (!playing && wasPlaying) emitter?.emit('player.pause', currentTimeSecs());
     },
     setSegmentMs(ms) { segMs = ms; },
-    setWaveformBase(seq) { waveformBaseSeq = seq; },
+    setWaveformBase(seq) {
+      if (waveformBaseSeq != null && seq !== waveformBaseSeq) {
+        displayOffsetMs += (seq - waveformBaseSeq) * segMs;
+      }
+      waveformBaseSeq = seq;
+    },
     // `durationSecs` used to be derived from status as
     // `(live_seq - dvr_start_seq + 1) * segMs` — the DVR window's nominal
     // span, refreshed on every WS push. That's the same "distance from a
@@ -826,6 +868,13 @@ function initWaveform(json) {
     },
     player: serverPlayer,
     waveformData: { json },
+    // peaks.js's axis natively labels time-since-the-loaded-data's-own-start
+    // (0 at `waveformBaseSeq`) — for a bounded, evicting DVR window that's
+    // time-since-the-window-started, unrelated to how long the broadcast has
+    // actually been running, and it silently shrinks/resets as the window
+    // slides forward. Converting to absolute broadcast time here makes the
+    // ruler track the same clock as the `playout-time` text readout.
+    formatAxisTime: (time) => fmtTime(serverPlayer.absoluteSecsForLocal(time)),
   }, (err, instance) => {
     if (err) { console.error('peaks.js init failed', err); return; }
     peaksInstance = instance;
@@ -854,13 +903,19 @@ function pointMs(json) {
 /// overlay:false makes the segment draw its own waveform peaks in `color` in
 /// place of the base waveform, so adjacent no-gap segments read as one
 /// continuously color-coded waveform rather than boxes drawn on top of it.
-function applySegmentColors(json) {
+/// Points before `evictedUpTo` (see `trimEvictedSegments`) are painted as a
+/// gap even though they're still physically present in `json` — recoloring
+/// is the only thing eviction needs to do to the display; see
+/// `trimEvictedSegments`'s doc comment for why the underlying data is left
+/// untouched.
+function applySegmentColors(json, evictedUpTo = 0) {
   peaksInstance.segments.removeAll();
   const pMs = pointMs(json);
 
   let i = 0;
   while (i < json.seqs.length) {
     const seq = json.seqs[i];
+    const evicted = i < evictedUpTo;
     const rung = json.rungs[i];
     const failed = json.decode_failed ? json.decode_failed[i] : false;
     let j = i;
@@ -868,7 +923,7 @@ function applySegmentColors(json) {
     peaksInstance.segments.add({
       startTime: (i * pMs) / 1000,
       endTime: (j * pMs) / 1000,
-      color: colorForRung(rung, failed),
+      color: evicted ? GAP_COLOR : colorForRung(rung, failed),
       editable: false,
       overlay: false,
       id: `seq-${seq}`,
@@ -907,6 +962,7 @@ async function applyWaveform() {
   lastAppliedWaveformFetchSeq = myFetchSeq;
 
   currentWaveformJson = json;
+  evictedPointCount = 0; // `json` already starts at the current dvr_start_seq
   waveformPointMs = pointMs(json);
   segmentMs = waveformPointMs * pointsPerSegment(json);
   serverPlayer.setSegmentMs(segmentMs);
@@ -923,43 +979,52 @@ async function applyWaveform() {
   }
 }
 
-/// Slices `json`'s parallel arrays (data/rungs/seqs/decode_failed) down to
-/// just the points at `newStartSeq` or later. `data` is [min,max] pairs, so
-/// it's sliced at `2*index` rather than `index`.
-function sliceWaveformFrom(json, index) {
-  return {
-    ...json,
-    data: json.data.slice(index * 2),
-    rungs: json.rungs.slice(index),
-    seqs: json.seqs.slice(index),
-    decode_failed: json.decode_failed ? json.decode_failed.slice(index) : undefined,
-    length: json.length - index,
-  };
-}
+// How many leading points of `currentWaveformJson` have been evicted from
+// the DVR since it was last (re-)loaded by `applyWaveform()`. Reset to 0
+// every time `applyWaveform()` swaps in a fresh JSON (which already starts
+// at the current `dvr_start_seq`, so nothing is evicted relative to it yet).
+let evictedPointCount = 0;
 
 // Runs the DVR store's eviction (see CLAUDE.md §8, `store.rs::evict_old`)
 // forward onto the already-loaded waveform, client-side, the moment
 // `status`'s `dvr_start_seq` reports it — rather than waiting for the next
 // 5s `applyWaveform()` timer poll (which re-decodes the *entire* DVR window
 // via ffmpeg server-side; see `waveform.rs`'s module docs on why that isn't
-// cheap enough to do every time the head moves). A plain array slice here is
-// free by comparison, and it's what makes an evicted segment's waveform
-// disappear from the overview promptly instead of lingering for up to 5s.
+// cheap enough to do every time the head moves).
+//
+// This used to physically slice the evicted points out of `currentWaveformJson`
+// and call `peaksInstance.setSource()` with the trimmed data, shifting
+// `waveformBaseSeq`/duration forward on every call. But `status` (and thus
+// this function) fires on every `ServerState` change — roughly once per
+// `segment_ms` once eviction is continuously active — and peaks.js's
+// `setSource()` unconditionally runs `zoom.setZoomLevels() -> setZoom(0,
+// true)` internally (`forceUpdate: true` skips its "already at this zoom
+// level" guard), resetting the zoomview's scroll position on *every* call
+// regardless of whether anything actually changed. AutoScroll then snaps it
+// back to the correct position a moment later — visible as the waveform
+// cursor jumping backward roughly every `segment_ms`, once a stream's DVR
+// window filled and eviction went continuous (this was reported as "still
+// jumping" after the `waveformFetchSeq` race fix above, which only guarded
+// the 5s `applyWaveform()` poll and did nothing for this much more frequent
+// per-eviction path).
+//
+// Fixed by never calling `setSource()` here at all: this only recolors the
+// now-evicted leading segments as a gap (`applySegmentColors`, a cheap
+// `segments` overlay update, not a `WaveformData`/zoom operation) and leaves
+// `currentWaveformJson`/`waveformBaseSeq`/duration untouched. The underlying
+// data only actually gets trimmed on the next full `applyWaveform()` fetch —
+// same up-to-5s lag as before this trim optimization existed — but the
+// segment recolor still makes an evicted segment *look* gone within one WS
+// push, which was this function's actual purpose.
 function trimEvictedSegments(newStartSeq) {
   if (!peaksInstance || !currentWaveformJson) return;
   const seqs = currentWaveformJson.seqs;
   let i = 0;
   while (i < seqs.length && seqs[i] < newStartSeq) i++;
-  if (i === 0 || i >= seqs.length) return;
+  if (i <= evictedPointCount || i >= seqs.length) return;
 
-  const trimmed = sliceWaveformFrom(currentWaveformJson, i);
-  currentWaveformJson = trimmed;
-  serverPlayer.setWaveformBase(trimmed.seqs[0]);
-  serverPlayer.setDuration((trimmed.length * waveformPointMs) / 1000);
-  peaksInstance.setSource({ waveformData: { json: trimmed } }, (err) => {
-    if (err) { console.error('waveform trim failed', err); return; }
-    applySegmentColors(trimmed);
-  });
+  evictedPointCount = i;
+  applySegmentColors(currentWaveformJson, evictedPointCount);
 }
 
 function connectWs() {

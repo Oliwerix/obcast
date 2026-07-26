@@ -740,6 +740,49 @@ dropped no matter how the network or server reorders completions. `trimEvictedSe
 eviction trims are synchronous and unaffected by this race — only the periodic full re-fetch needed
 the guard.
 
+**Fixed the actual root cause of the waveform "jumping back in time"** — the fetch-race fix above was a
+real, worthwhile correctness fix (it does eliminate a genuine stale-response race) but turned out not to
+be what the user was seeing, confirmed when the exact same symptom persisted after it shipped. Chased
+through several more wrong turns — a client/poll ordering theory that didn't hold up
+(`bumpAnchorFloor`, added and then reverted once the math showed the guard condition could never fire),
+and a `trimEvictedSegments` rewrite from physically re-slicing the loaded `WaveformData` on every
+eviction tick (which really was forcing peaks.js's `setSource()` to reset the zoomview's scroll via its
+internal `zoom.setZoomLevels() -> setZoom(0, true)` every ~2s once eviction went continuous, per the
+entry above) to a cheap recolor-only update that never touches `setSource` — a real, independent
+improvement, kept, but still not the reported bug. The actual root cause, found only once the user
+described what they were looking at precisely ("the ruler being at 00:35 despite the stream running for
+1:04:05"): peaks.js's own time axis natively labels *time since the currently-loaded `WaveformData`
+started* — i.e. `0` at `waveformBaseSeq` — which for a bounded, evicting DVR window is time-since-the-
+window-started, not time-since-the-broadcast-started. Before eviction ever kicks in (`dvr_start_seq =
+0`) the two happen to coincide, so the ruler looks perfectly correct for the first few minutes of any
+stream — which is exactly why this read as "starts jumping after around the 4 minute mark" in the
+original report and every fix attempt above kept landing on a plausible-but-wrong theory: the gap
+between the ruler and real elapsed time is ~0 early on and only grows with runtime, so "jumps" and
+"wrong after N minutes" are two descriptions of the same underlying mismatch, not two different bugs.
+Fixed with `formatAxisTime` (a documented `Peaks.init()` option, `doc/customizing.md`): a new
+`serverPlayer.absoluteSecsForLocal(localSecs)` converts the axis's native local-frame time to the
+broadcast's true elapsed time (`localSecs + waveformBaseSeq * segMs / 1000` — same fixed seq-0 origin as
+the `playout-time` text clock), formatted through the existing `fmtTime()`. The ruler now always agrees
+with the top clock, including through an eviction-driven `waveformBaseSeq` jump, since the axis simply
+relabels whatever's currently loaded rather than needing that data to stay anchored at a fixed point.
+`displayOffsetMs` (a decaying compensation added to `currentTimeSecs()`, canceling out the same
+`waveformBaseSeq` jump for a fraction of a second before fading) is kept for a narrower, real reason: that
+value still drives peaks.js's own playhead marker and native `autoScroll` — separately from the axis
+labels — via the emitted `player.timeupdate`, and would otherwise visibly snap the marker backward once
+per periodic refresh.
+
+A follow-on UX request from the same session (keep the playhead pixel-fixed at the view's center,
+waveform/ruler scrolling underneath it, instead of peaks.js's native edge-triggered `autoScroll`) was
+attempted and **reverted, not shipped** — three different implementations (restoring `view.setStartTime`
+after `setSource`; a standalone `requestAnimationFrame` loop re-centering every frame; a
+`player.timeupdate`-synchronized handler doing the same) each failed differently in live testing
+("resets to 0", "still moves", "not centered — on the left"), and root-causing peaks.js's actual
+scroll/playhead model precisely enough to get this right needs reading its authoritative source
+directly rather than piecemeal summarized fetches, which is what produced each wrong turn. `autoScroll:
+true` and `applyAutoScrollOffset()` (the pre-existing, working 25%-of-width edge-scroll behavior) are
+back exactly as they were. Centering the playhead is a real, separate ask, deliberately left for the
+maintainer to decide is worth a dedicated pass rather than continuing to guess at it.
+
 ---
 
 ## 9. Conventions
