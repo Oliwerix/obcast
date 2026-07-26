@@ -5,7 +5,7 @@
 <title>OBCast Remote</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
-<script src="https://unpkg.com/peaks.js/dist/peaks.js"></script>
+<script src="https://unpkg.com/peaks.js@4/dist/peaks.js"></script>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -535,51 +535,36 @@ function hexWithAlpha(hex, alpha) {
   return `rgba(${r},${g},${b},${alpha})`;
 }
 
-function drawLevelMeter(canvas, vuDb, peakDb) {
-  const ctx = canvas.getContext('2d');
-  const w = canvas.clientWidth, h = canvas.clientHeight;
-  ctx.clearRect(0, 0, w, h);
+// The ruler (background, faint zone-guide, tick marks, VU/dBFS labels) never
+// changes frame to frame -- only the VU fill bar and the flying peak line
+// move. This used to be redrawn from scratch (including ~18 fillText/stroke
+// calls) on every 'meters' WS message, which the server pushes at a fixed
+// 20Hz (obcast-server's METERS_INTERVAL) regardless of whether anything
+// actually changed: 2 canvases x 20/sec x ~18 draw calls is well over a
+// million redundant draw calls/hour, sustained for the length of a session.
+// Built once per logical canvas size (both L/R meters share the same
+// geometry) into an offscreen bitmap and blitted with a single drawImage,
+// leaving only the bar fill + peak line to actually redraw every frame.
+let meterRulerBitmap = null;
+function buildMeterRulerBitmap(w, h) {
+  const ratio = window.devicePixelRatio || 1;
+  const off = document.createElement('canvas');
+  off.width = w * ratio;
+  off.height = h * ratio;
+  const ctx = off.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+
   ctx.fillStyle = METER_TRACK;
   ctx.fillRect(0, 0, w, h);
 
-  const leftRulerW = 30, rightRulerW = 28;
-  const barLeft = leftRulerW, barRight = Math.max(barLeft + 10, w - rightRulerW);
-  const barTop = 10, barBottom = h;
-  const barHeight = barBottom - barTop;
-  const barW = barRight - barLeft;
-  const yFor = dbfs => barBottom - meterFrac(dbfs) * barHeight;
+  const { barLeft, barRight, yFor } = meterGeometry(w, h);
 
   // Faint always-visible zone guide so the scale reads at any level.
   meterZones().forEach(([lo, hi, color]) => {
     const y0 = yFor(hi), y1 = yFor(lo);
     ctx.fillStyle = hexWithAlpha(color, 0.12);
-    ctx.fillRect(barLeft, y0, barW, y1 - y0);
+    ctx.fillRect(barLeft, y0, barRight - barLeft, y1 - y0);
   });
-
-  // VU fill: segmented by zone, except a full solid-red override once the
-  // level crosses into red.
-  const fillTop = yFor(vuDb);
-  if (vuDb >= METER_RED_THRESHOLD_DBFS) {
-    ctx.fillStyle = METER_RED;
-    ctx.fillRect(barLeft, fillTop, barW, barBottom - fillTop);
-  } else {
-    meterZones().forEach(([lo, hi, color]) => {
-      const segHi = Math.min(hi, vuDb);
-      if (segHi <= lo) return;
-      const y0 = yFor(segHi), y1 = yFor(lo);
-      ctx.fillStyle = color;
-      ctx.fillRect(barLeft, y0, barW, y1 - y0);
-    });
-  }
-
-  // Flying peak marker — PPM or true digital peak, per the toggle.
-  const peakY = yFor(peakDb);
-  ctx.strokeStyle = METER_PEAK_COLOR;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(barLeft, peakY);
-  ctx.lineTo(barRight, peakY);
-  ctx.stroke();
 
   // Shared tick grid, read two ways: left edge VU-relative (0 = -18 dBFS),
   // right edge plain dBFS (0 at the top).
@@ -614,6 +599,56 @@ function drawLevelMeter(canvas, vuDb, peakDb) {
   ctx.fillText('VU', barLeft - 2, 0);
   ctx.textAlign = 'left';
   ctx.fillText('dBFS', barRight + 2, 0);
+
+  return off;
+}
+
+function meterGeometry(w, h) {
+  const leftRulerW = 30, rightRulerW = 28;
+  const barLeft = leftRulerW, barRight = Math.max(barLeft + 10, w - rightRulerW);
+  const barTop = 10, barBottom = h;
+  const barHeight = barBottom - barTop;
+  return { barLeft, barRight, barTop, barBottom, barHeight, yFor: dbfs => barBottom - meterFrac(dbfs) * barHeight };
+}
+
+function drawLevelMeter(canvas, vuDb, peakDb) {
+  const ctx = canvas.getContext('2d');
+  // Cached at setup time (see setupMeterCanvas) rather than read via
+  // canvas.clientWidth/clientHeight on every call -- a layout-dependent
+  // property read that's wasted work since these canvases have a fixed,
+  // never-resized logical size.
+  const w = canvas.logicalWidth, h = canvas.logicalHeight;
+  if (!meterRulerBitmap) meterRulerBitmap = buildMeterRulerBitmap(w, h);
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(meterRulerBitmap, 0, 0, w, h);
+
+  const { barLeft, barRight, barBottom, yFor } = meterGeometry(w, h);
+  const barW = barRight - barLeft;
+
+  // VU fill: segmented by zone, except a full solid-red override once the
+  // level crosses into red.
+  const fillTop = yFor(vuDb);
+  if (vuDb >= METER_RED_THRESHOLD_DBFS) {
+    ctx.fillStyle = METER_RED;
+    ctx.fillRect(barLeft, fillTop, barW, barBottom - fillTop);
+  } else {
+    meterZones().forEach(([lo, hi, color]) => {
+      const segHi = Math.min(hi, vuDb);
+      if (segHi <= lo) return;
+      const y0 = yFor(segHi), y1 = yFor(lo);
+      ctx.fillStyle = color;
+      ctx.fillRect(barLeft, y0, barW, y1 - y0);
+    });
+  }
+
+  // Flying peak marker — PPM or true digital peak, per the toggle.
+  const peakY = yFor(peakDb);
+  ctx.strokeStyle = METER_PEAK_COLOR;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(barLeft, peakY);
+  ctx.lineTo(barRight, peakY);
+  ctx.stroke();
 }
 
 // Backs the canvas with real device pixels so the ruler text stays crisp on
@@ -624,6 +659,8 @@ function setupMeterCanvas(canvas) {
   const cssW = canvas.width, cssH = canvas.height;
   canvas.style.width = cssW + 'px';
   canvas.style.height = cssH + 'px';
+  canvas.logicalWidth = cssW;
+  canvas.logicalHeight = cssH;
   canvas.width = cssW * ratio;
   canvas.height = cssH * ratio;
   canvas.getContext('2d').setTransform(ratio, 0, 0, ratio, 0, 0);
@@ -664,8 +701,19 @@ function applyMeters(vuDbL, vuDbR, ppmDbL, ppmDbR, peakDbL, peakDbR) {
     vuL: vuDbL, vuR: vuDbR, ppmL: ppmDbL, ppmR: ppmDbR,
     peakL: peakDbL ?? ppmDbL, peakR: peakDbR ?? ppmDbR,
   };
+  // The server pushes meters at a fixed 20Hz regardless of tab visibility,
+  // and a WS onmessage handler isn't subject to the background-tab timer
+  // throttling that would otherwise cap this cost -- so without this check
+  // both canvases would keep fully redrawing 20x/sec even while the tab is
+  // hidden. `lastMeters` above is still kept current so the next actual
+  // redraw (on becoming visible again, see the visibilitychange listener
+  // below) reflects the latest values immediately rather than a stale frame.
+  if (document.hidden) return;
   redrawMeters();
 }
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) redrawMeters();
+});
 
 // --- Waveform: BBC peaks.js, driven by the server's real playhead ---
 //
@@ -761,11 +809,23 @@ function makeServerPlayer() {
     return Math.max(0, Math.min(durationSecs, localMs / 1000));
   }
 
+  // Only kept alive while actually playing — this used to call
+  // requestAnimationFrame(tick) unconditionally forever, waking the JS main
+  // thread every display frame (up to 120-144Hz on a high-refresh monitor)
+  // to do nothing for however long playout sits paused/stopped during a
+  // multi-hour session. Re-armed from updateFromStatus() below whenever
+  // `playing` flips false -> true.
+  let tickScheduled = false;
   function tick() {
-    if (playing) emitter?.emit('player.timeupdate', currentTimeSecs());
+    if (!playing) { tickScheduled = false; return; }
+    emitter?.emit('player.timeupdate', currentTimeSecs());
     requestAnimationFrame(tick);
   }
-  requestAnimationFrame(tick);
+  function ensureTickRunning() {
+    if (tickScheduled) return;
+    tickScheduled = true;
+    requestAnimationFrame(tick);
+  }
 
   return {
     // -- required peaks.js adapter methods (doc/customizing.md "Player" interface) --
@@ -801,7 +861,7 @@ function makeServerPlayer() {
       }
       const wasPlaying = playing;
       playing = s.playout.state === 'playing';
-      if (playing && !wasPlaying) emitter?.emit('player.playing', currentTimeSecs());
+      if (playing && !wasPlaying) { emitter?.emit('player.playing', currentTimeSecs()); ensureTickRunning(); }
       if (!playing && wasPlaying) emitter?.emit('player.pause', currentTimeSecs());
     },
     setSegmentMs(ms) { segMs = ms; },
@@ -905,29 +965,98 @@ function applySegmentColors(json) {
 }
 
 // Cached so `trimEvictedSegments` (below) can prune it client-side between
-// full re-fetches without re-decoding anything server-side.
+// polls without re-decoding anything server-side, and so `applyWaveform` can
+// request only the segments it doesn't already have instead of the whole DVR
+// window every poll (see below).
 let currentWaveformJson = null;
 
+// Guards against two overlapping applyWaveform() calls both running at once
+// (each triggers a serial-ffmpeg-per-segment decode server-side, so overlap
+// compounds server load rather than just wasting client bandwidth) and,
+// combined with the fact trimEvictedSegments() below no-ops while
+// `peaksInstance` is still null, guarantees only one Peaks.js instance is
+// ever created against #zoomview-container.
+let waveformFetchInFlight = false;
+
+// Bumped by both applyWaveform() and trimEvictedSegments() before either
+// calls peaksInstance.setSource() (async, callback-based) and checked inside
+// each callback before applying its result. Without this, a slower call that
+// started first could resolve after a faster, later call and clobber
+// currentWaveformJson/the rendered segments with stale data — the two paths
+// fire on different, non-coprime cadences (a 5s poll here vs. roughly every
+// segment_ms from trimEvictedSegments' eviction-driven calls), so overlap is
+// plausible rather than exotic. The highest generation captured at call time
+// always wins, regardless of which callback actually resolves first.
+let waveformGeneration = 0;
+
+/// Concatenates `base`'s parallel arrays with `delta`'s, where `delta` is
+/// assumed to start exactly where `base` ends (see the `start_seq` used to
+/// fetch it in `applyWaveform`). `data` is a flat [min,max]-pair array at
+/// both ends, so a plain concat is correct without any 2x index math.
+function mergeWaveform(base, delta) {
+  return {
+    ...delta,
+    data: base.data.concat(delta.data),
+    rungs: base.rungs.concat(delta.rungs),
+    seqs: base.seqs.concat(delta.seqs),
+    decode_failed: (base.decode_failed || delta.decode_failed)
+      ? (base.decode_failed || new Array(base.length).fill(false))
+          .concat(delta.decode_failed || new Array(delta.length).fill(false))
+      : undefined,
+    length: base.length + delta.length,
+  };
+}
+
 async function applyWaveform() {
-  const resp = await fetch(`/api/${stream}/waveform`);
-  if (!resp.ok) return;
-  const json = await resp.json();
-  if (json.length === 0) return;
+  if (waveformFetchInFlight) return;
+  waveformFetchInFlight = true;
+  try {
+    // Once a waveform is already loaded, only ask for segments past the last
+    // one we have — eviction (the front of the window) is already trimmed
+    // incrementally by trimEvictedSegments below, so the only genuinely new
+    // data on a steady-state poll is whatever's been appended at the live
+    // edge. This turns "re-decode the entire DVR window via ffmpeg every 5s"
+    // (server-side, per waveform.rs's own doc comment — and literally
+    // unbounded under the documented OBCAST_DVR_WINDOW_MS=0 "never evict"
+    // mode) into "decode the couple of segments actually new since last
+    // poll," independent of how large the DVR window has grown.
+    const haveSeqs = currentWaveformJson && currentWaveformJson.seqs.length;
+    const startSeq = haveSeqs ? currentWaveformJson.seqs[currentWaveformJson.seqs.length - 1] + 1 : null;
+    const url = `/api/${stream}/waveform` + (startSeq != null ? `?start_seq=${startSeq}` : '');
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      // A start_seq already past the live edge (nothing new since our last
+      // poll) is rejected by the server as "end_seq must be >= start_seq" —
+      // that's the expected steady-state case, not a failure, so it's
+      // skipped silently rather than logged as an error.
+      return;
+    }
+    const json = await resp.json();
+    if (json.length === 0) return;
 
-  currentWaveformJson = json;
-  waveformPointMs = pointMs(json);
-  segmentMs = waveformPointMs * pointsPerSegment(json);
-  serverPlayer.setSegmentMs(segmentMs);
+    waveformPointMs = pointMs(json);
+    segmentMs = waveformPointMs * pointsPerSegment(json);
+    serverPlayer.setSegmentMs(segmentMs);
 
-  if (!peaksInstance) {
-    initWaveform(json);
-  } else {
-    serverPlayer.setWaveformBase(json.seqs[0]);
-    serverPlayer.setDuration((json.length * waveformPointMs) / 1000);
-    peaksInstance.setSource({ waveformData: { json } }, (err) => {
-      if (err) { console.error('waveform refresh failed', err); return; }
-      applySegmentColors(json);
-    });
+    const merged = startSeq != null ? mergeWaveform(currentWaveformJson, json) : json;
+    currentWaveformJson = merged;
+
+    if (!peaksInstance) {
+      initWaveform(merged);
+    } else {
+      serverPlayer.setWaveformBase(merged.seqs[0]);
+      serverPlayer.setDuration((merged.length * waveformPointMs) / 1000);
+      const myGeneration = ++waveformGeneration;
+      peaksInstance.setSource({ waveformData: { json: merged } }, (err) => {
+        if (err) { console.error('waveform refresh failed', err); return; }
+        if (myGeneration !== waveformGeneration) return; // superseded by a later call
+        applySegmentColors(merged);
+      });
+    }
+  } catch (e) {
+    console.error('waveform poll failed', e);
+  } finally {
+    waveformFetchInFlight = false;
   }
 }
 
@@ -964,15 +1093,36 @@ function trimEvictedSegments(newStartSeq) {
   currentWaveformJson = trimmed;
   serverPlayer.setWaveformBase(trimmed.seqs[0]);
   serverPlayer.setDuration((trimmed.length * waveformPointMs) / 1000);
+  const myGeneration = ++waveformGeneration;
   peaksInstance.setSource({ waveformData: { json: trimmed } }, (err) => {
     if (err) { console.error('waveform trim failed', err); return; }
+    if (myGeneration !== waveformGeneration) return; // superseded by a later call
     applySegmentColors(trimmed);
   });
+}
+
+// Reconnect backoff: fixed-1s retries used to mean an extended server outage
+// (or a permanently bad stream name, which the server rejects at the WS
+// upgrade — see stream_if_known — and which then looks identical to any other
+// transient close) produced ~3600 reconnect attempts/hour indefinitely, and
+// every open tab watching a show resynchronized onto the same 1s cadence, so
+// they'd all hammer the server in lockstep the instant it came back. Backs
+// off 1s -> 2s -> 4s ... capped at 15s, with +/-20% jitter so multiple tabs
+// spread out instead of herding; resets to the 1s floor on a successful open.
+const WS_RECONNECT_BASE_MS = 1000;
+const WS_RECONNECT_MAX_MS = 15000;
+let wsReconnectAttempt = 0;
+function nextWsReconnectDelay() {
+  const backoff = Math.min(WS_RECONNECT_MAX_MS, WS_RECONNECT_BASE_MS * 2 ** wsReconnectAttempt);
+  wsReconnectAttempt++;
+  const jitter = 0.8 + Math.random() * 0.4;
+  return Math.round(backoff * jitter);
 }
 
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/api/${stream}/ws`);
+  ws.onopen = () => { wsReconnectAttempt = 0; };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     // ControlEvent is internally tagged ("type"); Status's fields (stream,
@@ -993,12 +1143,28 @@ function connectWs() {
       appendLogEntry(msg);
     }
   };
-  ws.onclose = () => { setConnectionLost(); setTimeout(connectWs, 1000); };
+  ws.onclose = () => { setConnectionLost(); setTimeout(connectWs, nextWsReconnectDelay()); };
   ws.onerror = () => ws.close();
 }
 connectWs();
-applyWaveform();
-setInterval(applyWaveform, 5000);
+
+// Waveform polling: paused entirely while the tab is hidden (nothing on
+// screen benefits from a redecode nobody's looking at) and refreshed
+// immediately on becoming visible again, rather than a plain
+// setInterval(applyWaveform, 5000) that ran at full cadence in the
+// background for the whole life of the tab regardless of whether it was
+// ever foregrounded.
+const WAVEFORM_POLL_MS = 5000;
+let waveformPollTimer = null;
+function scheduleWaveformPoll() {
+  clearTimeout(waveformPollTimer);
+  if (document.hidden) return;
+  waveformPollTimer = setTimeout(() => { applyWaveform().finally(scheduleWaveformPoll); }, WAVEFORM_POLL_MS);
+}
+applyWaveform().finally(scheduleWaveformPoll);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { applyWaveform().finally(scheduleWaveformPoll); }
+});
 
 // The zoomview container is full page width (`width: 100%`), so a window
 // resize changes the view's pixel width and both peaks.js's own layout
@@ -1134,7 +1300,22 @@ laGoLive.onclick = () => {
   laTime.textContent = laBehindText(r.end);
 };
 
+// recoverMediaError() used to be called unconditionally on every fatal media
+// error, with no counter or time window -- hls.js's own documented pattern
+// (see its recover-media-error demo) tracks recent attempts and escalates to
+// a full destroy+rebuild once they cluster, rather than retrying forever. On
+// a persistently bad segment or a persistently flaky link (exactly the
+// condition this whole system exists to survive), an unconditional retry
+// churns through MediaSource/SourceBuffer construction/teardown for as long
+// as the condition lasts -- potentially hours, on an OB session -- with
+// nothing to fall back to the same destroy+rebuild path already used for
+// other fatal errors.
+const MEDIA_ERROR_RECOVERY_WINDOW_MS = 3000;
+const MEDIA_ERROR_RECOVERY_LIMIT = 3;
+let laMediaErrorTimestamps = [];
+
 function buildLaHls() {
+  laMediaErrorTimestamps = [];
   // hls.js flushes the back-buffer aggressively for live streams by default,
   // leaving nothing behind the live edge to scrub into; hold ~5 min to match
   // the server's own DVR window (obcast-server dvr_window_ms).
@@ -1156,7 +1337,16 @@ function buildLaHls() {
       clearTimeout(laRecoverTimer);
       laRecoverTimer = setTimeout(() => hls.startLoad(), 1000);
     } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-      hls.recoverMediaError();
+      const now = performance.now();
+      laMediaErrorTimestamps = laMediaErrorTimestamps.filter(t => now - t < MEDIA_ERROR_RECOVERY_WINDOW_MS);
+      laMediaErrorTimestamps.push(now);
+      clearTimeout(laRecoverTimer);
+      if (laMediaErrorTimestamps.length > MEDIA_ERROR_RECOVERY_LIMIT) {
+        hls.destroy();
+        laRecoverTimer = setTimeout(buildLaHls, 2000);
+      } else {
+        hls.recoverMediaError();
+      }
     } else {
       hls.destroy();
       clearTimeout(laRecoverTimer);

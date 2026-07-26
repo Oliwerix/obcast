@@ -166,6 +166,35 @@ function render() {
   });
 }
 
+// Whether two shows lists are equal in every field render() displays.
+// Compared field-by-field (rather than JSON.stringify) so field reordering
+// in a future server response doesn't spuriously trigger a rebuild.
+function sameShows(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i], y = b[i];
+    if (x.name !== y.name || x.live !== y.live || x.size_bytes !== y.size_bytes ||
+        x.duration_ms !== y.duration_ms || x.segment_count !== y.segment_count ||
+        x.modified_unix_ms !== y.modified_unix_ms) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Patches just the "Last active" cell text in place, without touching any
+// other DOM (and in particular without rebinding delete-button listeners or
+// disturbing a user's text selection) — used when the underlying data hasn't
+// changed but wall-clock time has moved on since the last full render(),
+// so the relative-time column doesn't go stale between real changes.
+function refreshRelativeTimes() {
+  content.querySelectorAll('tr[data-name]').forEach(row => {
+    const show = latestShows.find(s => s.name === row.getAttribute('data-name'));
+    const cell = row.querySelector('td.muted');
+    if (show && cell) cell.textContent = relativeTime(show.modified_unix_ms);
+  });
+}
+
 async function onDelete(name) {
   if (deleting.has(name)) return;
   if (!confirm(`Delete show "${name}"?\n\nThis permanently removes all audio files the server received for it. This cannot be undone.`)) {
@@ -204,8 +233,20 @@ async function refresh() {
       showBanner('err', 'Could not load shows: unexpected response from server.');
       return;
     }
-    latestShows = data;
     if (banner.className === 'err') { banner.className = ''; banner.textContent = ''; }
+
+    // Skip the full table rebuild (which recreates every row's DOM node and
+    // rebinds every delete button's onclick, wiping any in-progress text
+    // selection) on a poll where nothing actually changed -- true for most
+    // polls, since a show's stats only move while it's actively receiving
+    // audio. Still patch the "Last active" text directly so it doesn't go
+    // stale between real changes.
+    if (sameShows(data, latestShows)) {
+      latestShows = data;
+      refreshRelativeTimes();
+      return;
+    }
+    latestShows = data;
     render();
   } catch (e) {
     // Keep whatever is on screen; surface the problem without wiping the list.
@@ -216,8 +257,21 @@ async function refresh() {
   }
 }
 
-refresh();
-setInterval(refresh, 7000);
+// Paused entirely while the tab is hidden -- this used to poll at a fixed
+// 7s cadence forever regardless of whether the tab was focused, backgrounded,
+// or left open in another window for a whole broadcast day. Refreshes
+// immediately on becoming visible again instead of waiting out the interval.
+const REFRESH_MS = 7000;
+let refreshTimer = null;
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  if (document.hidden) return;
+  refreshTimer = setTimeout(() => { refresh().finally(scheduleRefresh); }, REFRESH_MS);
+}
+refresh().finally(scheduleRefresh);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refresh().finally(scheduleRefresh);
+});
 </script>
 
 </body>
