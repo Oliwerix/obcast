@@ -535,12 +535,21 @@ fn process_block(
 
     for f in 0..frames {
         let base = f * channels;
-        let (mut l, mut r) = if mono {
-            let v = raw[base + l_idx] * gain;
-            (v, v)
-        } else {
-            (raw[base + l_idx] * gain, raw[base + r_idx] * gain)
-        };
+        let raw_l = raw[base + l_idx];
+        let raw_r = if mono { raw_l } else { raw[base + r_idx] };
+
+        // Clip is checked both pre-gain (the source is already too hot,
+        // which turning our own gain down can't fix) and post-gain (our
+        // digital gain stage pushed an otherwise-clean signal over
+        // 0 dBFS) — either lights the same clip LED/alert.
+        if raw_l.abs() >= CLIP_THRESHOLD {
+            handle.clip_l.store(true, Ordering::Relaxed);
+        }
+        if raw_r.abs() >= CLIP_THRESHOLD {
+            handle.clip_r.store(true, Ordering::Relaxed);
+        }
+
+        let (mut l, mut r) = (raw_l * gain, raw_r * gain);
 
         if l.abs() >= CLIP_THRESHOLD {
             handle.clip_l.store(true, Ordering::Relaxed);

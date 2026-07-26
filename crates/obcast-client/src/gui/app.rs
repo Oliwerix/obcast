@@ -127,6 +127,14 @@ struct ObcastApp {
     /// cleared once `CLIP_FLASH_COUNT` on/off cycles have elapsed. See
     /// `flash_color`.
     clip_flash_started_at: Option<Instant>,
+    /// Whether the server link was down as of the last frame — edge-detected
+    /// the same way as `was_clipping`, so the link-outage alarm logs once
+    /// per outage rather than every frame it stays down. See `flash_color`.
+    was_link_down: bool,
+    /// Whether the current outage has already been logged as critical (past
+    /// `FLASH_BUFFER_THRESHOLD_MS`) — reset once the link recovers, so a
+    /// later outage can re-escalate and log again. See `flash_color`.
+    link_down_logged_critical: bool,
 }
 
 /// How many full on/off blinks a fresh input clip flashes the window
@@ -191,6 +199,8 @@ impl ObcastApp {
             created_at: Instant::now(),
             was_clipping: false,
             clip_flash_started_at: None,
+            was_link_down: false,
+            link_down_logged_critical: false,
         }
     }
 
@@ -536,7 +546,7 @@ impl ObcastApp {
         ui.heading("Gain");
         let mut gain = self.audio.gain_db();
         let resp = ui.add(
-            egui::Slider::new(&mut gain, -24.0..=24.0)
+            egui::Slider::new(&mut gain, -10.0..=24.0)
                 .suffix(" dB")
                 .text("input gain"),
         );
@@ -1159,10 +1169,17 @@ impl ObcastApp {
     /// continuously for as long as the outage lasts — yellow while `Buffer`
     /// still has `FLASH_BUFFER_THRESHOLD_MS` of headroom, red once it's
     /// below that and dropout is close.
+    ///
+    /// Both alarms are also logged (`SharedState::push_log`, edge-triggered
+    /// so an ongoing outage doesn't spam a line every frame) so the status
+    /// bar's infobar picks them up in the alert's own color — see
+    /// `status_bar`'s `log_entry`. Logging never forces `show_log` open;
+    /// the operator log panel only opens when the operator clicks "Log".
     fn flash_color(&mut self, now: Instant) -> Option<egui::Color32> {
         let clipping = self.audio.take_clip_l() || self.audio.take_clip_r();
         if clipping && !self.was_clipping {
             self.clip_flash_started_at = Some(now);
+            self.shared.push_log(LogLevel::Warn, "input clip detected");
         }
         self.was_clipping = clipping;
 
@@ -1177,14 +1194,32 @@ impl ObcastApp {
             self.clip_flash_started_at = None;
         }
 
-        let (buffer_ms, link_down) = self.buffer_estimate()?;
+        let buffer_estimate = self.buffer_estimate();
+        let link_down = matches!(buffer_estimate, Some((_, true)));
+        if link_down && !self.was_link_down {
+            self.shared.push_log(LogLevel::Warn, "server link down");
+        }
+        if !link_down {
+            self.link_down_logged_critical = false;
+        }
+        self.was_link_down = link_down;
+
+        let (buffer_ms, _) = buffer_estimate?;
         if !link_down {
             return None;
         }
-        let color = if buffer_ms >= FLASH_BUFFER_THRESHOLD_MS {
-            egui::Color32::from_rgb(0xe8, 0xc5, 0x2a)
-        } else {
+        let critical = buffer_ms < FLASH_BUFFER_THRESHOLD_MS;
+        if critical && !self.link_down_logged_critical {
+            self.shared.push_log(
+                LogLevel::Error,
+                format!("server link down and buffer critical ({buffer_ms} ms left)"),
+            );
+            self.link_down_logged_critical = true;
+        }
+        let color = if critical {
             egui::Color32::from_rgb(0xe2, 0x3d, 0x3d)
+        } else {
+            egui::Color32::from_rgb(0xe8, 0xc5, 0x2a)
         };
         let elapsed = now.duration_since(self.created_at).as_secs_f32();
         let half_periods_elapsed = (elapsed / FLASH_HALF_PERIOD.as_secs_f32()) as u64;
