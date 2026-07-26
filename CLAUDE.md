@@ -2,6 +2,14 @@
 
 Guidance for Claude Code working in this repository. Read this fully before making changes.
 
+**If running on host `sylence`:** use the `obcast-remote-build` wrapper script
+(`~/.local/bin/obcast-remote-build`, on `PATH`) instead of building locally. It rsyncs this
+workspace to the `obcast-build` SSH host (a 30-core/10GB box provisioned for this — Rust toolchain,
+mold linker, and the ALSA/X11/Wayland/GL dev headers `cpal`/`eframe` need), runs `cargo build`
+there, and syncs the resulting binaries back to `target-remote/`. Usage: `obcast-remote-build`
+(debug) or `obcast-remote-build --release`, from anywhere in the repo; extra args pass straight
+through to `cargo build` (e.g. `-p obcast-server`).
+
 ---
 
 ## 1. What we're building
