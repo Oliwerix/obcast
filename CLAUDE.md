@@ -818,6 +818,87 @@ on its next invocation and acks via `flushed_generation`, and the command loop w
 freshly spawned decoder session start writing — otherwise a flush racing a few milliseconds late
 could wipe the new session's first samples along with the stale ones.
 
+**Fixed: the web remote waveform still jumped backward in time, a few minutes into a stream, after
+every earlier anchor-math fix for this same symptom.** Reported directly: "the waveform time is still
+wrong and starts jumping after around the 4 minute mark and just jumps back in time" — after the
+`anchorAbsMs`/`durationSecs`/`waveformBaseSeq` fixes above had already closed every miscomputation
+found in how the playhead position is *derived*. The remaining bug wasn't in that math at all: it was
+a race in how `stream.html`'s `applyWaveform()` polls `GET /api/{stream}/waveform` (every 5s,
+`setInterval`). That endpoint decodes every segment in the DVR window via a serial `ffmpeg` spawn per
+segment (see `waveform.rs`'s handler docs on why the store lock is dropped before that runs) — cheap
+for a fresh stream's small window, but the decode cost scales with window size, and as a stream runs
+long enough for its window to fill out toward the full multi-minute size, that decode time grows past
+the 5s poll interval. Once it does, requests overlap in flight, and completion order stops matching
+issue order: an earlier request (which snapshotted an earlier, smaller DVR state) can finish *after* a
+later, faster one and clobber `waveformBaseSeq`/`durationSecs` with stale, smaller values — visibly
+snapping the cursor backward, and only once the stream has run long enough for decode time to catch up
+with the poll interval, matching the reported "around the 4 minute mark" onset exactly. Fixed with a
+monotonic `waveformFetchSeq` counter bumped when a request is *sent* (not when it finishes); a response
+is applied only if its counter value is still the highest one applied so far, so a stale response is
+dropped no matter how the network or server reorders completions. `trimEvictedSegments`'s client-side
+eviction trims are synchronous and unaffected by this race — only the periodic full re-fetch needed
+the guard.
+
+**Fixed the actual root cause of the waveform "jumping back in time"** — the fetch-race fix above was a
+real, worthwhile correctness fix (it does eliminate a genuine stale-response race) but turned out not to
+be what the user was seeing, confirmed when the exact same symptom persisted after it shipped. Chased
+through several more wrong turns — a client/poll ordering theory that didn't hold up
+(`bumpAnchorFloor`, added and then reverted once the math showed the guard condition could never fire),
+and a `trimEvictedSegments` rewrite from physically re-slicing the loaded `WaveformData` on every
+eviction tick (which really was forcing peaks.js's `setSource()` to reset the zoomview's scroll via its
+internal `zoom.setZoomLevels() -> setZoom(0, true)` every ~2s once eviction went continuous, per the
+entry above) to a cheap recolor-only update that never touches `setSource` — a real, independent
+improvement, kept, but still not the reported bug. The actual root cause, found only once the user
+described what they were looking at precisely ("the ruler being at 00:35 despite the stream running for
+1:04:05"): peaks.js's own time axis natively labels *time since the currently-loaded `WaveformData`
+started* — i.e. `0` at `waveformBaseSeq` — which for a bounded, evicting DVR window is time-since-the-
+window-started, not time-since-the-broadcast-started. Before eviction ever kicks in (`dvr_start_seq =
+0`) the two happen to coincide, so the ruler looks perfectly correct for the first few minutes of any
+stream — which is exactly why this read as "starts jumping after around the 4 minute mark" in the
+original report and every fix attempt above kept landing on a plausible-but-wrong theory: the gap
+between the ruler and real elapsed time is ~0 early on and only grows with runtime, so "jumps" and
+"wrong after N minutes" are two descriptions of the same underlying mismatch, not two different bugs.
+Fixed with `formatAxisTime` (a documented `Peaks.init()` option, `doc/customizing.md`): a new
+`serverPlayer.absoluteSecsForLocal(localSecs)` converts the axis's native local-frame time to the
+broadcast's true elapsed time (`localSecs + waveformBaseSeq * segMs / 1000` — same fixed seq-0 origin as
+the `playout-time` text clock), formatted through the existing `fmtTime()`. The ruler now always agrees
+with the top clock, including through an eviction-driven `waveformBaseSeq` jump, since the axis simply
+relabels whatever's currently loaded rather than needing that data to stay anchored at a fixed point.
+`displayOffsetMs` (a decaying compensation added to `currentTimeSecs()`, canceling out the same
+`waveformBaseSeq` jump for a fraction of a second before fading) is kept for a narrower, real reason: that
+value still drives peaks.js's own playhead marker and native `autoScroll` — separately from the axis
+labels — via the emitted `player.timeupdate`, and would otherwise visibly snap the marker backward once
+per periodic refresh.
+
+A follow-on UX request from the same session (keep the playhead pixel-fixed at the view's center,
+waveform/ruler scrolling underneath it, instead of peaks.js's native edge-triggered `autoScroll`) was
+attempted and **reverted, not shipped** — three different implementations (restoring `view.setStartTime`
+after `setSource`; a standalone `requestAnimationFrame` loop re-centering every frame; a
+`player.timeupdate`-synchronized handler doing the same) each failed differently in live testing
+("resets to 0", "still moves", "not centered — on the left"), and root-causing peaks.js's actual
+scroll/playhead model precisely enough to get this right needs reading its authoritative source
+directly rather than piecemeal summarized fetches, which is what produced each wrong turn. `autoScroll:
+true` and `applyAutoScrollOffset()` (the pre-existing, working 25%-of-width edge-scroll behavior) are
+back exactly as they were. Centering the playhead is a real, separate ask, deliberately left for the
+maintainer to decide is worth a dedicated pass rather than continuing to guess at it.
+
+**Reconciled the two entries above with an independent incremental-waveform-fetch perf rework merged
+around the same time** (a separate `applyWaveform()` rewrite: periodic full-window fetch replaced with
+a delta fetch of only the segments past the last one already held, guarded by a `waveformFetchInFlight`
+lock that refuses to start a second fetch while one is outstanding). That lock independently closes the
+exact overlapping-requests race the `waveformFetchSeq` counter above was added for, so the counter was
+dropped as redundant rather than kept alongside a lock that already makes it unreachable. The
+`trimEvictedSegments` recolor-only rewrite above was **not** carried forward: that rework's delta-fetch
+model no longer does a periodic full re-fetch, so `trimEvictedSegments` is now the *only* thing that
+ever shrinks `currentWaveformJson` — a stream whose encoder has fully disconnected (no new segments
+ever arriving again) but whose DVR keeps evicting on its timer would otherwise never trim, colors
+recede into `GAP_COLOR` forever while `waveformBaseSeq`/duration silently drift from the server's real
+`dvr_start_seq`. Physically slicing on eviction (this rework's original approach, restored as-is) is
+therefore kept despite reintroducing the scroll-reset-per-eviction-tick cosmetic issue the recolor-only
+rewrite existed to fix — correctness under a dead encoder wins over a live-stream scroll cosmetic;
+revisit as a follow-up if that jump proves bothersome in practice, folding the physical slice into
+`applyWaveform()`'s next merge (which already calls `setSource()`) rather than reviving recolor-only.
+
 **Automatic reconnect when the hardware audio device disconnects mid-session (server playout output
 and client capture input).** Prompted by an operator question: "what happens if the audio device
 disconnects, e.g. the mixer goes down?" Investigation found both sides *detected* and *surfaced* a

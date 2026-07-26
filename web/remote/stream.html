@@ -1093,6 +1093,24 @@ function makeServerPlayer() {
   let lastLiveSeq = null;
   let segMs = 2000;
   let emitter = null;
+  // `applyWaveform()`'s periodic 5s refresh moves `waveformBaseSeq` forward by
+  // however many segments the DVR evicted since the *previous* refresh —
+  // typically 2-3 segments (4-6s) at the default 2s segment length, since
+  // eviction runs continuously but the base only updates once per poll. That
+  // makes `currentTimeSecs()`'s frame-relative math (below) take a real step
+  // discontinuity at every refresh: the same absolute playhead position
+  // necessarily reads as a *smaller* local-frame value the instant the frame's
+  // origin jumps forward. `currentTimeSecs()` is what peaks.js's own playhead
+  // marker and autoScroll are driven from (via the emitted 'player.timeupdate'
+  // below), so left alone this reads as the playhead snapping backward once
+  // per refresh. `displayOffsetMs` exactly cancels that jump the moment
+  // `setWaveformBase()` applies it, then decays to 0 over a fraction of a
+  // second so the display settles onto the new frame's true value via a
+  // quick, smooth catch-up instead of a snap. Purely a display correction:
+  // the actual audio playing out server-side is completely unaffected.
+  let displayOffsetMs = 0;
+  let lastTickMs = null;
+  const DISPLAY_OFFSET_DECAY_PER_SEC = 6; // half-life ≈ 115ms
 
   function absoluteElapsedMs() {
     if (anchorWallClock == null) return 0;
@@ -1105,10 +1123,12 @@ function makeServerPlayer() {
   // waveform's* local coordinate frame (0 at `waveformBaseSeq`) — what
   // peaks.js needs for pixel positioning — recomputed fresh on every call so
   // a `waveformBaseSeq` change (eviction trim, or a fresh waveform fetch) is
-  // always reflected exactly, never against a stale conversion.
+  // always reflected exactly, never against a stale conversion. `displayOffsetMs`
+  // (see its doc comment above) smooths over the step change a base update
+  // itself introduces.
   function currentTimeSecs() {
     if (waveformBaseSeq == null) return 0;
-    const localMs = absoluteElapsedMs() - waveformBaseSeq * segMs;
+    const localMs = absoluteElapsedMs() - waveformBaseSeq * segMs + displayOffsetMs;
     return Math.max(0, Math.min(durationSecs, localMs / 1000));
   }
 
@@ -1120,6 +1140,12 @@ function makeServerPlayer() {
   // `playing` flips false -> true.
   let tickScheduled = false;
   function tick() {
+    const nowMs = performance.now();
+    if (lastTickMs != null && displayOffsetMs !== 0) {
+      displayOffsetMs *= Math.exp(-DISPLAY_OFFSET_DECAY_PER_SEC * (nowMs - lastTickMs) / 1000);
+      if (Math.abs(displayOffsetMs) < 1) displayOffsetMs = 0;
+    }
+    lastTickMs = nowMs;
     if (!playing) { tickScheduled = false; return; }
     emitter?.emit('player.timeupdate', currentTimeSecs());
     requestAnimationFrame(tick);
@@ -1152,6 +1178,17 @@ function makeServerPlayer() {
     isSeeking() { return false; },
     getCurrentTime() { return currentTimeSecs(); },
     getDuration() { return durationSecs; },
+    // Converts a *local* time (0 at `waveformBaseSeq`, what peaks.js's axis
+    // natively works in) to the broadcast's true absolute elapsed time (0 at
+    // stream start — same fixed origin as the top `playout-time` clock, see
+    // `updatePlayoutTime()`). Used by `formatAxisTime` below so the
+    // waveform's own ruler shows the same clock as the rest of the page,
+    // instead of time-since-the-DVR-window-started (which is what the axis
+    // shows natively, unbounded and unrelated to how long the broadcast has
+    // actually been running).
+    absoluteSecsForLocal(localSecs) {
+      return waveformBaseSeq == null ? localSecs : localSecs + (waveformBaseSeq * segMs) / 1000;
+    },
     setSource() { return Promise.resolve(); }, // no real media source to swap
     // -- internal: fed by connectWs()'s status handler / applyWaveform(), not part of the adapter contract --
     updateFromStatus(s) {
@@ -1169,7 +1206,12 @@ function makeServerPlayer() {
       if (!playing && wasPlaying) emitter?.emit('player.pause', currentTimeSecs());
     },
     setSegmentMs(ms) { segMs = ms; },
-    setWaveformBase(seq) { waveformBaseSeq = seq; },
+    setWaveformBase(seq) {
+      if (waveformBaseSeq != null && seq !== waveformBaseSeq) {
+        displayOffsetMs += (seq - waveformBaseSeq) * segMs;
+      }
+      waveformBaseSeq = seq;
+    },
     // `durationSecs` used to be derived from status as
     // `(live_seq - dvr_start_seq + 1) * segMs` — the DVR window's nominal
     // span, refreshed on every WS push. That's the same "distance from a
@@ -1217,6 +1259,13 @@ function initWaveform(json) {
     },
     player: serverPlayer,
     waveformData: { json },
+    // peaks.js's axis natively labels time-since-the-loaded-data's-own-start
+    // (0 at `waveformBaseSeq`) — for a bounded, evicting DVR window that's
+    // time-since-the-window-started, unrelated to how long the broadcast has
+    // actually been running, and it silently shrinks/resets as the window
+    // slides forward. Converting to absolute broadcast time here makes the
+    // ruler track the same clock as the `playout-time` text readout.
+    formatAxisTime: (time) => fmtTime(serverPlayer.absoluteSecsForLocal(time)),
   }, (err, instance) => {
     if (err) { console.error('peaks.js init failed', err); return; }
     peaksInstance = instance;
