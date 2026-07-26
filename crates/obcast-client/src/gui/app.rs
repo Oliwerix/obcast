@@ -570,7 +570,7 @@ impl ObcastApp {
         ui.heading("Gain");
         let mut gain = self.audio.gain_db();
         let resp = ui.add(
-            egui::Slider::new(&mut gain, -24.0..=24.0)
+            egui::Slider::new(&mut gain, -10.0..=24.0)
                 .suffix(" dB")
                 .text("input gain"),
         );
@@ -1316,14 +1316,16 @@ impl ObcastApp {
         }
     }
 
-    /// Common side effects of any alarm firing: logs `message` at `Warn`,
-    /// starts a `CLIP_FLASH_COUNT`-cycle border flash in `color`, and forces
-    /// the log panel open with this line highlighted for
-    /// `ALARM_HIGHLIGHT_DURATION`.
+    /// Common side effects of any alarm firing: logs `message` at `Warn`
+    /// (which the status bar's infobar picks up in the alert's own color —
+    /// see `status_bar`'s `log_entry`) and starts a `CLIP_FLASH_COUNT`-cycle
+    /// border flash in `color`. Deliberately does *not* open the log panel —
+    /// that stays under the operator's own control (the "Log" button); if
+    /// they do have it open already, the just-logged line stays highlighted
+    /// for `ALARM_HIGHLIGHT_DURATION` so it's easy to spot.
     fn fire_alarm(&mut self, now: Instant, message: impl Into<String>, color: egui::Color32) {
         let seq = self.shared.push_log(LogLevel::Warn, message);
         self.alarm_flash = Some((now, color));
-        self.show_log = true;
         self.alarm_highlight = Some((seq, now + ALARM_HIGHLIGHT_DURATION));
     }
 
