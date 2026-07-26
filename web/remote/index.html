@@ -28,9 +28,13 @@
     display: inline-block; padding: 3px 9px; border-radius: 100px; font-size: 11px;
     font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em;
   }
-  .pill.live { background: #1e4530; color: #4ade80; }
-  .pill.past { background: #2a2e35; color: #8a8f98; }
-  table.shows { width: 100%; border-collapse: collapse; }
+  .pill.live, .pill.up, .pill.playing { background: #1e4530; color: #4ade80; }
+  .pill.past, .pill.stopped { background: #2a2e35; color: #8a8f98; }
+  .pill.down, .pill.error { background: #3a1e1e; color: #f87171; }
+  .pill.stalled, .pill.paused, .pill.buffering { background: #4a3a12; color: #facc15; }
+  .health { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+  .table-scroll { width: 100%; overflow-x: auto; }
+  table.shows { width: 100%; border-collapse: collapse; min-width: 640px; }
   table.shows th {
     text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
     color: #8a8f98; font-weight: 600; padding: 8px 12px 8px 0; border-bottom: 1px solid #2a2e35;
@@ -45,6 +49,13 @@
   #banner { font-size: 13px; margin-bottom: 12px; display: none; }
   #banner.err { display: block; background: #3a1e1e; color: #f87171; border: 1px solid #5a2a2a; border-radius: 6px; padding: 8px 12px; }
   #banner.ok  { display: block; background: #1e4530; color: #4ade80; border: 1px solid #2a5a3f; border-radius: 6px; padding: 8px 12px; }
+
+  /* Larger touch targets on a narrow (phone/tablet) viewport -- checking on
+     a show from a phone in the field is an explicit use case here. */
+  @media (max-width: 640px) {
+    body { padding: 14px; }
+    button { min-height: 44px; padding: 10px 14px; }
+  }
 </style>
 </head>
 <body>
@@ -52,7 +63,7 @@
 <h1>OBCast — Shows</h1>
 <div class="sub">Every stream the server has received audio for. Open one to control it, or delete a past show to reclaim disk.</div>
 
-<div id="banner"></div>
+<div id="banner" role="status" aria-live="polite"></div>
 
 <div class="card">
   <div id="content">
@@ -142,27 +153,115 @@ function render() {
       <tr data-name="${enc}">
         <td><a class="show-name" href="${escapeHtml(href)}">${enc}</a></td>
         <td>${pill}</td>
+        <td class="v health" data-health="${enc}">${healthPillsHtml(name)}</td>
         <td class="v">${humanBytes(show.size_bytes)}</td>
         <td class="v">${humanDuration(show.duration_ms)}</td>
         <td class="v">${show.segment_count ?? 0}</td>
         <td class="muted">${escapeHtml(relativeTime(show.modified_unix_ms))}</td>
-        <td><button class="danger" data-del="${enc}" ${delAttr}>${delLabel}</button></td>
+        <td><button class="danger" data-del="${enc}" ${delAttr} aria-label="Delete show ${enc}">${delLabel}</button></td>
       </tr>`;
   }).join('');
 
   content.innerHTML = `
+    <div class="table-scroll">
     <table class="shows">
       <thead>
         <tr>
-          <th>Show</th><th>Status</th><th>Size</th><th>Duration</th>
-          <th>Segments</th><th>Last active</th><th></th>
+          <th scope="col">Show</th><th scope="col">Status</th><th scope="col">Health</th>
+          <th scope="col">Size</th><th scope="col">Duration</th>
+          <th scope="col">Segments</th><th scope="col">Last active</th><th scope="col"></th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
-    </table>`;
+    </table>
+    </div>`;
 
   content.querySelectorAll('button[data-del]').forEach(btn => {
     btn.onclick = () => onDelete(btn.getAttribute('data-del'));
+  });
+}
+
+// --- Multi-stream health (link/playout state per live show) ---
+//
+// A single overview of everything the server has received audio for was
+// already here, but none of the columns reflected live *health* -- an
+// operator running several simultaneous OB feeds had to open each show's
+// own stream.html individually just to see whether it was actually healthy
+// right now. Fetched via the existing GET /api/{stream}/status REST route
+// (not a WebSocket per row -- N long-lived sockets from an overview page
+// that's often left open for a whole broadcast day is exactly the kind of
+// resource-lifecycle cost this session's perf/leak pass was about avoiding),
+// and only for currently-live shows, so the extra request count scales with
+// concurrent broadcasts, not with total show history.
+let healthCache = {}; // name -> {connected, playoutState} | null (fetch failed)
+
+async function fetchHealth(name) {
+  try {
+    const resp = await fetch(apiBase + '/api/' + encodeURIComponent(name) + '/status');
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return { connected: !!(data.link && data.link.connected), playoutState: data.server?.playout?.state ?? null };
+  } catch {
+    return null;
+  }
+}
+
+function healthPillsHtml(name) {
+  const h = healthCache[name];
+  if (h === undefined) return '';
+  if (h === null) return '<span class="pill past">—</span>';
+  const linkHtml = `<span class="pill ${h.connected ? 'up' : 'down'}">${h.connected ? 'link up' : 'link down'}</span>`;
+  const stateHtml = h.playoutState
+    ? `<span class="pill ${h.playoutState}">${escapeHtml(h.playoutState)}</span>`
+    : '';
+  return linkHtml + stateHtml;
+}
+
+async function refreshHealth() {
+  const liveNames = latestShows.filter(s => s.live).map(s => s.name);
+  if (liveNames.length === 0) { healthCache = {}; return; }
+  const results = await Promise.all(liveNames.map(async name => [name, await fetchHealth(name)]));
+  const next = {};
+  results.forEach(([name, health]) => { next[name] = health; });
+  healthCache = next;
+
+  // Patch the health cells directly rather than a full render() -- health
+  // can change every poll for a live show even when sameShows() above
+  // decides nothing else did, and this shouldn't force a full table rebuild
+  // (rebinding every delete listener, wiping selection) just to update a
+  // couple of pills.
+  content.querySelectorAll('td[data-health]').forEach(cell => {
+    const name = cell.getAttribute('data-health');
+    cell.innerHTML = healthPillsHtml(name);
+  });
+}
+
+// Whether two shows lists are equal in every field render() displays.
+// Compared field-by-field (rather than JSON.stringify) so field reordering
+// in a future server response doesn't spuriously trigger a rebuild.
+function sameShows(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i], y = b[i];
+    if (x.name !== y.name || x.live !== y.live || x.size_bytes !== y.size_bytes ||
+        x.duration_ms !== y.duration_ms || x.segment_count !== y.segment_count ||
+        x.modified_unix_ms !== y.modified_unix_ms) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Patches just the "Last active" cell text in place, without touching any
+// other DOM (and in particular without rebinding delete-button listeners or
+// disturbing a user's text selection) — used when the underlying data hasn't
+// changed but wall-clock time has moved on since the last full render(),
+// so the relative-time column doesn't go stale between real changes.
+function refreshRelativeTimes() {
+  content.querySelectorAll('tr[data-name]').forEach(row => {
+    const show = latestShows.find(s => s.name === row.getAttribute('data-name'));
+    const cell = row.querySelector('td.muted');
+    if (show && cell) cell.textContent = relativeTime(show.modified_unix_ms);
   });
 }
 
@@ -204,8 +303,20 @@ async function refresh() {
       showBanner('err', 'Could not load shows: unexpected response from server.');
       return;
     }
-    latestShows = data;
     if (banner.className === 'err') { banner.className = ''; banner.textContent = ''; }
+
+    // Skip the full table rebuild (which recreates every row's DOM node and
+    // rebinds every delete button's onclick, wiping any in-progress text
+    // selection) on a poll where nothing actually changed -- true for most
+    // polls, since a show's stats only move while it's actively receiving
+    // audio. Still patch the "Last active" text directly so it doesn't go
+    // stale between real changes.
+    if (sameShows(data, latestShows)) {
+      latestShows = data;
+      refreshRelativeTimes();
+      return;
+    }
+    latestShows = data;
     render();
   } catch (e) {
     // Keep whatever is on screen; surface the problem without wiping the list.
@@ -216,8 +327,21 @@ async function refresh() {
   }
 }
 
-refresh();
-setInterval(refresh, 7000);
+// Paused entirely while the tab is hidden -- this used to poll at a fixed
+// 7s cadence forever regardless of whether the tab was focused, backgrounded,
+// or left open in another window for a whole broadcast day. Refreshes
+// immediately on becoming visible again instead of waiting out the interval.
+const REFRESH_MS = 7000;
+let refreshTimer = null;
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  if (document.hidden) return;
+  refreshTimer = setTimeout(() => { refresh().then(refreshHealth).finally(scheduleRefresh); }, REFRESH_MS);
+}
+refresh().then(refreshHealth).finally(scheduleRefresh);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refresh().then(refreshHealth).finally(scheduleRefresh);
+});
 </script>
 
 </body>

@@ -5,7 +5,7 @@
 <title>OBCast Remote</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
-<script src="https://unpkg.com/peaks.js/dist/peaks.js"></script>
+<script src="https://unpkg.com/peaks.js@4/dist/peaks.js"></script>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -85,6 +85,48 @@
   .log-entry .log-time { flex: 0 0 auto; color: #8a8f98; font-variant-numeric: tabular-nums; }
   .log-entry .pill { flex: 0 0 auto; }
   .log-entry .log-msg { color: #e6e6e6; word-break: break-word; }
+  details.section { margin-top: 14px; }
+  details.section > summary {
+    cursor: pointer; font-size: 11px; color: #8a8f98; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.03em; list-style: none; user-select: none;
+  }
+  details.section > summary::-webkit-details-marker { display: none; }
+  details.section > summary::before { content: '▸ '; }
+  details.section[open] > summary::before { content: '▾ '; }
+  .transport-hidden { display: none !important; }
+  .kbd-hint { font-size: 11px; color: #5a5f66; }
+  kbd {
+    background: #2a2e35; border: 1px solid #383d46; border-radius: 4px;
+    padding: 1px 5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10px;
+  }
+  #notes-list { max-height: 200px; overflow-y: auto; font-size: 13px; }
+  #notes-list .note-empty { color: #8a8f98; }
+  .note-entry {
+    display: flex; gap: 8px; align-items: baseline; padding: 4px 0;
+    border-bottom: 1px solid #22262c;
+  }
+  .note-entry:last-child { border-bottom: none; }
+  .note-entry .note-time { flex: 0 0 auto; color: #8a8f98; font-variant-numeric: tabular-nums; font-size: 12px; }
+  .note-entry .note-text { color: #e6e6e6; word-break: break-word; flex: 1 1 auto; }
+  .note-entry .note-del {
+    flex: 0 0 auto; background: none; border: none; color: #5a5f66; cursor: pointer;
+    padding: 0 4px; font-size: 12px;
+  }
+  .note-entry .note-del:hover { color: #f87171; }
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+  }
+
+  /* Larger touch targets on a narrow (phone/tablet) viewport -- checking on
+     a show from a phone in the field is an explicit use case here. */
+  @media (max-width: 640px) {
+    body { padding: 14px; }
+    button { min-height: 44px; padding: 10px 14px; }
+    input[type=range] { width: 100%; }
+    .meter-row { flex-wrap: wrap; }
+  }
 </style>
 </head>
 <body>
@@ -99,20 +141,25 @@
     move the real broadcast output, not just your browser.
   </div>
   <div class="row">
-    <span id="playout-pill" class="pill stopped">stopped</span>
-    <span id="onair-quality" class="la-quality" title="ABR rung actually reaching the hardware output right now (ground truth, not a live DVR-index lookup — see LinkHealth::current_rung)"><i></i><span id="onair-quality-label">—</span></span>
-    <span id="playout-reason" class="note" style="margin:0;"></span>
+    <span id="playout-pill" class="pill stopped" role="status">stopped</span>
+    <span id="onair-quality" class="la-quality" title="ABR rung actually reaching the hardware output right now (ground truth, not a live DVR-index lookup — see LinkHealth::current_rung)"><i aria-hidden="true"></i><span id="onair-quality-label">—</span></span>
+    <span id="playout-reason" class="note" style="margin:0;" role="status"></span>
   </div>
   <div class="row" style="margin-top:10px;">
     <span id="playout-time" style="font-variant-numeric: tabular-nums; font-size:22px; font-weight:600;">--:--</span>
     <span id="playout-behind" class="note" style="margin:0;">&mdash;</span>
   </div>
+  <div id="transport-controls">
   <div class="row" style="margin-top:14px;">
-    <button id="btn-seek-back" title="Seek back 10s">&laquo; 10s</button>
-    <button id="btn-playpause" class="primary">&#9654; Play</button>
-    <button id="btn-stop">&#9632; Stop</button>
-    <button id="btn-seek-fwd" title="Seek forward 10s">10s &raquo;</button>
+    <button id="btn-seek-back" title="Seek back 10s" aria-label="Seek back 10 seconds">&laquo; 10s</button>
+    <button id="btn-playpause" class="primary" aria-label="Play">&#9654; Play</button>
+    <button id="btn-stop" aria-label="Stop">&#9632; Stop</button>
+    <button id="btn-seek-fwd" title="Seek forward 10s" aria-label="Seek forward 10 seconds">10s &raquo;</button>
     <button id="btn-golive" title="Snap to the live edge">Live</button>
+  </div>
+  <div class="kbd-hint" style="margin-top:8px;">
+    <kbd>Space</kbd> play/pause &middot; <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> seek 10s &middot;
+    <kbd>L</kbd> go live &middot; <kbd>S</kbd> stop
   </div>
   <div class="row" style="margin-top:12px;">
     <label for="seek-secs" style="font-size:13px; color:#b8bcc4;">Seek to specific offset (seconds behind live):</label>
@@ -120,51 +167,55 @@
     <button id="btn-seek">Seek</button>
   </div>
   <div id="action-error" style="display:none; margin-top:12px; padding:8px 12px; border-radius:6px;
-       background:#3a1e1e; color:#f87171; font-size:13px;"></div>
+       background:#3a1e1e; color:#f87171; font-size:13px;" role="alert"></div>
   <div class="row" style="margin-top:12px;">
     <button id="btn-test-tone" title="1kHz sine: 2s both, then left, then right, looping">Play test tone</button>
-    <span id="test-tone-pill" class="pill stopped" style="display:none;">test tone</span>
+    <span id="test-tone-pill" class="pill stopped" style="display:none;" role="status">test tone</span>
     <span class="note" style="margin:0;">1kHz &middot; both &rarr; L &rarr; R, looping</span>
   </div>
-  <div class="row" style="margin-top:14px;">
-    <div>
-      <div class="row" style="margin-bottom:8px;">
-        <span style="font-size:11px; color:#8a8f98;">LEVELS</span>
-        <span class="meter-toggle">
-          <button id="peak-mode-ppm">PPM</button>
-          <button id="peak-mode-peak">dBFS peak</button>
-        </span>
-      </div>
-      <div class="meter-row">
-        <div class="meter-ch">
-          <span class="meter-ch-label">L</span>
-          <canvas id="meter-canvas-l" class="meter-canvas" width="130" height="220"></canvas>
-        </div>
-        <div class="meter-ch">
-          <span class="meter-ch-label">R</span>
-          <canvas id="meter-canvas-r" class="meter-canvas" width="130" height="220"></canvas>
-        </div>
-      </div>
-      <div class="note">0 VU = -18 dBFS. Left scale: VU-relative. Right scale: dBFS.</div>
-    </div>
   </div>
+
+  <details class="section" open>
+    <summary>Levels</summary>
+    <div class="row" style="margin-top:10px;">
+      <div>
+        <div class="row" style="margin-bottom:8px;">
+          <span class="meter-toggle">
+            <button id="peak-mode-ppm">PPM</button>
+            <button id="peak-mode-peak">dBFS peak</button>
+          </span>
+        </div>
+        <div class="meter-row">
+          <div class="meter-ch">
+            <span class="meter-ch-label">L</span>
+            <canvas id="meter-canvas-l" class="meter-canvas" width="130" height="220"></canvas>
+          </div>
+          <div class="meter-ch">
+            <span class="meter-ch-label">R</span>
+            <canvas id="meter-canvas-r" class="meter-canvas" width="130" height="220"></canvas>
+          </div>
+        </div>
+        <div class="note">0 VU = -18 dBFS. Left scale: VU-relative. Right scale: dBFS.</div>
+      </div>
+    </div>
+  </details>
 
   <div id="zoomview-container" style="margin-top:16px;"></div>
   <div class="legend">
-    <span><i style="background:#d03b3b;"></i>lo</span>
-    <span><i style="background:#ec835a;"></i>mid</span>
-    <span><i style="background:#fab219;"></i>hi</span>
-    <span><i style="background:#0ca30c;"></i>hd</span>
-    <span><i style="background:#3a3f47;"></i>gap</span>
-    <span><i style="background:#a78bfa;"></i>decode error</span>
+    <span><i aria-hidden="true" style="background:#d03b3b;"></i>lo</span>
+    <span><i aria-hidden="true" style="background:#ec835a;"></i>mid</span>
+    <span><i aria-hidden="true" style="background:#fab219;"></i>hi</span>
+    <span><i aria-hidden="true" style="background:#0ca30c;"></i>hd</span>
+    <span><i aria-hidden="true" style="background:#3a3f47;"></i>gap</span>
+    <span><i aria-hidden="true" style="background:#a78bfa;"></i>decode error</span>
   </div>
-  <div class="note">Click or drag the waveform to seek the server's hardware output. Color shows the ABR rung actually covering that audio.</div>
+  <div class="note" id="waveform-note">Click or drag the waveform to seek the server's hardware output. Color shows the ABR rung actually covering that audio.</div>
 </div>
 
 <div class="card">
   <h2>Stream health</h2>
   <table class="status">
-    <tr><td>Link</td><td class="v"><span id="link-pill" class="pill down">down</span></td></tr>
+    <tr><td>Link</td><td class="v"><span id="link-pill" class="pill down" role="status">down</span></td></tr>
     <tr><td>Last segment age</td><td class="v" id="seg-age">—</td></tr>
     <tr><td>Current rung</td><td class="v" id="cur-rung">—</td></tr>
     <tr><td>Gaps in window</td><td class="v" id="gaps">—</td></tr>
@@ -181,7 +232,21 @@
     and device errors) — the same events logged server-side, kept here for at-a-glance triage
     without tailing server logs.
   </div>
-  <div id="log-list"><div class="log-empty">No log entries yet.</div></div>
+  <div id="log-list" role="log" aria-live="polite"><div class="log-empty">No log entries yet.</div></div>
+</div>
+
+<div class="card" id="notes-card">
+  <h2>Operator notes</h2>
+  <div class="note" style="margin-top:0; margin-bottom:10px;">
+    Your own timestamped notes for this show ("talent break requested", "loud host laugh") — kept
+    only in this browser (not synced or shared), for correlating with the DVR/waveform later.
+  </div>
+  <div class="row">
+    <label for="note-input" class="visually-hidden">Add a note</label>
+    <input id="note-input" type="text" placeholder="Add a note…" style="flex:1 1 auto; min-width:200px;" />
+    <button id="btn-add-note">Add</button>
+  </div>
+  <div id="notes-list" style="margin-top:12px;" role="log" aria-live="polite"><div class="note-empty">No notes yet.</div></div>
 </div>
 
 <div class="card">
@@ -193,8 +258,8 @@
   <audio id="player" style="display:none;"></audio>
   <div class="row" style="margin-top:12px;">
     <button id="la-playpause" class="primary" disabled>Play</button>
-    <span id="la-state" class="pill stopped">idle</span>
-    <span id="la-quality" class="la-quality"><i></i><span id="la-quality-label">—</span></span>
+    <span id="la-state" class="pill stopped" role="status">idle</span>
+    <span id="la-quality" class="la-quality"><i aria-hidden="true"></i><span id="la-quality-label">—</span></span>
     <span class="la-spacer"></span>
     <button id="la-mute">Mute</button>
     <input id="la-volume" type="range" min="0" max="100" value="100" />
@@ -213,6 +278,23 @@ const stream = params.get('stream') || 'obshow';
 document.getElementById('stream-name').textContent = stream;
 
 const apiBase = '';
+
+// Read-only "listen" mode (?mode=listen): hides the transport/control
+// affordances (play/pause/stop/seek buttons, the seek-to-offset field, test
+// tone) and disables click-to-seek on the waveform, while keeping the state
+// pill/time/quality/waveform/levels/log/listen-along cards visible for
+// glancing at. Meant to be handed to a producer or remote colleague who
+// should be able to check on the show by ear without risking a fat-fingered
+// stop or seek on the actual broadcast output -- server-side control auth
+// (OBCAST_CONTROL_TOKEN, see CLAUDE.md) is the real security boundary; this
+// is purely a client-side UI restriction for a trusted-but-not-driving
+// viewer, same trust model as handing someone a "view only" link.
+const listenMode = params.get('mode') === 'listen';
+if (listenMode) {
+  document.getElementById('transport-controls').classList.add('transport-hidden');
+  const note = document.getElementById('waveform-note');
+  if (note) note.textContent = 'Read-only view — click-to-seek is disabled in listen mode.';
+}
 
 const actionError = document.getElementById('action-error');
 let actionErrorTimer = null;
@@ -309,6 +391,41 @@ document.getElementById('btn-seek').onclick = () => {
   post(`/api/${stream}/playout`, { cmd: 'seek', position: { kind: 'seconds_behind_live', value: secs } });
 };
 
+// Keyboard shortcuts for transport: an operator doing this for hours
+// otherwise has to precisely click small buttons every time. Disabled in
+// listen mode (a read-only viewer shouldn't be able to drive the real
+// output from the keyboard either) and while focus is in a text/number
+// input (so typing in the seek-to-offset field, or this page's own note
+// field, doesn't trigger a seek/stop), and ignores any modifier-key chord
+// so it doesn't fight browser/OS shortcuts.
+document.addEventListener('keydown', (e) => {
+  if (listenMode) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const tag = document.activeElement?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+  switch (e.key) {
+    case ' ':
+      e.preventDefault();
+      document.getElementById('btn-playpause').click();
+      break;
+    case 'ArrowLeft':
+      e.preventDefault();
+      seekRelative(SEEK_STEP_SECS);
+      break;
+    case 'ArrowRight':
+      e.preventDefault();
+      seekRelative(-SEEK_STEP_SECS);
+      break;
+    case 'l': case 'L':
+      post(`/api/${stream}/playout`, { cmd: 'go_live' });
+      break;
+    case 's': case 'S':
+      post(`/api/${stream}/playout`, { cmd: 'stop' });
+      break;
+  }
+});
+
 const testToneBtn = document.getElementById('btn-test-tone');
 const testTonePill = document.getElementById('test-tone-pill');
 testToneBtn.onclick = () => {
@@ -356,10 +473,13 @@ function updateTransportButtons(status) {
   const btn = document.getElementById('btn-playpause');
   if (state === 'playing' || state === 'stalled') {
     btn.innerHTML = '&#9616;&#9616; Pause';
+    btn.setAttribute('aria-label', 'Pause');
   } else if (state === 'paused') {
     btn.innerHTML = '&#9654; Resume';
+    btn.setAttribute('aria-label', 'Resume');
   } else {
     btn.innerHTML = '&#9654; Play';
+    btn.setAttribute('aria-label', 'Play');
   }
 }
 
@@ -411,6 +531,15 @@ function applyStatus(status) {
   document.getElementById('gaps').textContent = status.link.gaps;
 
   updateTestToneUi(!!s.playout.test_tone);
+
+  if (isBadState(status)) startAlertFlash(computeReason(status) || 'Playout needs attention.');
+  else stopAlertFlash();
+}
+
+// A stall/error/link-down condition is exactly what an operator who isn't
+// staring at this tab most needs to know about right now.
+function isBadState(status) {
+  return status.server.playout.state === 'error' || status.server.playout.state === 'stalled' || !status.link.connected;
 }
 
 // Human-readable rung name, falling back to the raw id if it's outside the
@@ -445,6 +574,98 @@ function setConnectionLost() {
   pill.className = 'pill error';
   document.getElementById('playout-reason').textContent =
     'lost connection to the control server — reconnecting…';
+  startAlertFlash('Lost connection to the control server — reconnecting…');
+}
+
+// --- Browser notifications + title/favicon flash for critical state changes ---
+//
+// An operator running a multi-hour OB broadcast is not staring at this tab
+// the whole time; without this, a stall, error, or dropped link only reaches
+// them if they happen to glance over. Both mechanisms are driven by the same
+// bad/healthy transition (isBadState() above, or a lost WS connection) so
+// they start together and clear together the moment the condition resolves
+// -- edge-triggered, not re-fired on every subsequent status push while it
+// remains bad.
+const originalTitle = document.title;
+let alertActive = false;
+let titleFlashTimer = null;
+let lastNotifiedAt = 0;
+const NOTIFY_COOLDOWN_MS = 30000;
+
+// Notification permission is requested on the first real user gesture on
+// this page (a transport click, or the listen-along Play button in listen
+// mode where transport is hidden) rather than unconditionally on load,
+// since an unprompted permission request has no gesture to anchor to and
+// most browsers silently ignore or auto-deny it anyway.
+function requestNotificationPermissionOnce() {
+  if (!('Notification' in window) || Notification.permission !== 'default') return;
+  Notification.requestPermission();
+}
+document.getElementById('transport-controls').addEventListener('click', requestNotificationPermissionOnce, { once: true });
+document.getElementById('la-playpause').addEventListener('click', requestNotificationPermissionOnce, { once: true });
+
+// A small canvas-drawn dot rather than a static asset -- no extra file to
+// ship, and trivial to recolor if this is ever reused for a different
+// severity in the future.
+function buildDotFavicon(color) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 32;
+  canvas.height = 32;
+  const ctx = canvas.getContext('2d');
+  ctx.beginPath();
+  ctx.arc(16, 16, 14, 0, 2 * Math.PI);
+  ctx.fillStyle = color;
+  ctx.fill();
+  return canvas.toDataURL('image/png');
+}
+const ALERT_FAVICON = buildDotFavicon('#e23d3d');
+function setFaviconAlert(on) {
+  const existing = document.querySelector('link[rel="icon"]');
+  if (!on) {
+    // Remove the element entirely rather than blanking its href -- an empty
+    // href resolves (via the DOM href IDL property) to the current page's
+    // own URL, not "no icon", which left the tab's favicon permanently
+    // blank after the first-ever alert instead of reverting to the
+    // browser's normal favicon resolution once everything's healthy again.
+    if (existing) existing.remove();
+    return;
+  }
+  const link = existing || document.createElement('link');
+  link.rel = 'icon';
+  link.href = ALERT_FAVICON;
+  if (!existing) document.head.appendChild(link);
+}
+
+function startAlertFlash(reasonText) {
+  if (!alertActive) {
+    alertActive = true;
+    let on = false;
+    titleFlashTimer = setInterval(() => {
+      on = !on;
+      document.title = on ? `⚠ ${stream} — OBCast Remote` : originalTitle;
+      setFaviconAlert(on);
+    }, 1000);
+  }
+
+  const now = Date.now();
+  if (document.hidden && now - lastNotifiedAt >= NOTIFY_COOLDOWN_MS &&
+      'Notification' in window && Notification.permission === 'granted') {
+    lastNotifiedAt = now;
+    try {
+      new Notification(`OBCast: ${stream}`, { body: reasonText, tag: 'obcast-alert' });
+    } catch {
+      // Some browsers restrict constructing Notification directly outside a
+      // service worker; nothing useful to do beyond not crashing the page.
+    }
+  }
+}
+
+function stopAlertFlash() {
+  if (!alertActive) return;
+  alertActive = false;
+  clearInterval(titleFlashTimer);
+  document.title = originalTitle;
+  setFaviconAlert(false);
 }
 
 // --- Server log panel: recent_log backlog (once, from the first `status`
@@ -502,6 +723,88 @@ function populateInitialLog(entries) {
   entries.forEach(appendLogEntry);
 }
 
+// --- Operator notes: a lightweight timestamped free-text log distinct from
+// the server's own auto-generated one above, so a multi-hour DVR/waveform
+// review later can be correlated with what the operator was actually seeing
+// at that moment ("talent break requested", "loud host laugh"). Kept purely
+// client-side in localStorage, keyed by stream name -- doesn't survive a
+// different browser/machine, but needs no new server surface either.
+const NOTES_CAP = 500;
+const notesKey = `obcast-notes-${stream}`;
+const notesListEl = document.getElementById('notes-list');
+const noteInput = document.getElementById('note-input');
+
+function loadNotes() {
+  try {
+    const raw = localStorage.getItem(notesKey);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+function saveNotes(notes) {
+  try {
+    localStorage.setItem(notesKey, JSON.stringify(notes.slice(-NOTES_CAP)));
+  } catch {
+    // Storage full/disabled -- notes just won't persist across a reload;
+    // not worth surfacing an error for a purely-convenience local log.
+  }
+}
+
+function renderNotes() {
+  const notes = loadNotes();
+  if (notes.length === 0) {
+    notesListEl.innerHTML = '<div class="note-empty">No notes yet.</div>';
+    return;
+  }
+  notesListEl.innerHTML = '';
+  // Newest first, matching the server log panel's chronological-then-latest
+  // reading order being least-effort to scan when checking "what just
+  // happened" at a glance.
+  notes.slice().reverse().forEach((n) => {
+    const row = document.createElement('div');
+    row.className = 'note-entry';
+
+    const time = document.createElement('span');
+    time.className = 'note-time';
+    time.textContent = fmtLogTime(n.at_ms);
+
+    const text = document.createElement('span');
+    text.className = 'note-text';
+    text.textContent = n.text;
+
+    const del = document.createElement('button');
+    del.className = 'note-del';
+    del.textContent = '✕';
+    del.setAttribute('aria-label', 'Delete note');
+    del.onclick = () => {
+      saveNotes(loadNotes().filter((x) => x.at_ms !== n.at_ms || x.text !== n.text));
+      renderNotes();
+    };
+
+    row.appendChild(time);
+    row.appendChild(text);
+    row.appendChild(del);
+    notesListEl.appendChild(row);
+  });
+}
+
+function addNote() {
+  const text = noteInput.value.trim();
+  if (!text) return;
+  const notes = loadNotes();
+  notes.push({ at_ms: Date.now(), text });
+  saveNotes(notes);
+  noteInput.value = '';
+  renderNotes();
+}
+document.getElementById('btn-add-note').onclick = addNote;
+noteInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') addNote();
+});
+renderNotes();
+
 // Dual-scale vertical VU/PPM meter, drawn to match the encoder client's
 // egui widget (crates/obcast-client/src/gui/meter.rs) pixel-for-pixel in
 // spirit: 0 VU at -18 dBFS, a left ruler read VU-relative and a right ruler
@@ -535,51 +838,36 @@ function hexWithAlpha(hex, alpha) {
   return `rgba(${r},${g},${b},${alpha})`;
 }
 
-function drawLevelMeter(canvas, vuDb, peakDb) {
-  const ctx = canvas.getContext('2d');
-  const w = canvas.clientWidth, h = canvas.clientHeight;
-  ctx.clearRect(0, 0, w, h);
+// The ruler (background, faint zone-guide, tick marks, VU/dBFS labels) never
+// changes frame to frame -- only the VU fill bar and the flying peak line
+// move. This used to be redrawn from scratch (including ~18 fillText/stroke
+// calls) on every 'meters' WS message, which the server pushes at a fixed
+// 20Hz (obcast-server's METERS_INTERVAL) regardless of whether anything
+// actually changed: 2 canvases x 20/sec x ~18 draw calls is well over a
+// million redundant draw calls/hour, sustained for the length of a session.
+// Built once per logical canvas size (both L/R meters share the same
+// geometry) into an offscreen bitmap and blitted with a single drawImage,
+// leaving only the bar fill + peak line to actually redraw every frame.
+let meterRulerBitmap = null;
+function buildMeterRulerBitmap(w, h) {
+  const ratio = window.devicePixelRatio || 1;
+  const off = document.createElement('canvas');
+  off.width = w * ratio;
+  off.height = h * ratio;
+  const ctx = off.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+
   ctx.fillStyle = METER_TRACK;
   ctx.fillRect(0, 0, w, h);
 
-  const leftRulerW = 30, rightRulerW = 28;
-  const barLeft = leftRulerW, barRight = Math.max(barLeft + 10, w - rightRulerW);
-  const barTop = 10, barBottom = h;
-  const barHeight = barBottom - barTop;
-  const barW = barRight - barLeft;
-  const yFor = dbfs => barBottom - meterFrac(dbfs) * barHeight;
+  const { barLeft, barRight, yFor } = meterGeometry(w, h);
 
   // Faint always-visible zone guide so the scale reads at any level.
   meterZones().forEach(([lo, hi, color]) => {
     const y0 = yFor(hi), y1 = yFor(lo);
     ctx.fillStyle = hexWithAlpha(color, 0.12);
-    ctx.fillRect(barLeft, y0, barW, y1 - y0);
+    ctx.fillRect(barLeft, y0, barRight - barLeft, y1 - y0);
   });
-
-  // VU fill: segmented by zone, except a full solid-red override once the
-  // level crosses into red.
-  const fillTop = yFor(vuDb);
-  if (vuDb >= METER_RED_THRESHOLD_DBFS) {
-    ctx.fillStyle = METER_RED;
-    ctx.fillRect(barLeft, fillTop, barW, barBottom - fillTop);
-  } else {
-    meterZones().forEach(([lo, hi, color]) => {
-      const segHi = Math.min(hi, vuDb);
-      if (segHi <= lo) return;
-      const y0 = yFor(segHi), y1 = yFor(lo);
-      ctx.fillStyle = color;
-      ctx.fillRect(barLeft, y0, barW, y1 - y0);
-    });
-  }
-
-  // Flying peak marker — PPM or true digital peak, per the toggle.
-  const peakY = yFor(peakDb);
-  ctx.strokeStyle = METER_PEAK_COLOR;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(barLeft, peakY);
-  ctx.lineTo(barRight, peakY);
-  ctx.stroke();
 
   // Shared tick grid, read two ways: left edge VU-relative (0 = -18 dBFS),
   // right edge plain dBFS (0 at the top).
@@ -614,6 +902,56 @@ function drawLevelMeter(canvas, vuDb, peakDb) {
   ctx.fillText('VU', barLeft - 2, 0);
   ctx.textAlign = 'left';
   ctx.fillText('dBFS', barRight + 2, 0);
+
+  return off;
+}
+
+function meterGeometry(w, h) {
+  const leftRulerW = 30, rightRulerW = 28;
+  const barLeft = leftRulerW, barRight = Math.max(barLeft + 10, w - rightRulerW);
+  const barTop = 10, barBottom = h;
+  const barHeight = barBottom - barTop;
+  return { barLeft, barRight, barTop, barBottom, barHeight, yFor: dbfs => barBottom - meterFrac(dbfs) * barHeight };
+}
+
+function drawLevelMeter(canvas, vuDb, peakDb) {
+  const ctx = canvas.getContext('2d');
+  // Cached at setup time (see setupMeterCanvas) rather than read via
+  // canvas.clientWidth/clientHeight on every call -- a layout-dependent
+  // property read that's wasted work since these canvases have a fixed,
+  // never-resized logical size.
+  const w = canvas.logicalWidth, h = canvas.logicalHeight;
+  if (!meterRulerBitmap) meterRulerBitmap = buildMeterRulerBitmap(w, h);
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(meterRulerBitmap, 0, 0, w, h);
+
+  const { barLeft, barRight, barBottom, yFor } = meterGeometry(w, h);
+  const barW = barRight - barLeft;
+
+  // VU fill: segmented by zone, except a full solid-red override once the
+  // level crosses into red.
+  const fillTop = yFor(vuDb);
+  if (vuDb >= METER_RED_THRESHOLD_DBFS) {
+    ctx.fillStyle = METER_RED;
+    ctx.fillRect(barLeft, fillTop, barW, barBottom - fillTop);
+  } else {
+    meterZones().forEach(([lo, hi, color]) => {
+      const segHi = Math.min(hi, vuDb);
+      if (segHi <= lo) return;
+      const y0 = yFor(segHi), y1 = yFor(lo);
+      ctx.fillStyle = color;
+      ctx.fillRect(barLeft, y0, barW, y1 - y0);
+    });
+  }
+
+  // Flying peak marker — PPM or true digital peak, per the toggle.
+  const peakY = yFor(peakDb);
+  ctx.strokeStyle = METER_PEAK_COLOR;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(barLeft, peakY);
+  ctx.lineTo(barRight, peakY);
+  ctx.stroke();
 }
 
 // Backs the canvas with real device pixels so the ruler text stays crisp on
@@ -624,6 +962,8 @@ function setupMeterCanvas(canvas) {
   const cssW = canvas.width, cssH = canvas.height;
   canvas.style.width = cssW + 'px';
   canvas.style.height = cssH + 'px';
+  canvas.logicalWidth = cssW;
+  canvas.logicalHeight = cssH;
   canvas.width = cssW * ratio;
   canvas.height = cssH * ratio;
   canvas.getContext('2d').setTransform(ratio, 0, 0, ratio, 0, 0);
@@ -664,8 +1004,19 @@ function applyMeters(vuDbL, vuDbR, ppmDbL, ppmDbR, peakDbL, peakDbR) {
     vuL: vuDbL, vuR: vuDbR, ppmL: ppmDbL, ppmR: ppmDbR,
     peakL: peakDbL ?? ppmDbL, peakR: peakDbR ?? ppmDbR,
   };
+  // The server pushes meters at a fixed 20Hz regardless of tab visibility,
+  // and a WS onmessage handler isn't subject to the background-tab timer
+  // throttling that would otherwise cap this cost -- so without this check
+  // both canvases would keep fully redrawing 20x/sec even while the tab is
+  // hidden. `lastMeters` above is still kept current so the next actual
+  // redraw (on becoming visible again, see the visibilitychange listener
+  // below) reflects the latest values immediately rather than a stale frame.
+  if (document.hidden) return;
   redrawMeters();
 }
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) redrawMeters();
+});
 
 // --- Waveform: BBC peaks.js, driven by the server's real playhead ---
 //
@@ -761,23 +1112,36 @@ function makeServerPlayer() {
     return Math.max(0, Math.min(durationSecs, localMs / 1000));
   }
 
+  // Only kept alive while actually playing — this used to call
+  // requestAnimationFrame(tick) unconditionally forever, waking the JS main
+  // thread every display frame (up to 120-144Hz on a high-refresh monitor)
+  // to do nothing for however long playout sits paused/stopped during a
+  // multi-hour session. Re-armed from updateFromStatus() below whenever
+  // `playing` flips false -> true.
+  let tickScheduled = false;
   function tick() {
-    if (playing) emitter?.emit('player.timeupdate', currentTimeSecs());
+    if (!playing) { tickScheduled = false; return; }
+    emitter?.emit('player.timeupdate', currentTimeSecs());
     requestAnimationFrame(tick);
   }
-  requestAnimationFrame(tick);
+  function ensureTickRunning() {
+    if (tickScheduled) return;
+    tickScheduled = true;
+    requestAnimationFrame(tick);
+  }
 
   return {
     // -- required peaks.js adapter methods (doc/customizing.md "Player" interface) --
     init(eventEmitter) { emitter = eventEmitter; return Promise.resolve(); },
     destroy() {},
-    play() { post(`/api/${stream}/playout`, { cmd: 'resume' }); return Promise.resolve(); },
-    pause() { post(`/api/${stream}/playout`, { cmd: 'pause' }); },
+    play() { if (!listenMode) post(`/api/${stream}/playout`, { cmd: 'resume' }); return Promise.resolve(); },
+    pause() { if (!listenMode) post(`/api/${stream}/playout`, { cmd: 'pause' }); },
     // `time` is in the waveform's own coordinate frame (seconds from
     // `waveformBaseSeq`), same frame `currentTimeSecs()` reports in — convert
     // to "ms behind live" using the latest known live edge so a click lands
     // on the exact sample the user clicked, not rounded to a whole segment.
     seek(time) {
+      if (listenMode) return; // read-only: never post a control command
       if (waveformBaseSeq == null || lastLiveSeq == null) return;
       const clickedMs = Math.max(0, time * 1000);
       const liveEndMs = (lastLiveSeq - waveformBaseSeq + 1) * segMs;
@@ -801,7 +1165,7 @@ function makeServerPlayer() {
       }
       const wasPlaying = playing;
       playing = s.playout.state === 'playing';
-      if (playing && !wasPlaying) emitter?.emit('player.playing', currentTimeSecs());
+      if (playing && !wasPlaying) { emitter?.emit('player.playing', currentTimeSecs()); ensureTickRunning(); }
       if (!playing && wasPlaying) emitter?.emit('player.pause', currentTimeSecs());
     },
     setSegmentMs(ms) { segMs = ms; },
@@ -905,29 +1269,98 @@ function applySegmentColors(json) {
 }
 
 // Cached so `trimEvictedSegments` (below) can prune it client-side between
-// full re-fetches without re-decoding anything server-side.
+// polls without re-decoding anything server-side, and so `applyWaveform` can
+// request only the segments it doesn't already have instead of the whole DVR
+// window every poll (see below).
 let currentWaveformJson = null;
 
+// Guards against two overlapping applyWaveform() calls both running at once
+// (each triggers a serial-ffmpeg-per-segment decode server-side, so overlap
+// compounds server load rather than just wasting client bandwidth) and,
+// combined with the fact trimEvictedSegments() below no-ops while
+// `peaksInstance` is still null, guarantees only one Peaks.js instance is
+// ever created against #zoomview-container.
+let waveformFetchInFlight = false;
+
+// Bumped by both applyWaveform() and trimEvictedSegments() before either
+// calls peaksInstance.setSource() (async, callback-based) and checked inside
+// each callback before applying its result. Without this, a slower call that
+// started first could resolve after a faster, later call and clobber
+// currentWaveformJson/the rendered segments with stale data — the two paths
+// fire on different, non-coprime cadences (a 5s poll here vs. roughly every
+// segment_ms from trimEvictedSegments' eviction-driven calls), so overlap is
+// plausible rather than exotic. The highest generation captured at call time
+// always wins, regardless of which callback actually resolves first.
+let waveformGeneration = 0;
+
+/// Concatenates `base`'s parallel arrays with `delta`'s, where `delta` is
+/// assumed to start exactly where `base` ends (see the `start_seq` used to
+/// fetch it in `applyWaveform`). `data` is a flat [min,max]-pair array at
+/// both ends, so a plain concat is correct without any 2x index math.
+function mergeWaveform(base, delta) {
+  return {
+    ...delta,
+    data: base.data.concat(delta.data),
+    rungs: base.rungs.concat(delta.rungs),
+    seqs: base.seqs.concat(delta.seqs),
+    decode_failed: (base.decode_failed || delta.decode_failed)
+      ? (base.decode_failed || new Array(base.length).fill(false))
+          .concat(delta.decode_failed || new Array(delta.length).fill(false))
+      : undefined,
+    length: base.length + delta.length,
+  };
+}
+
 async function applyWaveform() {
-  const resp = await fetch(`/api/${stream}/waveform`);
-  if (!resp.ok) return;
-  const json = await resp.json();
-  if (json.length === 0) return;
+  if (waveformFetchInFlight) return;
+  waveformFetchInFlight = true;
+  try {
+    // Once a waveform is already loaded, only ask for segments past the last
+    // one we have — eviction (the front of the window) is already trimmed
+    // incrementally by trimEvictedSegments below, so the only genuinely new
+    // data on a steady-state poll is whatever's been appended at the live
+    // edge. This turns "re-decode the entire DVR window via ffmpeg every 5s"
+    // (server-side, per waveform.rs's own doc comment — and literally
+    // unbounded under the documented OBCAST_DVR_WINDOW_MS=0 "never evict"
+    // mode) into "decode the couple of segments actually new since last
+    // poll," independent of how large the DVR window has grown.
+    const haveSeqs = currentWaveformJson && currentWaveformJson.seqs.length;
+    const startSeq = haveSeqs ? currentWaveformJson.seqs[currentWaveformJson.seqs.length - 1] + 1 : null;
+    const url = `/api/${stream}/waveform` + (startSeq != null ? `?start_seq=${startSeq}` : '');
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      // A start_seq already past the live edge (nothing new since our last
+      // poll) is rejected by the server as "end_seq must be >= start_seq" —
+      // that's the expected steady-state case, not a failure, so it's
+      // skipped silently rather than logged as an error.
+      return;
+    }
+    const json = await resp.json();
+    if (json.length === 0) return;
 
-  currentWaveformJson = json;
-  waveformPointMs = pointMs(json);
-  segmentMs = waveformPointMs * pointsPerSegment(json);
-  serverPlayer.setSegmentMs(segmentMs);
+    waveformPointMs = pointMs(json);
+    segmentMs = waveformPointMs * pointsPerSegment(json);
+    serverPlayer.setSegmentMs(segmentMs);
 
-  if (!peaksInstance) {
-    initWaveform(json);
-  } else {
-    serverPlayer.setWaveformBase(json.seqs[0]);
-    serverPlayer.setDuration((json.length * waveformPointMs) / 1000);
-    peaksInstance.setSource({ waveformData: { json } }, (err) => {
-      if (err) { console.error('waveform refresh failed', err); return; }
-      applySegmentColors(json);
-    });
+    const merged = startSeq != null ? mergeWaveform(currentWaveformJson, json) : json;
+    currentWaveformJson = merged;
+
+    if (!peaksInstance) {
+      initWaveform(merged);
+    } else {
+      serverPlayer.setWaveformBase(merged.seqs[0]);
+      serverPlayer.setDuration((merged.length * waveformPointMs) / 1000);
+      const myGeneration = ++waveformGeneration;
+      peaksInstance.setSource({ waveformData: { json: merged } }, (err) => {
+        if (err) { console.error('waveform refresh failed', err); return; }
+        if (myGeneration !== waveformGeneration) return; // superseded by a later call
+        applySegmentColors(merged);
+      });
+    }
+  } catch (e) {
+    console.error('waveform poll failed', e);
+  } finally {
+    waveformFetchInFlight = false;
   }
 }
 
@@ -964,15 +1397,36 @@ function trimEvictedSegments(newStartSeq) {
   currentWaveformJson = trimmed;
   serverPlayer.setWaveformBase(trimmed.seqs[0]);
   serverPlayer.setDuration((trimmed.length * waveformPointMs) / 1000);
+  const myGeneration = ++waveformGeneration;
   peaksInstance.setSource({ waveformData: { json: trimmed } }, (err) => {
     if (err) { console.error('waveform trim failed', err); return; }
+    if (myGeneration !== waveformGeneration) return; // superseded by a later call
     applySegmentColors(trimmed);
   });
+}
+
+// Reconnect backoff: fixed-1s retries used to mean an extended server outage
+// (or a permanently bad stream name, which the server rejects at the WS
+// upgrade — see stream_if_known — and which then looks identical to any other
+// transient close) produced ~3600 reconnect attempts/hour indefinitely, and
+// every open tab watching a show resynchronized onto the same 1s cadence, so
+// they'd all hammer the server in lockstep the instant it came back. Backs
+// off 1s -> 2s -> 4s ... capped at 15s, with +/-20% jitter so multiple tabs
+// spread out instead of herding; resets to the 1s floor on a successful open.
+const WS_RECONNECT_BASE_MS = 1000;
+const WS_RECONNECT_MAX_MS = 15000;
+let wsReconnectAttempt = 0;
+function nextWsReconnectDelay() {
+  const backoff = Math.min(WS_RECONNECT_MAX_MS, WS_RECONNECT_BASE_MS * 2 ** wsReconnectAttempt);
+  wsReconnectAttempt++;
+  const jitter = 0.8 + Math.random() * 0.4;
+  return Math.round(backoff * jitter);
 }
 
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/api/${stream}/ws`);
+  ws.onopen = () => { wsReconnectAttempt = 0; };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     // ControlEvent is internally tagged ("type"); Status's fields (stream,
@@ -993,12 +1447,49 @@ function connectWs() {
       appendLogEntry(msg);
     }
   };
-  ws.onclose = () => { setConnectionLost(); setTimeout(connectWs, 1000); };
+  ws.onclose = () => { setConnectionLost(); setTimeout(connectWs, nextWsReconnectDelay()); };
   ws.onerror = () => ws.close();
 }
 connectWs();
-applyWaveform();
-setInterval(applyWaveform, 5000);
+
+// Keep the screen awake while this page is open -- checking on a live show
+// from a phone in the field is an explicit use case here, and a screen that
+// dims/locks mid-glance is exactly the wrong failure mode for an operator
+// control panel. Best-effort: not every browser supports the Wake Lock API,
+// and a lock is automatically released by the browser whenever the tab is
+// hidden, so it's reacquired on becoming visible again.
+let wakeLock = null;
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+  } catch {
+    // Denied, unsupported in this context (e.g. not HTTPS), or the page
+    // isn't visible yet -- nothing actionable, just don't hold a lock.
+  }
+}
+requestWakeLock();
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) requestWakeLock();
+});
+
+// Waveform polling: paused entirely while the tab is hidden (nothing on
+// screen benefits from a redecode nobody's looking at) and refreshed
+// immediately on becoming visible again, rather than a plain
+// setInterval(applyWaveform, 5000) that ran at full cadence in the
+// background for the whole life of the tab regardless of whether it was
+// ever foregrounded.
+const WAVEFORM_POLL_MS = 5000;
+let waveformPollTimer = null;
+function scheduleWaveformPoll() {
+  clearTimeout(waveformPollTimer);
+  if (document.hidden) return;
+  waveformPollTimer = setTimeout(() => { applyWaveform().finally(scheduleWaveformPoll); }, WAVEFORM_POLL_MS);
+}
+applyWaveform().finally(scheduleWaveformPoll);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { applyWaveform().finally(scheduleWaveformPoll); }
+});
 
 // The zoomview container is full page width (`width: 100%`), so a window
 // resize changes the view's pixel width and both peaks.js's own layout
@@ -1134,7 +1625,22 @@ laGoLive.onclick = () => {
   laTime.textContent = laBehindText(r.end);
 };
 
+// recoverMediaError() used to be called unconditionally on every fatal media
+// error, with no counter or time window -- hls.js's own documented pattern
+// (see its recover-media-error demo) tracks recent attempts and escalates to
+// a full destroy+rebuild once they cluster, rather than retrying forever. On
+// a persistently bad segment or a persistently flaky link (exactly the
+// condition this whole system exists to survive), an unconditional retry
+// churns through MediaSource/SourceBuffer construction/teardown for as long
+// as the condition lasts -- potentially hours, on an OB session -- with
+// nothing to fall back to the same destroy+rebuild path already used for
+// other fatal errors.
+const MEDIA_ERROR_RECOVERY_WINDOW_MS = 3000;
+const MEDIA_ERROR_RECOVERY_LIMIT = 3;
+let laMediaErrorTimestamps = [];
+
 function buildLaHls() {
+  laMediaErrorTimestamps = [];
   // hls.js flushes the back-buffer aggressively for live streams by default,
   // leaving nothing behind the live edge to scrub into; hold ~5 min to match
   // the server's own DVR window (obcast-server dvr_window_ms).
@@ -1156,7 +1662,16 @@ function buildLaHls() {
       clearTimeout(laRecoverTimer);
       laRecoverTimer = setTimeout(() => hls.startLoad(), 1000);
     } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-      hls.recoverMediaError();
+      const now = performance.now();
+      laMediaErrorTimestamps = laMediaErrorTimestamps.filter(t => now - t < MEDIA_ERROR_RECOVERY_WINDOW_MS);
+      laMediaErrorTimestamps.push(now);
+      clearTimeout(laRecoverTimer);
+      if (laMediaErrorTimestamps.length > MEDIA_ERROR_RECOVERY_LIMIT) {
+        hls.destroy();
+        laRecoverTimer = setTimeout(buildLaHls, 2000);
+      } else {
+        hls.recoverMediaError();
+      }
     } else {
       hls.destroy();
       clearTimeout(laRecoverTimer);
