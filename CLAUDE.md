@@ -882,21 +882,22 @@ true` and `applyAutoScrollOffset()` (the pre-existing, working 25%-of-width edge
 back exactly as they were. Centering the playhead is a real, separate ask, deliberately left for the
 maintainer to decide is worth a dedicated pass rather than continuing to guess at it.
 
-**Reconciled the two entries above with the independent incremental-waveform-fetch perf rework
-merged around the same time (see "Fixed web remote perf/memory issues" further below).** That rework
-replaced `applyWaveform()`'s periodic full-window fetch with a delta fetch (only segments past the
-last one already held) guarded by a `waveformFetchInFlight` lock that refuses to start a second fetch
-while one is outstanding — which independently closes the exact overlapping-requests race the
-`waveformFetchSeq` counter above was added for, making that counter redundant; it was removed rather
-than kept alongside a lock that already makes it unreachable. Separately, that same rework had
-reintroduced physically slicing `currentWaveformJson` and calling `setSource()` inside
-`trimEvictedSegments` (needed for bounded memory now that `applyWaveform()` no longer does a periodic
-full re-fetch to naturally cap array growth) — which reintroduces exactly the scroll-reset-on-every-
-eviction-tick bug the recolor-only rewrite above exists to prevent. Resolved by keeping
-`trimEvictedSegments` recolor-only (no slice, no `setSource`) and instead folding the deferred slice
-into `applyWaveform()`'s next merge, which already has to call `setSource()` for the newly-arrived
-data — so the physical trim still happens (bounding memory) but never as an extra call made solely
-for eviction bookkeeping.
+**Reconciled the two entries above with an independent incremental-waveform-fetch perf rework merged
+around the same time** (a separate `applyWaveform()` rewrite: periodic full-window fetch replaced with
+a delta fetch of only the segments past the last one already held, guarded by a `waveformFetchInFlight`
+lock that refuses to start a second fetch while one is outstanding). That lock independently closes the
+exact overlapping-requests race the `waveformFetchSeq` counter above was added for, so the counter was
+dropped as redundant rather than kept alongside a lock that already makes it unreachable. The
+`trimEvictedSegments` recolor-only rewrite above was **not** carried forward: that rework's delta-fetch
+model no longer does a periodic full re-fetch, so `trimEvictedSegments` is now the *only* thing that
+ever shrinks `currentWaveformJson` — a stream whose encoder has fully disconnected (no new segments
+ever arriving again) but whose DVR keeps evicting on its timer would otherwise never trim, colors
+recede into `GAP_COLOR` forever while `waveformBaseSeq`/duration silently drift from the server's real
+`dvr_start_seq`. Physically slicing on eviction (this rework's original approach, restored as-is) is
+therefore kept despite reintroducing the scroll-reset-per-eviction-tick cosmetic issue the recolor-only
+rewrite existed to fix — correctness under a dead encoder wins over a live-stream scroll cosmetic;
+revisit as a follow-up if that jump proves bothersome in practice, folding the physical slice into
+`applyWaveform()`'s next merge (which already calls `setSource()`) rather than reviving recolor-only.
 
 **Automatic reconnect when the hardware audio device disconnects mid-session (server playout output
 and client capture input).** Prompted by an operator question: "what happens if the audio device

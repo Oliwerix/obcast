@@ -1294,19 +1294,13 @@ function pointMs(json) {
 /// overlay:false makes the segment draw its own waveform peaks in `color` in
 /// place of the base waveform, so adjacent no-gap segments read as one
 /// continuously color-coded waveform rather than boxes drawn on top of it.
-/// Points before `evictedUpTo` (see `trimEvictedSegments`) are painted as a
-/// gap even though they're still physically present in `json` — recoloring
-/// is the only thing eviction needs to do to the display; see
-/// `trimEvictedSegments`'s doc comment for why the underlying data is left
-/// untouched.
-function applySegmentColors(json, evictedUpTo = 0) {
+function applySegmentColors(json) {
   peaksInstance.segments.removeAll();
   const pMs = pointMs(json);
 
   let i = 0;
   while (i < json.seqs.length) {
     const seq = json.seqs[i];
-    const evicted = i < evictedUpTo;
     const rung = json.rungs[i];
     const failed = json.decode_failed ? json.decode_failed[i] : false;
     let j = i;
@@ -1314,7 +1308,7 @@ function applySegmentColors(json, evictedUpTo = 0) {
     peaksInstance.segments.add({
       startTime: (i * pMs) / 1000,
       endTime: (j * pMs) / 1000,
-      color: evicted ? GAP_COLOR : colorForRung(rung, failed),
+      color: colorForRung(rung, failed),
       editable: false,
       overlay: false,
       id: `seq-${seq}`,
@@ -1341,7 +1335,11 @@ let waveformFetchInFlight = false;
 // calls peaksInstance.setSource() (async, callback-based) and checked inside
 // each callback before applying its result. Without this, a slower call that
 // started first could resolve after a faster, later call and clobber
-// currentWaveformJson/the rendered segments with stale data.
+// currentWaveformJson/the rendered segments with stale data — the two paths
+// fire on different, non-coprime cadences (a 5s poll here vs. roughly every
+// segment_ms from trimEvictedSegments' eviction-driven calls), so overlap is
+// plausible rather than exotic. The highest generation captured at call time
+// always wins, regardless of which callback actually resolves first.
 let waveformGeneration = 0;
 
 /// Concatenates `base`'s parallel arrays with `delta`'s, where `delta` is
@@ -1362,33 +1360,19 @@ function mergeWaveform(base, delta) {
   };
 }
 
-/// Slices `json`'s parallel arrays (data/rungs/seqs/decode_failed) down to
-/// just the points at `newStartSeq` or later. `data` is [min,max] pairs, so
-/// it's sliced at `2*index` rather than `index`.
-function sliceWaveformFrom(json, index) {
-  return {
-    ...json,
-    data: json.data.slice(index * 2),
-    rungs: json.rungs.slice(index),
-    seqs: json.seqs.slice(index),
-    decode_failed: json.decode_failed ? json.decode_failed.slice(index) : undefined,
-    length: json.length - index,
-  };
-}
-
 async function applyWaveform() {
   if (waveformFetchInFlight) return;
   waveformFetchInFlight = true;
   try {
     // Once a waveform is already loaded, only ask for segments past the last
-    // one we have — eviction (the front of the window) is handled separately
-    // below (see `evictedPointCount`), so the only genuinely new data on a
-    // steady-state poll is whatever's been appended at the live edge. This
-    // turns "re-decode the entire DVR window via ffmpeg every 5s" (server-side,
-    // per waveform.rs's own doc comment — and literally unbounded under the
-    // documented OBCAST_DVR_WINDOW_MS=0 "never evict" mode) into "decode the
-    // couple of segments actually new since last poll," independent of how
-    // large the DVR window has grown.
+    // one we have — eviction (the front of the window) is already trimmed
+    // incrementally by trimEvictedSegments below, so the only genuinely new
+    // data on a steady-state poll is whatever's been appended at the live
+    // edge. This turns "re-decode the entire DVR window via ffmpeg every 5s"
+    // (server-side, per waveform.rs's own doc comment — and literally
+    // unbounded under the documented OBCAST_DVR_WINDOW_MS=0 "never evict"
+    // mode) into "decode the couple of segments actually new since last
+    // poll," independent of how large the DVR window has grown.
     const haveSeqs = currentWaveformJson && currentWaveformJson.seqs.length;
     const startSeq = haveSeqs ? currentWaveformJson.seqs[currentWaveformJson.seqs.length - 1] + 1 : null;
     const url = `/api/${stream}/waveform` + (startSeq != null ? `?start_seq=${startSeq}` : '');
@@ -1407,17 +1391,7 @@ async function applyWaveform() {
     segmentMs = waveformPointMs * pointsPerSegment(json);
     serverPlayer.setSegmentMs(segmentMs);
 
-    let merged = startSeq != null ? mergeWaveform(currentWaveformJson, json) : json;
-    // Fold in whatever trimEvictedSegments() below has recolored-but-not-yet-
-    // physically-sliced since the last time we got here (see its doc comment
-    // for why it defers the slice). This is the one setSource() call in this
-    // whole flow that's already happening anyway because new data just
-    // arrived, so trimming the stale evicted prefix off here adds no extra
-    // scroll-resetting call beyond what a plain data update already causes.
-    if (evictedPointCount > 0) {
-      merged = sliceWaveformFrom(merged, evictedPointCount);
-      evictedPointCount = 0;
-    }
+    const merged = startSeq != null ? mergeWaveform(currentWaveformJson, json) : json;
     currentWaveformJson = merged;
 
     if (!peaksInstance) {
@@ -1439,49 +1413,45 @@ async function applyWaveform() {
   }
 }
 
-// How many leading points of `currentWaveformJson` have been evicted from the
-// DVR but not yet physically sliced out of the array — `trimEvictedSegments`
-// below only recolors them (see its doc comment for why); the actual slice
-// is folded into the next `applyWaveform()` merge above.
-let evictedPointCount = 0;
+/// Slices `json`'s parallel arrays (data/rungs/seqs/decode_failed) down to
+/// just the points at `newStartSeq` or later. `data` is [min,max] pairs, so
+/// it's sliced at `2*index` rather than `index`.
+function sliceWaveformFrom(json, index) {
+  return {
+    ...json,
+    data: json.data.slice(index * 2),
+    rungs: json.rungs.slice(index),
+    seqs: json.seqs.slice(index),
+    decode_failed: json.decode_failed ? json.decode_failed.slice(index) : undefined,
+    length: json.length - index,
+  };
+}
 
 // Runs the DVR store's eviction (see CLAUDE.md §8, `store.rs::evict_old`)
 // forward onto the already-loaded waveform, client-side, the moment
 // `status`'s `dvr_start_seq` reports it — rather than waiting for the next
 // 5s `applyWaveform()` timer poll (which re-decodes the *entire* DVR window
 // via ffmpeg server-side; see `waveform.rs`'s module docs on why that isn't
-// cheap enough to do every time the head moves).
-//
-// This used to physically slice the evicted points out of `currentWaveformJson`
-// and call `peaksInstance.setSource()` with the trimmed data immediately. But
-// `status` (and thus this function) fires on every `ServerState` change —
-// roughly once per `segment_ms` once eviction is continuously active — and
-// peaks.js's `setSource()` unconditionally runs `zoom.setZoomLevels() ->
-// setZoom(0, true)` internally (`forceUpdate: true` skips its "already at
-// this zoom level" guard), resetting the zoomview's scroll position on
-// *every* call regardless of whether anything actually changed. AutoScroll
-// then snaps it back to the correct position a moment later — visible as the
-// waveform cursor jumping backward roughly every `segment_ms`, once a
-// stream's DVR window filled and eviction went continuous.
-//
-// Fixed by never calling `setSource()` here at all: this only recolors the
-// now-evicted leading segments as a gap (`applySegmentColors`, a cheap
-// `segments` overlay update, not a `WaveformData`/zoom operation) and leaves
-// `currentWaveformJson`/`waveformBaseSeq`/duration untouched here. The actual
-// slice happens lazily in `applyWaveform()` above the next time new data
-// merges in, which is also the only remaining place this file calls
-// `setSource()` purely for eviction bookkeeping — so this recolor still
-// makes an evicted segment *look* gone within one WS push (this function's
-// actual purpose) without ever causing the scroll-reset jump on its own.
+// cheap enough to do every time the head moves). A plain array slice here is
+// free by comparison, and it's what makes an evicted segment's waveform
+// disappear from the overview promptly instead of lingering for up to 5s.
 function trimEvictedSegments(newStartSeq) {
   if (!peaksInstance || !currentWaveformJson) return;
   const seqs = currentWaveformJson.seqs;
   let i = 0;
   while (i < seqs.length && seqs[i] < newStartSeq) i++;
-  if (i <= evictedPointCount || i >= seqs.length) return;
+  if (i === 0 || i >= seqs.length) return;
 
-  evictedPointCount = i;
-  applySegmentColors(currentWaveformJson, evictedPointCount);
+  const trimmed = sliceWaveformFrom(currentWaveformJson, i);
+  currentWaveformJson = trimmed;
+  serverPlayer.setWaveformBase(trimmed.seqs[0]);
+  serverPlayer.setDuration((trimmed.length * waveformPointMs) / 1000);
+  const myGeneration = ++waveformGeneration;
+  peaksInstance.setSource({ waveformData: { json: trimmed } }, (err) => {
+    if (err) { console.error('waveform trim failed', err); return; }
+    if (myGeneration !== waveformGeneration) return; // superseded by a later call
+    applySegmentColors(trimmed);
+  });
 }
 
 // Reconnect backoff: fixed-1s retries used to mean an extended server outage
