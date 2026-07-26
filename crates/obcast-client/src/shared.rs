@@ -5,7 +5,7 @@
 //! per-frame poll never blocks on network tasks.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use obcast_proto::control::{LogEntry, LogLevel};
@@ -65,6 +65,13 @@ pub struct SharedState {
     /// `recent_log`/`latest_log`) so a dead "live" session surfaces instead
     /// of silently producing nothing.
     log: std::sync::Mutex<VecDeque<LogEntry>>,
+    /// Total number of log lines ever pushed (never decremented, even as
+    /// `log` itself evicts old entries at `LOG_CAP`). Lets the GUI's status
+    /// bar dismiss the latest entry without an unstable dismissal key: it
+    /// just remembers the counter value at the moment of dismissal and
+    /// compares against the current value (see `log_seq`/the status bar's
+    /// infobar-dismiss handling in `gui/app.rs`).
+    log_seq: AtomicU64,
     /// Latched one-shot: an `Error`-level line was logged since the GUI last
     /// checked, so the GUI should drop its own `live` state back to idle.
     encoder_failed: AtomicBool,
@@ -80,6 +87,7 @@ impl SharedState {
             primary_rung: AtomicU32::new(0),
             upload_history: std::sync::Mutex::new(BTreeMap::new()),
             log: std::sync::Mutex::new(VecDeque::new()),
+            log_seq: AtomicU64::new(0),
             encoder_failed: AtomicBool::new(false),
         }
     }
@@ -88,7 +96,11 @@ impl SharedState {
     /// entries also latch `encoder_failed`, so a dead pipeline flips the GUI
     /// out of "live" without every call site needing to track that
     /// separately (see `take_encoder_failed`).
-    pub fn push_log(&self, level: LogLevel, message: impl Into<String>) {
+    /// Returns the `log_seq` value assigned to this entry, so a caller that
+    /// needs to refer back to this exact line later (e.g. the GUI's alarm
+    /// highlight — see `gui::app::ObcastApp::fire_alarm`) doesn't need a
+    /// second, racy lookup.
+    pub fn push_log(&self, level: LogLevel, message: impl Into<String>) -> u64 {
         let entry = LogEntry {
             at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -100,11 +112,13 @@ impl SharedState {
         if level == LogLevel::Error {
             self.encoder_failed.store(true, Ordering::Relaxed);
         }
+        let seq = self.log_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let mut log = self.log.lock().unwrap();
         log.push_back(entry);
         while log.len() > LOG_CAP {
             log.pop_front();
         }
+        seq
     }
 
     /// Snapshot of the retained log, oldest first, for the GUI panel to
@@ -119,6 +133,13 @@ impl SharedState {
     /// panel is open).
     pub fn latest_log(&self) -> Option<LogEntry> {
         self.log.lock().unwrap().back().cloned()
+    }
+
+    /// Current value of the monotonic log counter — pair with `latest_log`
+    /// so the GUI can dismiss the infobar's summary of it and only have it
+    /// reappear once a genuinely new line is pushed (see `log_seq` field doc).
+    pub fn log_seq(&self) -> u64 {
+        self.log_seq.load(Ordering::Relaxed)
     }
 
     /// Returns true exactly once after an `Error`-level line was logged, so

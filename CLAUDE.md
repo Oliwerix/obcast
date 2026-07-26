@@ -532,6 +532,39 @@ The `obcast-proto` Rust types are the source of truth for all these schemas.
   high-quality pick. All pre-existing tests were updated to pass `preferred_rung: low_rung()`
   (recovering the previous always-low-rung live-edge behavior) and pass unchanged, confirming the
   fix is additive rather than a behavior change for callers that don't set a preference.
+- **Fixed: "Default quality" was still a no-op for the whole pre-roll phase — before the playhead
+  is ever initialized.** The fix above made Tier B (live edge) honor `preferred_rung`, but only
+  once `server.playout.state` is `Playing`/`Paused`/`Stalled` *and* there's already a real gap
+  between the anchor and the live edge (the normal "playing with a healthy buffer" shape the fix's
+  tests all used). Reported directly: start the client with quality set to "mid" and the very first
+  segments still go out at the lowest rung. Root cause: `anchor()` falls back to the live edge
+  itself while `server.playout.state` is `Stopped` (no position has ever been set — true right
+  after starting the encoder, and for the whole time a stream is buffering toward
+  `auto_start_buffer_ms`, see the "encoder-requested auto-start" entry below). With the anchor
+  pinned to the tip, Tier A's "secure `target_ms` of lead ahead of the anchor" walk resolves, every
+  tick, to "the one segment just encoded" — there's no pre-existing buffer ahead of the live edge
+  for a healthy link to ever separate from — so continuity claimed literally every newly-produced
+  segment, always at the low rung (its unconditional, deliberate behavior whenever a real playout
+  head is being defended). Tier B's identical newest-window scan then found nothing left to do.
+  Net effect: for as long as a stream stays stopped — which is the entire pre-roll window
+  auto-start is built around — every segment banked into the DVR was low quality regardless of the
+  operator's pick, and by the time playout actually started (at `dvr_start_seq`, i.e. the *oldest*
+  end of that buffer), Tier C's one-rung-per-tick ratcheting meant re-upgrading minutes of
+  already-low backlog instead of it having been recorded correctly the first time. Fixed by adding
+  a `has_active_head` check (`Playing | Paused | Stalled`) inside Tier A itself: with an active head,
+  behavior is unchanged (always low, unconditionally — the existing
+  `continuity_ignores_preferred_rung_even_with_ample_budget` test still passes untouched); without
+  one, continuity now tries `preferred_rung` first (same affordability/availability check Tier B
+  uses) and only falls back to `low` — still bursting past the tick budget, same as its ordinary
+  no-gap guarantee — when the preferred rung doesn't fit or isn't encoded yet. This keeps the
+  dropout guarantee intact for the one case it still matters while stopped: the web remote's
+  "start" button defaults to `position: live` (`stream.html`), so an operator hitting start with no
+  explicit scrub position can snap straight to the tip at any moment, and a low-rung fallback must
+  still be there when they do. Three new `scheduler.rs` tests cover the stopped/uninitialized case
+  directly: continuity banks the preferred rung with ample bandwidth, falls back to low when it's
+  unaffordable, and falls back to low when it hasn't been encoded locally yet — mirroring the three
+  Tier B tests above but for `PlayoutState::Stopped, position_seq: None` instead of a healthy
+  in-progress buffer.
 
 **Beyond the roadmap (built, not on the original M-list):** a BBC peaks.js quality-colored waveform
 (`server/waveform.rs` + `GET /api/{stream}/waveform`, color-coded by ABR rung with click-to-seek);
@@ -648,6 +681,72 @@ also calls peaks.js's own `view.fitToContainer()`, since per its docs it does no
 resizes on its own). True continuous (non-jumping) scroll is possible but would mean disabling
 peaks.js's autoScroll and driving `view.updateWaveform()` every animation frame ourselves — left
 as a follow-up if the 25%-edge jump still isn't smooth enough in practice.
+
+**Fixed: after a reconnect, the buffer sat flat at a small margin for tens of seconds before growing,
+instead of proactively rebuilding.** Reported directly: after a deliberate network drop and
+reconnect, the server-reported buffer drained to ~15s (didn't run dry, good) but then *held* at
+~15s for ~30s — neither draining further nor growing — before finally starting to climb, even
+though the reconnected link had ample spare bandwidth the whole time. Root cause was in
+`scheduler.rs`'s Tier A (continuity): it only walked the contiguous frontier forward from the
+playout head until securing `water.target_ms` (a small, fixed 12s by default) — not `water.high_ms`
+(20s, the threshold that separately gates when Tier C is allowed to start upgrading quality). Tier B
+(live edge) only ever touches its own newest-`target_ms` tail near the encoder's live edge. Nothing
+filled the region in between — exactly the backlog a network outage creates, since the encoder kept
+producing segments locally the whole time it couldn't upload them — regardless of how much idle
+bandwidth was sitting unused (continuity uploads are explicitly burst/budget-exempt, so budget was
+never the constraint). That backlog only got touched once the anchor's own real-time playback
+advance happened to walk the near-anchor window into it, which is what produced the "flat for ~30s,
+then climbing" symptom — and once it did start catching up, the now-uncapped-by-budget continuity
+burst could catch up fast, which is also what produced a related report (immediately prior in this
+same investigation) of the buffer appearing to "suddenly dump the whole thing into HD" once `high_ms`
+was finally crossed. Fixed by extending Tier A's stopping point from `target_ms` to `high_ms`:
+continuity now spends its budget-exempt priority rebuilding the *entire* resilience margin — not
+just a small dropout-safety sliver — before Tier C ever runs, on the reasoning that a link that just
+dropped can drop again, so depth is worth more than quality until the margin is back. No new config
+surface was needed: `water.high_ms` already meant exactly "how much buffer before quality resumes,"
+it just wasn't being filled that far. An operator wanting a deep standing buffer rebuilt before
+quality resumes (e.g. "get back to 300s before touching HD") just configures a larger `high_ms`.
+`scheduler.rs`'s `far_behind_head_only_fills_near_anchor_and_near_live_edge_not_the_middle` test
+(which had asserted the *old*, buggy "middle region left untouched all the way out to `high_ms`"
+behavior as correct) was replaced with
+`far_behind_head_rebuilds_to_high_ms_and_still_fills_the_live_edge`, plus a new end-to-end
+regression, `after_reconnect_rebuilds_the_full_margin_before_any_upgrade_across_ticks`, simulating
+the real per-tick loop (16 actions/tick, matching `uploader.rs`) across many ticks with a 300s
+`high_ms` and a deep post-outage backlog, asserting zero upgrades fire until the full margin is
+rebuilt and that the rebuild genuinely takes multiple ticks rather than completing in one. `docs/
+protocol.md` §5 updated in the same change.
+
+**Stream restart / name reuse.** Previously undefined and genuinely broken: `AppState`'s per-name
+`DvrStore` lives for the life of the server process with no session boundary, while ffmpeg always
+numbers a fresh encode process's own files from 0 (`encode.rs`, deliberate — see the ABR ladder
+rework entry above). So any encoder-process restart under an unchanged stream name — an explicit
+Stop→Go-Live, *or* a live rung toggle, which reuses that exact same respawn path — re-uploaded
+seq 0.. while the store's `live_seq` was still parked wherever the old session left off; `evict_old`'s
+window floor is computed from that old high-water mark, so the new session's segments were recorded
+and then evicted on the very next tick, before playout could ever reach them — dead air that would
+only self-heal once the new seq counter climbed back past the old `live_seq` (hours, at the default
+2s/segment). Fixed with two pieces, deliberately kept independent: (1) **client-side seq stitching**
+— `uploader.rs::resolve_seq_offset` reads the last-known `ServerState.live_seq` before its first
+upload and adds `live_seq + 1` as an offset on top of its own 0-based local file numbers, so the wire
+`Seq` just keeps climbing across a restart or rung toggle instead of colliding with it; `LocalInventory`
+is shifted into this wire-seq space in `uploader::run` and shifted back only to look up the on-disk
+file path, so `plan_uploads`/`stalled_continuity_seq` (`obcast-proto`) are untouched. (2) **server-side
+stale reset** — a new `ServerState.stale_session` flag (true once `OBCAST_STALE_RESET_MS`, default 5
+min, has passed with no ingested segment) tells the client to use offset 0 instead for a genuinely new
+broadcast; a new `X-New-Session` header (sent only until the client's first upload actually succeeds)
+tells the server this really is a fresh encoder session, not the same one recovering from an outage.
+The server only wipes a stream's DVR index and on-disk segments (in place — same `StreamHandle`, so
+SSE/WS/control subscribers don't need to reconnect, unlike `DELETE /api/shows/{name}`) when **both**
+conditions hold (`ingest.rs::should_reset_for_new_session`): the marker alone (a quick restart, or a
+rung toggle, always well under the stale window) must not discard a live broadcast's buffer, and the
+window alone can't tell a real restart apart from the same encoder process's backlog draining after a
+long-but-survivable outage — which is exactly the scenario this whole system exists to ride out
+without loss, so a pure timeout was explicitly rejected during design (a >5min real outage would have
+had its DVR history wiped the moment it reconnected, the opposite of "an outage causes delay, not
+loss"). An unmodified/older client that never sends `X-New-Session` always gets append behaviour and
+never an automatic reset; `DELETE /api/shows/{name}` remains the explicit, unconditional way to clear
+a show regardless. See `docs/protocol.md` §2–3 "Session continuity" for the wire contract and
+`OBCAST_STALE_RESET_MS` in `docs/getting-started.md`.
 
 **What's next.** Everything from the previous "auth split / resource leak / DVR reaping / stalled
 playout state / waveform decode failures / reverse telemetry / packaging / StreamProfile dedup /
@@ -782,6 +881,77 @@ directly rather than piecemeal summarized fetches, which is what produced each w
 true` and `applyAutoScrollOffset()` (the pre-existing, working 25%-of-width edge-scroll behavior) are
 back exactly as they were. Centering the playhead is a real, separate ask, deliberately left for the
 maintainer to decide is worth a dedicated pass rather than continuing to guess at it.
+
+**Reconciled the two entries above with the independent incremental-waveform-fetch perf rework
+merged around the same time (see "Fixed web remote perf/memory issues" further below).** That rework
+replaced `applyWaveform()`'s periodic full-window fetch with a delta fetch (only segments past the
+last one already held) guarded by a `waveformFetchInFlight` lock that refuses to start a second fetch
+while one is outstanding — which independently closes the exact overlapping-requests race the
+`waveformFetchSeq` counter above was added for, making that counter redundant; it was removed rather
+than kept alongside a lock that already makes it unreachable. Separately, that same rework had
+reintroduced physically slicing `currentWaveformJson` and calling `setSource()` inside
+`trimEvictedSegments` (needed for bounded memory now that `applyWaveform()` no longer does a periodic
+full re-fetch to naturally cap array growth) — which reintroduces exactly the scroll-reset-on-every-
+eviction-tick bug the recolor-only rewrite above exists to prevent. Resolved by keeping
+`trimEvictedSegments` recolor-only (no slice, no `setSource`) and instead folding the deferred slice
+into `applyWaveform()`'s next merge, which already has to call `setSource()` for the newly-arrived
+data — so the physical trim still happens (bounding memory) but never as an extra call made solely
+for eviction bookkeeping.
+
+**Automatic reconnect when the hardware audio device disconnects mid-session (server playout output
+and client capture input).** Prompted by an operator question: "what happens if the audio device
+disconnects, e.g. the mixer goes down?" Investigation found both sides *detected* and *surfaced* a
+device error already (not silent), but neither *recovered*: the server's `cpal` output stream was
+built once at engine startup and never rebuilt, so once its `err_fn` fired (or the configured device
+was missing/mis-configured at startup), `device_error`/`PlayoutState::Error` stuck **permanently** —
+`playout_state()` checks `device_error` first, and the only place that ever cleared it
+(`restart_decoder_session`'s success path) is unrelated to the output device itself, so recovery
+required restarting the server process for that stream. The client's capture `err_fn` at least
+demoted `running`/set `last_error` cleanly, and an existing PCM-stall watchdog (`gui/app.rs`) already
+dropped a dead pipeline out of "live" rather than broadcasting silence forever (the M6 fix) — but
+still required the operator to manually click "Open" again once the mixer came back.
+- **Server (`playout.rs`).** `run_engine`'s device/stream setup and its command-processing loop are
+  now wrapped in an outer `'engine` reconnect loop. On any device/stream failure — missing device or
+  no default config at startup, a failed `build_output_stream`, or the stream's `err_fn` firing
+  mid-session (new `stream_failed: Arc<AtomicBool>`, checked once per inner-loop tick) — the loop
+  tears down what it can and retries every `DEVICE_RETRY_INTERVAL` (3s) until the device/stream opens
+  successfully again, rather than the old permanent `drain_forever`. `current` (the playout head)
+  survives across reconnects, and if playout was (or was asked to be) running when the device died,
+  it resumes automatically from the same seq once reconnected — no operator action needed. While the
+  device is down, `wait_for_retry_or_shutdown` still drains and applies incoming `EngineCommand`s via
+  `apply_command_offline` (state bookkeeping only — `current`/`running`/`position_seq`/etc. — since
+  there's no stream/decoder to actually drive), so a `Stop`/`Start` issued mid-outage isn't lost and
+  takes effect immediately rather than only once the retry clock happens to elapse. A hard mid-session
+  failure can't safely reuse `teardown_session_safely` (which needs a *working* output callback to
+  drain the ring while joining the old decoder's reader thread — exactly what's gone) — a new
+  `abandon_decoder_session` kills the ffmpeg process but deliberately does not join the reader thread,
+  which might be parked forever inside `push_all` waiting for ring space that a dead stream will never
+  free again; a fresh ring/session is built for the next connection attempt regardless. Logging (the
+  actual originating ask — "make sure the server logs it"): `report_device_error` logs loudly
+  (`tracing::error!` plus a pushed web-remote log line, so it shows up in `stream.html`'s log panel,
+  not just the server's own stdout) on the *first* failure of an outage, then quietly
+  (`tracing::warn!` only) on each subsequent retry so a long outage doesn't spam the web remote; a
+  successful reconnect logs "audio output device reconnected, resuming playout" at `info` level plus
+  a matching web-remote log line. Five new `playout.rs` tests cover `apply_command_offline`'s state
+  bookkeeping (`Start`/`Stop`/`Seek`/`SetVolume` while offline).
+- **Client (`audio.rs`).** `run_engine`'s command loop switched from a blocking `cmd_rx.recv()` to
+  `cmd_rx.recv_timeout(DEVICE_RETRY_INTERVAL)` (also 3s) so it wakes up periodically even with no new
+  command. A new `last_open: Option<(String, String)>` remembers the most recently requested
+  host/device; on each timeout wakeup, if a stream was open but `running` has gone false (the
+  capture `err_fn` fired since the last wakeup — e.g. the mixer lost power), the loop begins retrying
+  against that same host/device via a shared `try_open` helper (factored out of the `Open` command
+  handler, which also now retries on a failed *explicit* open rather than giving up after one try).
+  Retrying stops the moment `try_open` succeeds (logs "capture device reconnected") or the operator
+  sends an explicit `Close`. Confirmed (via a read-only research pass over `gui/app.rs`) that nothing
+  in the GUI assumes `AudioHandle::is_running()`/`last_error()` only change in direct response to a
+  GUI-issued `Open` — the device panel, Go Live button enablement, and the PCM-stall watchdog are all
+  re-evaluated fresh every frame with no edge-triggered/GUI-owned latch — so `running` flipping true
+  again from a background retry (rather than a button click) is safe and requires no GUI changes.
+  Deliberately unchanged: reconnecting the *capture device* does not itself resume the encoder's
+  "live" (broadcasting) state — that still requires an explicit operator "Go Live" after an
+  interruption of unknown length, per the existing M6 behavior; this fix is scoped to the device
+  connection itself; per CLAUDE.md's own spirit, resuming *what* to broadcast after an unknown gap
+  stays a deliberate operator decision, not something to automate silently.
 
 ---
 

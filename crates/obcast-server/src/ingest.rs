@@ -65,11 +65,6 @@ fn check_auth(handle: &StreamHandle, headers: &HeaderMap) -> Result<(), ApiError
     }
 }
 
-async fn current_state(handle: &StreamHandle) -> ServerState {
-    let store = handle.store.lock().await;
-    store.build_server_state(handle.playout_status())
-}
-
 /// Starts playout on its own once the encoder's requested auto-start buffer
 /// (`EncoderState::auto_start_buffer_ms`, set via heartbeat) has accumulated
 /// — see `DvrStore::due_for_auto_start`. A no-op whenever playout isn't
@@ -108,8 +103,65 @@ async fn maybe_auto_start(handle: &StreamHandle) {
         position: seq,
         skip_ms: 0,
     });
-    let state = current_state(handle).await;
+    let state = handle.current_state().await;
     let _ = handle.tx.send(state);
+}
+
+/// Whether an incoming upload should reset this stream to a fresh DVR
+/// session: the client marks this as the start of a new encoder session
+/// (`X-New-Session`, sent only on the first upload after a real
+/// go-live/ffmpeg respawn — see `uploader.rs::run`) *and* the stream has
+/// gone at least `stale_reset_ms` without an ingested segment. Both
+/// conditions are required: the marker alone (a quick restart, or a live
+/// rung-toggle respawn, both well under the stale window) should just
+/// append per CLAUDE.md §8, and the timer alone can't tell a genuine
+/// restart apart from the same encoder recovering after a long-but-
+/// survivable outage — a pure timeout would wipe real DVR history from an
+/// ongoing broadcast exactly when the system is supposed to be proving its
+/// resilience.
+fn should_reset_for_new_session(new_session: bool, is_stale: bool, has_content: bool) -> bool {
+    new_session && is_stale && has_content
+}
+
+/// Wipes an existing stream's DVR index and on-disk segments in place (the
+/// `StreamHandle` stays in `AppState`'s map, so SSE/WS subscribers and the
+/// playout thread keep the same handle — only its contents change) when
+/// `should_reset_for_new_session` says this upload starts a genuinely new
+/// broadcast. A no-op otherwise, which is the default: a same-name upload
+/// just appends.
+async fn maybe_reset_stale_session(
+    app: &AppState,
+    stream: &str,
+    handle: &StreamHandle,
+    new_session: bool,
+) {
+    let is_stale = handle.is_stale().await;
+    let has_content = handle.store.lock().await.live_seq().is_some();
+    if !should_reset_for_new_session(new_session, is_stale, has_content) {
+        return;
+    }
+    tracing::warn!(
+        stream,
+        "X-New-Session marker past the stale-reset window: starting a fresh DVR session"
+    );
+    handle.push_log(
+        LogLevel::Warn,
+        "stream restarted after a long gap; starting a fresh DVR session".to_string(),
+    );
+    handle.playout.send(EngineCommand::Stop);
+    *handle.store.lock().await = app.fresh_store(stream);
+    let dir = app.data_dir().join(stream);
+    match tokio::fs::remove_dir_all(&dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(stream, error = %e, "failed to clear stale segment directory");
+            handle.push_log(
+                LogLevel::Warn,
+                format!("failed to clear stale segment directory: {e}"),
+            );
+        }
+    }
 }
 
 pub async fn upload_segment(
@@ -124,6 +176,14 @@ pub async fn upload_segment(
     let rung: RungId = header_u8(&headers, "x-rendition")?;
     let seq: Seq = header_u64(&headers, "x-seq")?;
 
+    maybe_reset_stale_session(
+        &app,
+        &stream,
+        &handle,
+        headers.contains_key("x-new-session"),
+    )
+    .await;
+
     let path = {
         let store = handle.store.lock().await;
         store.segment_path(rung, seq)
@@ -137,12 +197,12 @@ pub async fn upload_segment(
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let (state, evicted) = {
+    let evicted = {
         let mut store = handle.store.lock().await;
         // Never let eviction outrun the playout head — see `DvrStore::evict_old`.
-        let evicted = store.record(rung, seq, handle.playout.position());
-        (store.build_server_state(handle.playout_status()), evicted)
+        store.record(rung, seq, handle.playout.position())
     };
+    let state = handle.current_state().await;
     *handle.last_ingest.lock().await = Some(std::time::Instant::now());
     let _ = handle.tx.send(state.clone());
     tracing::info!(stream, rung, seq, bytes = body.len(), "segment ingested");
@@ -217,7 +277,7 @@ pub async fn abandon(
         tracing::warn!(stream, seq, "segment abandoned");
         handle.push_log(LogLevel::Warn, format!("segment {seq} abandoned"));
     }
-    let state = current_state(&handle).await;
+    let state = handle.current_state().await;
     let _ = handle.tx.send(state);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -230,7 +290,7 @@ pub async fn state_feed(
 ) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
     let handle = app.stream(&stream).await;
     let mut rx = handle.tx.subscribe();
-    let initial = current_state(&handle).await;
+    let initial = handle.current_state().await;
 
     let stream = async_stream::stream! {
         yield Event::default().event("state").json_data(&initial);
@@ -248,7 +308,7 @@ pub async fn state_feed(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    let state = current_state(&handle).await;
+                    let state = handle.current_state().await;
                     yield Event::default().event("state").json_data(&state);
                 }
             }
@@ -256,4 +316,44 @@ pub async fn state_feed(
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quick_restart_under_the_stale_window_appends_rather_than_resets() {
+        // A quick Stop→Go-Live (or a live rung-toggle respawn) sends the
+        // new-session marker, but well under the stale window — CLAUDE.md
+        // §8 says this should just append, not reset.
+        assert!(!should_reset_for_new_session(true, false, true));
+    }
+
+    #[test]
+    fn long_outage_on_the_same_encoder_process_never_resets() {
+        // No marker was ever sent (the encoder process never restarted), so
+        // even a very long gap since the last ingest must not reset — this
+        // is exactly the "outage causes delay, not loss" scenario the whole
+        // system exists to survive.
+        assert!(!should_reset_for_new_session(false, true, true));
+    }
+
+    #[test]
+    fn marker_past_the_stale_window_resets() {
+        assert!(should_reset_for_new_session(true, true, true));
+    }
+
+    #[test]
+    fn never_ingested_before_has_nothing_to_reset() {
+        // A brand-new stream name: no prior content, so even a marker past
+        // a (vacuously true) stale window is a no-op — there's no old
+        // session to discard.
+        assert!(!should_reset_for_new_session(true, true, false));
+    }
+
+    #[test]
+    fn no_marker_and_not_stale_never_resets() {
+        assert!(!should_reset_for_new_session(false, false, true));
+    }
 }

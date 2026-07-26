@@ -48,6 +48,7 @@ Headers:
   X-Auth: <ingest token>
   X-Rendition: <rung id>          # lowest currently-enabled rung = survival rung
   X-Seq: <u64>                    # canonical clock; idempotent on (rung, seq)
+  X-New-Session: true             # only on the first upload of a new encoder session
   Content-Type: audio/mp2t
 Body: <segment bytes>
 ```
@@ -62,6 +63,39 @@ fresh feedback, so when the link works the encoder needs no extra round trips.
 POST /ingest/{stream}/abandon      Body: { "seqs": [u64, ...] }
 ```
 Tells the server to stop waiting on permanent gaps so playout can skip them.
+
+### Session continuity (stream restart / name reuse)
+`Seq` is a single, ever-climbing number per stream *name* on the server, but
+ffmpeg always numbers a fresh encode process's own files from 0 (see
+`encode.rs`) — every encoder-process restart, whether an explicit operator
+Stop→Go-Live or the internal respawn behind a live rung toggle, needs to
+reconcile those two facts before its first upload.
+
+- **Default: append.** The client reads the last-known `ServerState.live_seq`
+  (delivered by the state feed before any of its own uploads land) and adds
+  `live_seq + 1` as an offset on top of its own 0-based local file numbers
+  before sending `X-Seq`, so the server just sees `Seq` keep climbing —
+  exactly as if nothing happened. This is what makes a quick restart or a
+  live rung toggle transparent: the DVR and playout head are untouched.
+- **`ServerState.stale_session`** is `true` once the stream has gone at least
+  `OBCAST_STALE_RESET_MS` (default 5 min) without an ingested segment. A
+  client reading `true` at go-live time uses offset 0 instead — a genuinely
+  new broadcast's `Seq` starts fresh, matching `stream.html`'s assumption
+  that elapsed time is `position_seq * segment_ms` from a `Seq`-0 origin.
+- **The server only actually resets** (wiping the old DVR index and on-disk
+  segments for that name, in place — the stream keeps its existing
+  `StreamHandle`, so SSE/WS subscribers don't need to reconnect) when an
+  upload arrives with **both** `X-New-Session` set **and** the stream already
+  past the stale window. Requiring both matters: the marker alone (a quick
+  restart, well under the window) must not discard a live broadcast's
+  buffer, and the window alone can't tell a real restart apart from the same
+  encoder process recovering after a long-but-survivable outage — which is
+  exactly the scenario this system exists to ride out without loss. See
+  `should_reset_for_new_session` in `obcast-server/src/ingest.rs`.
+- A client that skips `X-New-Session` entirely (or an older client) always
+  gets append behaviour, never an automatic reset — the operator's existing
+  `DELETE /api/shows/{name}` remains the explicit, unconditional way to
+  clear a show.
 
 ---
 
@@ -217,6 +251,10 @@ segment's start.
 - `water` = `{ low_ms, target_ms, high_ms }` — survival / target / upgrade gates.
 - `coverage[]` — best rung per seq for a bounded window ahead of the anchor, so
   the encoder sees exactly where HD is missing without guessing.
+- `stale_session` — whether this stream has gone without an ingested segment
+  for at least `OBCAST_STALE_RESET_MS`; used only at go-live time to pick a
+  `Seq` offset (append vs. restart at 0) — see "Session continuity" above.
+  Not otherwise consulted by `plan_uploads`.
 
 ---
 
@@ -425,14 +463,20 @@ GET /hls/{stream}/{rendition}/{seq}.ts
 **Scheduler tiers** (see `scheduler.rs`, all unit-tested):
 
 1. **Continuity** — from the playout head forward, fill any hole at the **low
-   rung** until `target_ms` of contiguous audio is secured. Allowed to burst past
-   the tick budget; dropout is the worst outcome. When the buffer is draining on
-   a flaky link, this is effectively "low quality first, no dropout."
+   rung** until `high_ms` (not just `target_ms`) of contiguous audio is secured.
+   Allowed to burst past the tick budget; dropout is the worst outcome — and so
+   is spending idle bandwidth on quality while the resilience margin is still
+   thin, since a link that just dropped can drop again. When the buffer is
+   draining or recovering on a flaky link, this is effectively "rebuild the
+   full standing buffer at low quality first, no dropout, before spending
+   anything on HD." Operators wanting a deeper standing margin before quality
+   resumes after a reconnect just configure a larger `high_ms` (e.g. 300s).
 2. **Live edge** — cover the newest ~`target_ms` at the low rung so the DVR stays
    contiguous and go-live is instant. Skipped in survival mode.
-3. **Upgrade** — only when `lead_ms ≥ high_ms` and bandwidth remains, raise
-   quality **strictly ahead of the playout head**, nearest-first, one rung step
-   per tick. This is "add HD back in as speed recovers," and the ahead-of-head
+3. **Upgrade** — only when `lead_ms ≥ high_ms` (i.e. continuity has finished
+   rebuilding the margin) and bandwidth remains, raise quality **strictly
+   ahead of the playout head**, nearest-first, one rung step per tick. This is
+   "add HD back in once the buffer is safely rebuilt," and the ahead-of-head
    guard is what stops us upgrading segments that will never be played.
 
 Continuity cost counts against the tick budget when gating tiers 2–3, so a

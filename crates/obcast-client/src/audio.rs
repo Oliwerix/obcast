@@ -12,9 +12,10 @@
 //! same pattern as the server's playout engine
 //! (`obcast-server/src/playout.rs`).
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -124,6 +125,21 @@ pub struct AudioHandle {
     peak_r_bits: AtomicU32,
     clip_l: AtomicBool,
     clip_r: AtomicBool,
+    /// Monotonic count of clip *edges* (a transition from not-clipping to
+    /// clipping across processed audio blocks) — unlike `clip_l`/`clip_r`
+    /// above, this never resets on its own or via `reset_clips()`, so a GUI
+    /// polling at its own cadence can always tell "a genuinely new clip
+    /// happened since I last checked" apart from "the sticky LED flag is
+    /// still set from an old clip that was never acknowledged" by comparing
+    /// against a remembered value rather than reading a snapshot that could
+    /// have already reset itself between polls. See `clip_edge_seq()`.
+    clip_edge_seq: AtomicU64,
+    /// Internal-only: whether the block most recently processed contained a
+    /// clipping sample — compared against the current block's result to
+    /// detect the edge that bumps `clip_edge_seq`. Not exposed; the public
+    /// clip signals are `clip_l`/`clip_r` (sticky) and `clip_edge_seq`
+    /// (edge count).
+    clip_block_active: AtomicBool,
 
     /// ITU-R BS.1770-4 / EBU R128 K-weighted programme loudness (LUFS),
     /// combined across L/R — see `obcast_proto::loudness::Loudness`. Unlike
@@ -256,6 +272,13 @@ impl AudioHandle {
         self.clip_r.store(false, Ordering::Relaxed);
     }
 
+    /// See the `clip_edge_seq` field doc: a monotonic count of clip edges,
+    /// for a caller that needs to detect a genuinely new clip rather than a
+    /// still-set sticky flag.
+    pub fn clip_edge_seq(&self) -> u64 {
+        self.clip_edge_seq.load(Ordering::Relaxed)
+    }
+
     /// ITU-R BS.1770-4 K-weighted programme loudness in LUFS:
     /// `(momentary, short_term, integrated)`. Momentary covers the last
     /// 400 ms, short-term the last 3 s (both ungated); integrated is the
@@ -307,6 +330,8 @@ pub fn spawn(pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>) -> Arc<AudioHandle> 
         peak_r_bits: AtomicU32::new((-100.0f32).to_bits()),
         clip_l: AtomicBool::new(false),
         clip_r: AtomicBool::new(false),
+        clip_edge_seq: AtomicU64::new(0),
+        clip_block_active: AtomicBool::new(false),
         momentary_lufs_bits: AtomicU32::new((-100.0f32).to_bits()),
         short_term_lufs_bits: AtomicU32::new((-100.0f32).to_bits()),
         integrated_lufs_bits: AtomicU32::new((-100.0f32).to_bits()),
@@ -324,6 +349,44 @@ pub fn spawn(pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>) -> Arc<AudioHandle> 
     handle
 }
 
+/// How long the engine waits between automatic attempts to reopen the
+/// capture device after it's lost mid-session (e.g. an OB site's mixer loses
+/// power or is unplugged) or an explicit `Open` fails — see `run_engine`'s
+/// retry branch. Short enough that a brief power-cycle doesn't read as a
+/// long outage, long enough that a genuinely absent device doesn't spam
+/// retries/logs.
+const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Attempts to open `host`/`device`, applying the resulting state to
+/// `handle` and swapping it into `*stream` on success — shared by the
+/// explicit `Open` command handler and the automatic reconnect retry below,
+/// which differ only in what they log around the call.
+fn try_open(
+    host: &str,
+    device: &str,
+    handle: &Arc<AudioHandle>,
+    pcm_tx: &tokio_mpsc::UnboundedSender<Vec<f32>>,
+    stream: &mut Option<cpal::Stream>,
+) -> Result<(u16, u32)> {
+    match open_stream(host, device, handle.clone(), pcm_tx.clone()) {
+        Ok((s, channels, rate, opened_name)) => {
+            handle.device_channels.store(channels, Ordering::Relaxed);
+            handle.sample_rate.store(rate, Ordering::Relaxed);
+            *handle.device_name.write().unwrap() = opened_name;
+            *handle.channel_peaks.write().unwrap() = vec![0.0; channels as usize];
+            handle.running.store(true, Ordering::Relaxed);
+            *handle.last_error.write().unwrap() = None;
+            *stream = Some(s);
+            Ok((channels, rate))
+        }
+        Err(err) => {
+            handle.running.store(false, Ordering::Relaxed);
+            *handle.last_error.write().unwrap() = Some(err.to_string());
+            Err(err)
+        }
+    }
+}
+
 // `stream` below is held only for its `Drop` (which stops the device) —
 // it's intentionally never read, just reassigned to swap/close devices.
 #[allow(unused_assignments, unused_variables)]
@@ -333,32 +396,61 @@ fn run_engine(
     pcm_tx: tokio_mpsc::UnboundedSender<Vec<f32>>,
 ) {
     let mut stream: Option<cpal::Stream> = None;
+    // The most recently requested (host, device), used to retry the same
+    // target automatically — `None` means no `Open` has been requested yet,
+    // or an explicit `Close` cancelled any pending retry.
+    let mut last_open: Option<(String, String)> = None;
+    // Set once an `Open` fails, or a previously-open stream's `err_fn`
+    // reports it lost — cleared the moment a (re)connect attempt succeeds.
+    let mut retrying = false;
 
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            AudioCommand::Open { host, device } => {
+    loop {
+        match cmd_rx.recv_timeout(DEVICE_RETRY_INTERVAL) {
+            Ok(AudioCommand::Open { host, device }) => {
                 stream = None; // close any previous device before opening the next
-                match open_stream(&host, &device, handle.clone(), pcm_tx.clone()) {
-                    Ok((s, channels, rate, opened_name)) => {
-                        handle.device_channels.store(channels, Ordering::Relaxed);
-                        handle.sample_rate.store(rate, Ordering::Relaxed);
-                        *handle.device_name.write().unwrap() = opened_name;
-                        *handle.channel_peaks.write().unwrap() = vec![0.0; channels as usize];
-                        handle.running.store(true, Ordering::Relaxed);
-                        *handle.last_error.write().unwrap() = None;
-                        stream = Some(s);
+                last_open = Some((host.clone(), device.clone()));
+                retrying = false;
+                match try_open(&host, &device, &handle, &pcm_tx, &mut stream) {
+                    Ok((channels, rate)) => {
                         tracing::info!(host = %host, device = %device, channels, rate, "capture device opened");
                     }
                     Err(err) => {
-                        handle.running.store(false, Ordering::Relaxed);
-                        *handle.last_error.write().unwrap() = Some(err.to_string());
-                        tracing::warn!(host = %host, device = %device, error = %err, "failed to open capture device");
+                        tracing::warn!(host = %host, device = %device, error = %err, "failed to open capture device; will keep retrying");
+                        retrying = true;
                     }
                 }
             }
-            AudioCommand::Close => {
+            Ok(AudioCommand::Close) => {
                 stream = None;
+                last_open = None;
+                retrying = false;
                 handle.running.store(false, Ordering::Relaxed);
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                // A stream that was open can go silently not-running between
+                // wakeups if its `err_fn` fired (device lost) — start
+                // retrying against the same host/device rather than leaving
+                // capture dead until the operator notices and manually
+                // reopens (e.g. the OB site's mixer losing power).
+                if stream.is_some() && !handle.running.load(Ordering::Relaxed) {
+                    stream = None;
+                    retrying = true;
+                    tracing::warn!("capture device disconnected, will attempt to reconnect");
+                }
+                if retrying {
+                    if let Some((host, device)) = last_open.clone() {
+                        match try_open(&host, &device, &handle, &pcm_tx, &mut stream) {
+                            Ok((channels, rate)) => {
+                                tracing::info!(host = %host, device = %device, channels, rate, "capture device reconnected");
+                                retrying = false;
+                            }
+                            Err(err) => {
+                                tracing::debug!(host = %host, device = %device, error = %err, "capture device still unavailable, will retry");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -475,6 +567,10 @@ struct MeterState {
     loudness: Loudness,
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
+    /// Set once the callback has tried to raise its own OS thread priority
+    /// (see `elevate_audio_thread_priority`) — checked on the first call
+    /// only, since it's a syscall we don't want to repeat every block.
+    priority_elevated: bool,
 }
 
 impl MeterState {
@@ -489,7 +585,29 @@ impl MeterState {
             loudness: Loudness::new(OUT_CHANNELS, sample_rate),
             scratch_l: Vec::new(),
             scratch_r: Vec::new(),
+            priority_elevated: false,
         }
+    }
+}
+
+/// Raises the *calling* OS thread to the platform's highest scheduling
+/// priority. Must be called from the real cpal callback thread itself (not
+/// the engine thread that builds the stream) — `cpal` creates that thread
+/// internally, so there's no `JoinHandle` to set this on ahead of time; the
+/// callback's first invocation is the earliest point we're actually running
+/// on it. Best-effort: an unprivileged process can't raise its priority on
+/// Linux without `CAP_SYS_NICE` (the same permission wrinkle pro-audio apps
+/// like JACK solve with an `/etc/security/limits.d` audio-group entry, not
+/// something this binary can grant itself), so failure is logged once and
+/// capture keeps running at normal priority rather than treating it as
+/// fatal.
+fn elevate_audio_thread_priority() {
+    use thread_priority::{set_current_thread_priority, ThreadPriority};
+    if let Err(err) = set_current_thread_priority(ThreadPriority::Max) {
+        tracing::warn!(
+            ?err,
+            "failed to raise capture thread priority, continuing at normal priority"
+        );
     }
 }
 
@@ -504,6 +622,11 @@ fn process_block(
     pcm_tx: &tokio_mpsc::UnboundedSender<Vec<f32>>,
     meters: &mut MeterState,
 ) {
+    if !meters.priority_elevated {
+        meters.priority_elevated = true;
+        elevate_audio_thread_priority();
+    }
+
     if channels == 0 {
         return;
     }
@@ -533,20 +656,35 @@ fn process_block(
     meters.scratch_l.clear();
     meters.scratch_r.clear();
 
+    let mut block_clipped = false;
     for f in 0..frames {
         let base = f * channels;
-        let (mut l, mut r) = if mono {
-            let v = raw[base + l_idx] * gain;
-            (v, v)
-        } else {
-            (raw[base + l_idx] * gain, raw[base + r_idx] * gain)
-        };
+        let raw_l = raw[base + l_idx];
+        let raw_r = if mono { raw_l } else { raw[base + r_idx] };
+
+        // Clip is checked both pre-gain (the source is already too hot,
+        // which turning our own gain down can't fix) and post-gain (our
+        // own gain stage pushed an otherwise-clean signal over 0 dBFS) —
+        // either lights the same clip LED/alert and bumps the same edge
+        // count below.
+        if raw_l.abs() >= CLIP_THRESHOLD {
+            handle.clip_l.store(true, Ordering::Relaxed);
+            block_clipped = true;
+        }
+        if raw_r.abs() >= CLIP_THRESHOLD {
+            handle.clip_r.store(true, Ordering::Relaxed);
+            block_clipped = true;
+        }
+
+        let (mut l, mut r) = (raw_l * gain, raw_r * gain);
 
         if l.abs() >= CLIP_THRESHOLD {
             handle.clip_l.store(true, Ordering::Relaxed);
+            block_clipped = true;
         }
         if r.abs() >= CLIP_THRESHOLD {
             handle.clip_r.store(true, Ordering::Relaxed);
+            block_clipped = true;
         }
         l = l.clamp(-1.0, 1.0);
         r = r.clamp(-1.0, 1.0);
@@ -555,6 +693,16 @@ fn process_block(
         meters.scratch_r.push(r);
         out.push(l);
         out.push(r);
+    }
+    // A rising edge (this block clipped, the previous one didn't) bumps the
+    // edge count a caller can diff against to detect a genuinely new clip —
+    // see the `clip_edge_seq` field doc for why `clip_l`/`clip_r` alone
+    // can't do this (they're sticky until manually reset).
+    let was_active = handle
+        .clip_block_active
+        .swap(block_clipped, Ordering::Relaxed);
+    if block_clipped && !was_active {
+        handle.clip_edge_seq.fetch_add(1, Ordering::Relaxed);
     }
 
     // Feed the post-gain, post-clamp block through the IEC ballistics

@@ -326,6 +326,10 @@ impl DvrStore {
             water: self.water,
             coverage,
             buffered_ms: self.buffered_ms(),
+            // `DvrStore` has no notion of "time since last ingest" — that's
+            // tracked on `StreamHandle` (see `StreamHandle::current_state`,
+            // which overwrites this field after calling here).
+            stale_session: false,
         }
     }
 }

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::response::Redirect;
 use axum::routing::{delete, get, post};
@@ -46,6 +46,13 @@ pub struct StreamHandle {
     pub log: Arc<LogSink>,
     pub ingest_token: Option<String>,
     pub last_ingest: Mutex<Option<Instant>>,
+    /// Copied from `AppState::stale_reset_ms` at creation time — how long
+    /// this stream must go without an ingested segment before `is_stale`
+    /// reports true. See `ingest.rs`'s `X-New-Session`-gated reset and
+    /// CLAUDE.md §8 "stream restart / name reuse" for the full design. Not
+    /// to be confused with `api.rs::STALE_AFTER` (5s), which is the much
+    /// shorter "is this stream currently live" link-health window.
+    pub stale_reset_ms: u32,
 }
 
 impl StreamHandle {
@@ -74,6 +81,28 @@ impl StreamHandle {
     pub fn recent_log(&self) -> Vec<LogEntry> {
         self.log.recent()
     }
+
+    /// Whether this stream has gone at least `stale_reset_ms` without an
+    /// ingested segment. `false` (not stale) if nothing has ever been
+    /// ingested — there's no prior session to consider "over".
+    pub async fn is_stale(&self) -> bool {
+        self.last_ingest
+            .lock()
+            .await
+            .is_some_and(|t| t.elapsed() >= Duration::from_millis(self.stale_reset_ms as u64))
+    }
+
+    /// The current `ServerState`, including `stale_session` — `DvrStore`
+    /// itself has no notion of ingest timing, so this fills that field in
+    /// after building the rest from the store.
+    pub async fn current_state(&self) -> ServerState {
+        let mut state = {
+            let store = self.store.lock().await;
+            store.build_server_state(self.playout_status())
+        };
+        state.stale_session = self.is_stale().await;
+        state
+    }
 }
 
 pub struct AppState {
@@ -86,16 +115,24 @@ pub struct AppState {
     control_token: Option<String>,
     audio: AudioConfig,
     playout_ring_segments: usize,
+    stale_reset_ms: u32,
 }
 
 impl AppState {
-    fn create_stream_handle(&self, name: &str) -> Arc<StreamHandle> {
-        let store = Arc::new(Mutex::new(DvrStore::new(
+    /// A blank `DvrStore` for `name`, built from this app's shared config —
+    /// used both for a brand-new stream and to replace an existing stream's
+    /// store in place when `ingest.rs` decides a stale session has ended.
+    pub(crate) fn fresh_store(&self, name: &str) -> DvrStore {
+        DvrStore::new(
             self.profile.clone(),
             self.water,
             self.dvr_window_ms,
             self.data_dir.join(name),
-        )));
+        )
+    }
+
+    fn create_stream_handle(&self, name: &str) -> Arc<StreamHandle> {
+        let store = Arc::new(Mutex::new(self.fresh_store(name)));
         let rungs = self.profile.rungs.iter().map(|r| r.id).collect();
         // Constructed before both `playout::spawn` and `StreamHandle` below
         // and cloned into each, so the playout engine's dedicated thread and
@@ -120,6 +157,7 @@ impl AppState {
             log,
             ingest_token: self.ingest_token.clone(),
             last_ingest: Mutex::new(None),
+            stale_reset_ms: self.stale_reset_ms,
         })
     }
 
@@ -237,6 +275,15 @@ async fn main() {
         .ok()
         .map(|v| v.parse().expect("invalid OBCAST_PLAYOUT_RING_SEGMENTS"))
         .unwrap_or(4);
+    // How long a stream must go without an ingested segment, combined with
+    // the encoder's `X-New-Session` marker on its next upload, before that
+    // upload is treated as the start of a genuinely new broadcast (wiping
+    // the old DVR/segments) rather than the same session appending — see
+    // CLAUDE.md §8 "stream restart / name reuse" and docs/protocol.md §3.
+    let stale_reset_ms: u32 = std::env::var("OBCAST_STALE_RESET_MS")
+        .ok()
+        .map(|v| v.parse().expect("invalid OBCAST_STALE_RESET_MS"))
+        .unwrap_or(5 * 60 * 1000);
     let server_cfg = config::ServerConfig::load();
 
     let app_state = Arc::new(AppState {
@@ -249,6 +296,7 @@ async fn main() {
         control_token,
         audio: server_cfg.audio,
         playout_ring_segments,
+        stale_reset_ms,
     });
 
     let app = Router::new()
